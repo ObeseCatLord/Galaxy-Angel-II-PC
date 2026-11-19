@@ -4,8 +4,12 @@ The Linux ARM64 build runs natively on Valve's Steam Frame (SteamOS on
 ARM64). No emulation is involved. You can play flat, on a screen in the
 headset, or in VR.
 
-> **Status:** this build follows Valve's Steam Frame documentation and has
-> been tested on ARM64 Linux. It has **not yet been tried on a Steam Frame**.
+> **Status (0.11.0, measured on a Steam Frame in SteamVR):** the game starts
+> in VR at the headset's 72 Hz, the theater, the battle table and its HUD
+> panels work, and the Frame's finger tracking is used. **Battles run slower
+> than real time on the Frame:** about 13 to 21 frames a second at native
+> resolution, held back by the processor running the game, not by graphics
+> (at 2x the graphics add more: 13). The story scenes run at full rate.
 > Please report what works and what doesn't.
 
 ## Installing
@@ -56,19 +60,19 @@ needs a keyboard.
 ## Settings for the Frame
 
 - **Internal resolution:** sets how sharp the 3D scenes are, in VR and
-  flat. **4x matches the Frame's recommended VR resolution.**
+  flat. **Automatic picks native on the Frame**: 2x stereo battles drew
+  13 frames a second (57 ms per frame on its GPU), native under 1 ms of GPU
+  time per frame. 4x matches the Frame's recommended VR resolution but is out
+  of reach for battles.
   - In VR each eye gets its own picture at this resolution. 4x renders
     2560x1792 per eye, which covers SteamVR's recommended 1728x1728 eye size
     on the Frame (1440x1440 by default).
   - 2x gives 1280x896, about half the detail. Native gives 640x448.
   - 4x is the highest setting (16 samples per pixel), so the panels' own
     2160x2160 is not reached.
-  - Whether the Frame's GPU keeps 72 Hz at 4x in VR is not yet measured. If
-    VR stutters, try 2x. Both eyes' pictures now go straight from the
-    graphics card to the headset view instead of through main memory
-    (checked on a desktop PC with a simulated headset); whether that also
-    works with the Frame's graphics driver is not yet known, and without it
-    4x costs much more.
+  - Both eyes' pictures go straight from the graphics card to the headset
+    view instead of through main memory, also with the Frame's graphics
+    driver (checked on a Frame).
   - The 2D scenes are the games' own 640x448 art at every setting.
 - **Frame rate:** 60 (PS2) is the safe choice. Higher rates draw more frames
   and cost battery.

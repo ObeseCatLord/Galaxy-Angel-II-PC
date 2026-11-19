@@ -5,7 +5,7 @@
 - Starts like a PC game: borderless fullscreen at the display's own
   resolution and shape (ultrawide included), with the internal resolution
   picked from the display (new default "Automatic": 4x from 1440p up, 2x on
-  1080p; 2x in VR and on ARM).
+  1080p; 2x in VR; native on ARM).
   Window mode and fixed resolutions stay in Settings and as `--windowed`,
   `--resolution 2x`.
 - Widescreen and ultrawide without stretching: the wider 3D view (hor+) is
@@ -36,6 +36,10 @@
   follow your real fingers; with bare hands a pinch is the trigger and a fist
   the grip. Finger tracking is not yet tried on a headset; Settings > VR
   finger tracking turns it off.
+- Steam Frame: tried in SteamVR for the first time. VR at 72 Hz, the battle
+  table and finger tracking work; battles run slower than real time (about
+  13 to 21 frames a second, limited by the processor), see
+  docs/STEAM_FRAME.md.
 - HD battle graphics (new setting, on by default; at 2x and 4x): the battle
   HUD is drawn sharp whatever the 2D filter. Flat-coloured pieces (the units'
   HP rings, stars, arrows, the clock's digits, enemy icons) are redrawn as
