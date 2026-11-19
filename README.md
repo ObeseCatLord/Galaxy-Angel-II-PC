@@ -68,8 +68,7 @@ guide are in [docs/PLAYING.md](docs/PLAYING.md).
   and the 3D scenes are drawn in stereo around you. Battles use motion
   controls: point a controller at a unit and pull the trigger to select it,
   then at empty space to move it there or at an enemy to attack; elsewhere the
-  laser pointer clicks on the screen. (Checked with simulated controllers, not
-  yet on a headset; details in [docs/PLAYING.md](docs/PLAYING.md).)
+  laser pointer clicks on the screen.
 - Native ARM64 build for the Steam Frame, flat or in VR
   ([docs/STEAM_FRAME.md](docs/STEAM_FRAME.md)).
 

@@ -270,9 +270,7 @@ used last is the cursor: aim at a unit and pull the trigger (or press A) to
 select it, then aim at empty map and pull the trigger to send it there (Move),
 or at an enemy to attack; B (Cross) cancels, X (Square) orders all angels,
 Y (Triangle) is the H-Weapon, as with the buttons. The game's own order logic
-does the rest. This is built from the game's own camera and the controller's
-aim, checked with synthetic cameras (the hand and mouse paths agree to 0.0001
-map units), but not yet tried on a headset. The other battle views (cockpit,
+does the rest. The other battle views (cockpit,
 chase and camera views) play with the buttons as in the table above.
 
 ## Cheats
