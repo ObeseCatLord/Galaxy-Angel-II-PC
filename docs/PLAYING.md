@@ -265,13 +265,42 @@ movies stay on the screen. If the world feels too big or too small, set
 `GA2_VR_SCALE` (game units per metre, default 50) before starting; set
 `GA2_VR_STEREO=0` to keep every scene on the screen.
 
-**Pointing in battles.** On the tactical map (a 3D stereo scene) the hand you
-used last is the cursor: aim at a unit and pull the trigger (or press A) to
-select it, then aim at empty map and pull the trigger to send it there (Move),
-or at an enemy to attack; B (Cross) cancels, X (Square) orders all angels,
-Y (Triangle) is the H-Weapon, as with the buttons. The game's own order logic
-does the rest. The other battle views (cockpit,
-chase and camera views) play with the buttons as in the table above.
+**The battle table** (Settings > **VR battle map** > *Battle table*, the
+default; modelled on BattleGroupVR's tactical map). The battle's tactical map
+hovers flat in front of you as a holographic table, about waist high: the
+game's own map, with each unit's icon standing over it as a disc on a stalk.
+The full picture (the radar, the clock, the unit panel, dialogue and the
+game's menus) is on a screen beyond the table. Your hands are translucent
+gloves.
+
+| Gesture | Does |
+| --- | --- |
+| Look at a unit and hold your fingertip over it, or touch its disc | hovers it (it lights up; a short buzz) |
+| Trigger on one of your angels | selects it |
+| Hold the trigger, point at a spot and let go | a beam shows the target; letting go moves the angel there, or attacks the enemy / supports the friend under your hand |
+| Trigger on the table with an angel selected | moves it there |
+| One grip, drag | moves the map (it follows your hand, then drifts on a little) |
+| Both grips | apart / together zooms in / out; twisting turns the table |
+| X / Y / B | all angels / H-Weapon / cancel, as on the pad |
+| Left / right stick click | cockpit (the triggers fire) / the camera of the unit (the triggers zoom) |
+| The ? at the table's front right corner | replays the battle part of the VR guide |
+
+`GA2_VR_TABLE=<height below the eyes>,<distance>,<width>` (metres, default
+`0.45,0.55,1.2`) places the table. *Surround* instead draws the tactical map
+around you in stereo, with the laser pointer: aim at a unit and pull the
+trigger (or press A) to select it, then aim at empty map and pull the trigger
+to send it there (Move), or at an enemy to attack; B (Cross) cancels, X
+(Square) orders all angels, Y (Triangle) is the H-Weapon. The other battle
+views (cockpit, chase and camera views) play with the buttons as in the table
+above.
+
+**The VR guide.** The first time you play in VR, a guide next to the screen
+walks you through pointing, clicking, the buttons and recentring, and at the
+first battle table through grabbing, zooming, selecting and drag orders; each
+step finishes when you do it, and holding B skips a part. Replay it any time:
+Settings > **VR guide** > *Show again*, or touch the ? on the battle table.
+During the game's own Tutorial (title screen), a card at the table says how to
+do in VR what the tutorial asks for, in place of its pad buttons.
 
 ## Cheats
 

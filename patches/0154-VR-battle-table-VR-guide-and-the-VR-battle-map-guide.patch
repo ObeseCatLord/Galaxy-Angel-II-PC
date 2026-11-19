@@ -1,0 +1,1912 @@
+From bc9688f69ff64af1737168ee158fc3082854869c Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 20:08:36 -0600
+Subject: [PATCH] VR battle table, VR guide and the VR battle map / guide
+ options
+
+In VR with "VR battle map" Battle table (default) the tactical map hovers flat
+in front of the player as a holographic table (after BattleGroupVR): the
+game picture reprojected from its camera onto a horizontal table, unit icons
+on stalks, the full picture on a screen beyond, translucent glove hands, a
+drag beam for orders, haptic pulses (an OpenXR vibration action, suggested
+with a fallback), table turn by twisting both grips. ga2_battletable carries
+the state between the game side (native/compat/ga2_battlepointer.cpp) and
+ga2_vr. ga2_vr_input: Scene::TacticalTable (press-drag-release Circle,
+grips belong to the table). ga2_vrguide: an interactive guide to the VR
+controls (basics at the screen, the battle part at the table, a card that
+translates the game tutorial's gated buttons into VR gestures), option
+"VR guide" (show / battle / basics / done), replay by the table's ?.
+Unit tests for the input scene and the guide.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt                    |   1 +
+ ps2xRuntime/include/runtime/ga2_battletable.h |  91 ++
+ ps2xRuntime/include/runtime/ga2_options.h     |  10 +
+ ps2xRuntime/src/lib/ga2_battletable.cpp       |  93 ++
+ ps2xRuntime/src/lib/ga2_settings_menu.cpp     |   2 +
+ ps2xRuntime/src/lib/ga2_vr.cpp                | 901 +++++++++++++++++-
+ ps2xRuntime/src/lib/ga2_vr_input.h            |  25 +-
+ ps2xRuntime/src/lib/ga2_vrguide.h             | 325 +++++++
+ ps2xTest/src/ga2_vr_input_tests.cpp           | 153 +++
+ 9 files changed, 1587 insertions(+), 14 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_battletable.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_battletable.cpp
+ create mode 100644 ps2xRuntime/src/lib/ga2_vrguide.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index d1619ad..8069d21 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -402,6 +402,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ga2_present.cpp
+     src/lib/ga2_zerocopy.cpp
+     src/lib/ga2_vuthread.cpp
++    src/lib/ga2_battletable.cpp
+     src/lib/ga2_mpv_shader.cpp
+     src/lib/ga2_vr.cpp
+     src/lib/ga2_vr_platform.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_battletable.h b/ps2xRuntime/include/runtime/ga2_battletable.h
+new file mode 100644
+index 0000000..7982a2a
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_battletable.h
+@@ -0,0 +1,91 @@
++#pragma once
++
++#include <cstdint>
++
++// The battle table: in VR with "VR battle selection" Hand, the battle's tactical map hovers flat in front of the
++// player as a holographic table (after BattleGroupVR's radar). Both sides of it:
++//   - the game (native/compat/ga2_battlepointer.cpp, game thread) knows the map: the camera's projection of the
++//     ground, the units, what is hovered and targeted; it publishes a State once per map update and turns the
++//     hands into the game's own picks, orders, pans and zooms;
++//   - ga2_vr (main thread) knows the headset: it places the table in the play space, publishes it with the
++//     hands and the head (Pose) once per headset frame, draws the table (the game's own picture reprojected onto
++//     it), the units' markers, the order line and the hands, and plays the haptic pulses the game asks for.
++// The table shows the ground: table point (u, v) (metres from its centre, u to the right, v away from the
++// player) is the map point (cx, cz) + s (u r + v f) (r, f: the camera's right and forward on the ground), and
++// the game's picture of that point is at project(M, point) in the 2D layer's 640 x 480 space.
++namespace ga2_battletable
++{
++    constexpr int kMaxUnits = 96;
++
++    struct Unit
++    {
++        float x = 0.0f, z = 0.0f;   // map position (map units)
++        float sx = 0.0f, sy = 0.0f; // its icon in the 2D layer's 640 x 480 space (centre)
++        bool hovered = false;       // under a hand
++        bool focused = false;       // the game's cursor unit (the one an order goes to)
++    };
++
++    struct State
++    {
++        bool active = false; // the tactical map is shown in table mode
++        // Ground -> 2D layer: (sx, sy) = (c.x / c.w - originX, c.y / c.w - originY), c = (X, 0, Z, 1) M (row vector).
++        float M[16] = {};
++        float originX = 0.0f, originY = 0.0f;
++        // The 2D layer is 640 x 480 over the 640 x 448 picture; a hor+ frame squeezes the 3D picture by k.
++        float k = 1.0f;
++        bool wide = false;
++        // Table point (u, v) metres -> map point.
++        float cx = 0.0f, cz = 0.0f, rx = 1.0f, rz = 0.0f, fx = 0.0f, fz = 1.0f, s = 100.0f;
++        Unit units[kMaxUnits];
++        int unitCount = 0;
++        // The order being dragged: from the hand to this map point (a unit's or the ground's).
++        bool drag = false;
++        int dragHand = 1;
++        float dragX = 0.0f, dragZ = 0.0f;
++        bool orderOnRelease = false; // releasing the trigger now gives the order (Circle again)
++        uint32_t hapticSmall[2] = {0, 0}, hapticBig[2] = {0, 0}; // pulse counters per hand (left, right)
++        uint32_t presses = 0, orders = 0; // counters: trigger pressed on a unit, an order given by a release
++        // The game's tutorial gates as actions (ga2_vrguide.h Gate bits; all set when nothing is gated).
++        uint32_t gates = 0x3FFu;
++        uint64_t serial = 0;
++    };
++
++    struct Hand
++    {
++        bool valid = false;
++        float tip[3] = {0, 0, 0};    // the index fingertip (the pointer)
++        float aim[3] = {0, 0, -1};   // the fingertip's forward direction (unit)
++        float palm[3] = {0, 0, 0};   // the palm (grabbing)
++        float trigger = 0.0f, grip = 0.0f;
++    };
++
++    // Everything in the recentred play space (metres, OpenXR axes: x right, y up, -z forward).
++    struct Pose
++    {
++        bool valid = false;
++        float center[3] = {0, -0.45f, -0.55f};
++        float yaw = 0.0f;        // the table's turn about y (radians, + = counter-clockwise seen from above)
++        float halfWidth = 0.6f;  // along u
++        float halfDepth = 0.4f;  // along v
++        Hand hands[2];           // left, right
++        float head[3] = {0, 0, 0};
++        float gaze[3] = {0, 0, -1};
++        uint64_t serial = 0;
++    };
++
++    // Table point (u, v, height) <-> play space, for a pose.
++    void toPlay(const Pose &pose, float u, float v, float h, float out[3]);
++    void toTable(const Pose &pose, const float p[3], float &u, float &v, float &h);
++    // Table point <-> map point, for a state.
++    void tableToMap(const State &s, float u, float v, float &x, float &z);
++    void mapToTable(const State &s, float x, float z, float &u, float &v);
++    // A map point's position in the game's picture (u, v in 0..1 of the 640 x 448 picture); false behind the camera.
++    bool mapToPicture(const State &s, float x, float z, float &pu, float &pv);
++
++    // Game thread.
++    void publish(const State &state);
++    Pose pose();
++    // ga2_vr.
++    State latest(); // inactive when the game has not published for a while
++    void publishPose(const Pose &pose);
++}
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index b795832..c4f7ee1 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -37,6 +37,8 @@ namespace ga2_options
+         Buttons,
+         SharpText,
+         Vr,
++        VrBattleSelect,
++        VrGuide,
+         OnscreenPad,
+         DumpTextures,
+         KeyCount
+@@ -112,6 +114,14 @@ namespace ga2_options
+              "GA2_SHARP_TEXT", Apply::Live, {{"auto", "Automatic"}, {"1", "On"}, {"0", "Off"}}},
+             {"vr", "VR mode", "Plays in a headset through SteamVR or Monado (OpenXR). Hold both grips to recentre the screen.",
+              "GA2_VR", Apply::Restart, {{"0", "Off"}, {"1", "On (headset)"}}},
++            {"vr_battle_select", "VR battle map",
++             "Battle table: the map hovers in front of you; touch or cover units with your hand, drag orders, grab to pan, "
++             "both hands to zoom and turn. Surround: the map around you in stereo, laser pointer.",
++             "GA2_VR_BATTLE_SELECT", Apply::Live, {{"hand", "Battle table (hands)"}, {"laser", "Surround (laser)"}}},
++            {"vr_guide", "VR guide",
++             "The VR controls guide: its basics on the screen, its battle part at the next battle map. Show again replays both.",
++             "GA2_VR_GUIDE", Apply::Live,
++             {{"show", "Show again"}, {"battle", "Battle part next"}, {"basics", "Basics next"}, {"done", "Seen"}}},
+             {"onscreen_pad", "On-screen pad", "Clickable pad buttons beside the picture, for mouse-only play.", "GA2_ONSCREEN_PAD",
+              Apply::Live, {{"0", "Off"}, {"1", "On"}}},
+             {"dump_textures", "Dump textures (modding)",
+diff --git a/ps2xRuntime/src/lib/ga2_battletable.cpp b/ps2xRuntime/src/lib/ga2_battletable.cpp
+new file mode 100644
+index 0000000..3f28288
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_battletable.cpp
+@@ -0,0 +1,93 @@
++#include "runtime/ga2_battletable.h"
++
++#include <chrono>
++#include <cmath>
++#include <mutex>
++
++namespace ga2_battletable
++{
++    namespace
++    {
++        std::mutex g_mutex;
++        State g_state;
++        Pose g_pose;
++        std::chrono::steady_clock::time_point g_published{};
++    }
++
++    void toPlay(const Pose &p, float u, float v, float h, float out[3])
++    {
++        // u right, v away from the player (-z), turned by yaw about y.
++        const float c = std::cos(p.yaw), s = std::sin(p.yaw);
++        const float x = u, z = -v;
++        out[0] = p.center[0] + c * x + s * z;
++        out[1] = p.center[1] + h;
++        out[2] = p.center[2] - s * x + c * z;
++    }
++
++    void toTable(const Pose &p, const float q[3], float &u, float &v, float &h)
++    {
++        const float c = std::cos(p.yaw), s = std::sin(p.yaw);
++        const float dx = q[0] - p.center[0], dz = q[2] - p.center[2];
++        const float x = c * dx - s * dz, z = s * dx + c * dz;
++        u = x;
++        v = -z;
++        h = q[1] - p.center[1];
++    }
++
++    void tableToMap(const State &s, float u, float v, float &x, float &z)
++    {
++        x = s.cx + s.s * (u * s.rx + v * s.fx);
++        z = s.cz + s.s * (u * s.rz + v * s.fz);
++    }
++
++    void mapToTable(const State &s, float x, float z, float &u, float &v)
++    {
++        // r and f are orthonormal on the ground.
++        const float dx = (x - s.cx) / s.s, dz = (z - s.cz) / s.s;
++        u = dx * s.rx + dz * s.rz;
++        v = dx * s.fx + dz * s.fz;
++    }
++
++    bool mapToPicture(const State &s, float x, float z, float &pu, float &pv)
++    {
++        const float *M = s.M;
++        const float cx = x * M[0] + z * M[8] + M[12], cy = x * M[1] + z * M[9] + M[13];
++        const float cw = x * M[3] + z * M[11] + M[15];
++        if (!(cw > 1e-6f))
++            return false;
++        float sx = cx / cw - s.originX, sy = cy / cw - s.originY; // the 2D layer's 640 x 480 space
++        if (s.wide && s.k > 0.0f)
++            sx = 320.0f + (sx - 320.0f) / s.k; // the 3D picture is squeezed into the frame by k
++        pu = sx / 640.0f;
++        pv = sy / 480.0f;
++        return std::isfinite(pu) && std::isfinite(pv);
++    }
++
++    void publish(const State &state)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_state = state;
++        g_published = std::chrono::steady_clock::now();
++    }
++
++    State latest()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        State s = g_state;
++        if (std::chrono::steady_clock::now() - g_published > std::chrono::milliseconds(400))
++            s.active = false;
++        return s;
++    }
++
++    Pose pose()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        return g_pose;
++    }
++
++    void publishPose(const Pose &pose)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_pose = pose;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_settings_menu.cpp b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+index 37156be..b41bbe6 100644
+--- a/ps2xRuntime/src/lib/ga2_settings_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+@@ -215,6 +215,8 @@ namespace ga2_settings_menu
+                 return "Textures the game loads from now on go to the dump folder.";
+             case ga2_options::Vr:
+                 return "Takes effect when the game is started again.";
++            case ga2_options::VrBattleSelect:
++                return ga2_vr::headsetRunning() ? "" : "Used on the battle map in VR.";
+             default:
+                 return ga2_options::options()[key].apply == ga2_options::Apply::Restart ? "Takes effect when the game is started again." : "";
+             }
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 1d567ac..34a3a1b 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -2,7 +2,10 @@
+ #include "ga2_cheat_menu.h"
+ #include "ga2_vr_bindings.h"
+ #include "ga2_vr_input.h"
++#include "ga2_vrguide.h"
+ #include "runtime/ga2_display.h"
++#include "runtime/ga2_battletable.h"
++#include "runtime/ga2_ui_font.h"
+ #include "runtime/ga2_settings.h"
+ #include "ps2_mouse.h"
+ #include "runtime/ga2_vrpointer.h"
+@@ -172,6 +175,7 @@ namespace ga2_vr
+             V3 from, to;
+             bool hit = false;
+             bool active = false; // the hand that clicks
++            bool beam = true;    // false: only the reticle (the hand is the pointer)
+         };
+ 
+         struct Renderer
+@@ -511,12 +515,15 @@ void main() {
+                 const V3 a0 = l.from - side, a1 = l.from + side, b0 = l.to - side, b1 = l.to + side;
+                 const float beam[30] = {a0.x, a0.y, a0.z, 0, -1, b0.x, b0.y, b0.z, length, -1, b1.x, b1.y, b1.z, length, 1,
+                                         a0.x, a0.y, a0.z, 0, -1, b1.x, b1.y, b1.z, length, 1, a1.x, a1.y, a1.z, 0, 1};
+-                glUseProgram(g_gl.beam);
+-                setMatrix(g_gl.beam, "mvp", viewProj);
+-                glUniform1f(glGetUniformLocation(g_gl.beam, "time"), time);
+-                glUniform1f(glGetUniformLocation(g_gl.beam, "beamLength"), length);
+-                glUniform1f(glGetUniformLocation(g_gl.beam, "fadeEnd"), l.hit || length > 2.0f ? 0.0f : 1.0f);
+-                drawMesh(beam, 6);
++                if (l.beam)
++                {
++                    glUseProgram(g_gl.beam);
++                    setMatrix(g_gl.beam, "mvp", viewProj);
++                    glUniform1f(glGetUniformLocation(g_gl.beam, "time"), time);
++                    glUniform1f(glGetUniformLocation(g_gl.beam, "beamLength"), length);
++                    glUniform1f(glGetUniformLocation(g_gl.beam, "fadeEnd"), l.hit || length > 2.0f ? 0.0f : 1.0f);
++                    drawMesh(beam, 6);
++                }
+                 // The reticle just ahead of the controller, across the aim.
+                 {
+                     const V3 up = std::fabs(dir.y) > 0.95f ? V3{1, 0, 0} : V3{0, 1, 0};
+@@ -543,6 +550,662 @@ void main() {
+ 
+         // Draws sky, screen and lasers for one eye. view/proj: the eye; eye:
+         // its position (for billboarding).
++        // ---- the battle table (ga2_battletable.h) ----------------------------------------------
++        // In VR with "VR battle selection" Hand the tactical map hovers flat in front of the player (after
++        // BattleGroupVR's radar): the game's own picture of the map, reprojected from its camera onto a horizontal
++        // table (exact for the ground, the unit icons lie on it), the units' icons standing over it as holographic
++        // discs on stalks, the order being dragged as a beam to its target, the whole picture (HUD, dialogue,
++        // menus) on a screen beyond the table, and the hands as translucent gloves.
++        const char *kTableVs = R"(#version 330
++layout(location = 0) in vec3 pos;
++layout(location = 1) in vec2 uv;
++layout(location = 2) in vec2 aux;
++uniform mat4 mvp;
++out vec2 v_uv;
++out vec2 v_aux;
++void main() { v_uv = uv; v_aux = aux; gl_Position = mvp * vec4(pos, 1.0); })";
++
++        // uv: the picture (0..1 of the 640 x 448 frame; outside: not visible); aux: the table, -1..1 on both axes.
++        const char *kTableFs = R"(#version 330
++in vec2 v_uv;
++in vec2 v_aux;
++uniform sampler2D tex;
++uniform vec2 extent;
++uniform float time;
++uniform vec4 masks[5]; // HUD rectangles in picture uv (x0, y0, x1, y1): shown on the screen beyond, not on the table
++out vec4 o;
++float box(vec2 p, vec4 r, float soft) {
++    vec2 a = smoothstep(r.xy - soft, r.xy, p) * (1.0 - smoothstep(r.zw, r.zw + soft, p));
++    return a.x * a.y;
++}
++void main()
++{
++    vec2 e = abs(v_aux);
++    float edge = max(e.x, e.y);
++    // Inside the picture (soft border) and outside the HUD.
++    vec2 inPic = smoothstep(vec2(0.0), vec2(0.03), v_uv) * (1.0 - smoothstep(vec2(0.97), vec2(1.0), v_uv));
++    float pic = inPic.x * inPic.y;
++    for (int i = 0; i < 5; ++i)
++        pic *= 1.0 - box(v_uv, masks[i], 0.01);
++    vec3 map = texture(tex, clamp(v_uv, 0.0, 1.0) * extent).rgb * 1.15;
++    // The plate: a dark blue glass with a glowing rim and a faint scan line drifting across.
++    float rim = smoothstep(0.93, 0.985, edge) * (1.0 - smoothstep(0.985, 1.0, edge));
++    float scan = 0.5 + 0.5 * sin((v_aux.y * 0.5 + 0.5 - fract(time * 0.12)) * 60.0);
++    float scanLine = smoothstep(0.985, 1.0, scan) * 0.08;
++    vec3 plate = vec3(0.02, 0.06, 0.14);
++    float fade = 1.0 - smoothstep(0.90, 0.97, edge);
++    vec3 col = mix(plate, map, pic * fade) + vec3(0.25, 0.6, 1.0) * (rim * 1.4 + scanLine);
++    float a = clamp(0.55 + 0.4 * pic * fade + rim, 0.0, 1.0);
++    o = vec4(col * a, a);
++})";
++
++        // A unit's icon from the picture, as a round holographic disc (uv 0..1 over the disc).
++        const char *kIconFs = R"(#version 330
++in vec2 v_uv;
++uniform sampler2D tex;
++uniform vec2 extent;
++uniform vec4 src; // picture uv: centre x, y, half size x, y
++uniform vec3 tint;
++uniform float glow;
++out vec4 o;
++void main()
++{
++    vec2 d = v_uv - 0.5;
++    float r = length(d) * 2.0;
++    if (r > 1.0) discard;
++    vec3 c = texture(tex, (src.xy + d * 2.0 * src.zw) * extent).rgb;
++    float ring = smoothstep(0.80, 0.90, r) * (1.0 - smoothstep(0.95, 1.0, r));
++    float a = 1.0 - smoothstep(0.92, 1.0, r);
++    vec3 col = c * (1.0 + glow * 0.3) + tint * ring * (1.0 + glow);
++    o = vec4(col * a, a);
++})";
++
++        // A solid additive colour (stalks, lines).
++        const char *kColorFs = R"(#version 330
++in vec2 v_uv;
++uniform vec4 color;
++out vec4 o;
++void main() { float a = 1.0 - smoothstep(0.6, 1.0, abs(v_uv.y * 2.0 - 1.0)); o = vec4(color.rgb * color.a * a, 0.0); })";
++
++        // The gloves: translucent, bright at the silhouette (fresnel), with a faint fill.
++        const char *kHandVs = R"(#version 330
++layout(location = 0) in vec3 pos;
++layout(location = 1) in vec3 nrm;
++uniform mat4 mvp;
++uniform vec3 eye;
++out vec3 v_n;
++out vec3 v_v;
++void main() { v_n = nrm; v_v = normalize(eye - pos); gl_Position = mvp * vec4(pos, 1.0); })";
++        const char *kHandFs = R"(#version 330
++in vec3 v_n;
++in vec3 v_v;
++uniform vec3 color;
++uniform float strength;
++out vec4 o;
++void main()
++{
++    float f = 1.0 - abs(dot(normalize(v_n), normalize(v_v)));
++    float rim = pow(f, 2.2);
++    vec3 c = color * (0.10 + rim * 0.95) * strength;
++    o = vec4(c, 0.0);
++})";
++
++        struct TableGl
++        {
++            GLuint table = 0, icon = 0, color = 0, hand = 0;
++            GLuint vao7 = 0, vbo7 = 0, vao6 = 0, vbo6 = 0;
++            bool ready = false;
++        } g_tableGl;
++
++        void initTableGl()
++        {
++            if (g_tableGl.ready)
++                return;
++            g_tableGl.table = compile(kTableVs, kTableFs, "table");
++            g_tableGl.icon = compile(kMeshVs, kIconFs, "table icon");
++            g_tableGl.color = compile(kMeshVs, kColorFs, "table line");
++            g_tableGl.hand = compile(kHandVs, kHandFs, "glove");
++            auto make = [](GLuint &vao, GLuint &vbo, std::initializer_list<int> sizes) {
++                glGenVertexArrays(1, &vao);
++                glGenBuffers(1, &vbo);
++                glBindVertexArray(vao);
++                glBindBuffer(GL_ARRAY_BUFFER, vbo);
++                int stride = 0;
++                for (int s : sizes)
++                    stride += s;
++                int offset = 0, index = 0;
++                for (int s : sizes)
++                {
++                    glEnableVertexAttribArray(GLuint(index));
++                    glVertexAttribPointer(GLuint(index), s, GL_FLOAT, GL_FALSE, stride * int(sizeof(float)),
++                                          reinterpret_cast<void *>(size_t(offset) * sizeof(float)));
++                    offset += s;
++                    ++index;
++                }
++                glBindVertexArray(0);
++            };
++            make(g_tableGl.vao7, g_tableGl.vbo7, {3, 2, 2});
++            make(g_tableGl.vao6, g_tableGl.vbo6, {3, 3});
++            // The glove program takes "nrm" at location 1 (compile() binds "uv" there; the layout qualifiers win).
++            g_tableGl.ready = true;
++        }
++
++        void drawArrays(GLuint vao, GLuint vbo, const std::vector<float> &data, int floatsPerVertex)
++        {
++            glBindVertexArray(vao);
++            glBindBuffer(GL_ARRAY_BUFFER, vbo);
++            glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(sizeof(float) * data.size()), data.data(), GL_DYNAMIC_DRAW);
++            glDrawArrays(GL_TRIANGLES, 0, GLsizei(data.size() / size_t(floatsPerVertex)));
++        }
++
++        V3 playPoint(const ga2_battletable::Pose &pose, float u, float v, float h)
++        {
++            float p[3];
++            ga2_battletable::toPlay(pose, u, v, h, p);
++            return V3{p[0], p[1], p[2]};
++        }
++
++        // A thin camera-facing band from a to b (additive colour).
++        void drawLine(const M4 &viewProj, V3 eye, V3 a, V3 b, float width, V3 rgb, float alpha)
++        {
++            const V3 axis = b - a;
++            if (dot(axis, axis) < 1e-8f)
++                return;
++            const V3 side = normalize(cross(normalize(axis), normalize(eye - (a + b) * 0.5f))) * (width * 0.5f);
++            const V3 a0 = a - side, a1 = a + side, b0 = b - side, b1 = b + side;
++            const float q[30] = {a0.x, a0.y, a0.z, 0, 0, b0.x, b0.y, b0.z, 1, 0, b1.x, b1.y, b1.z, 1, 1,
++                                 a0.x, a0.y, a0.z, 0, 0, b1.x, b1.y, b1.z, 1, 1, a1.x, a1.y, a1.z, 0, 1};
++            glUseProgram(g_tableGl.color);
++            setMatrix(g_tableGl.color, "mvp", viewProj);
++            glUniform4f(glGetUniformLocation(g_tableGl.color, "color"), rgb.x, rgb.y, rgb.z, alpha);
++            drawMesh(q, 6);
++        }
++
++        // A flat ring on the table (the cursor program's hologram ring), centre c, radius r.
++        void drawTableRing(const M4 &viewProj, const ga2_battletable::Pose &pose, float u, float v, float r, float strength,
++                           float time)
++        {
++            const V3 c = playPoint(pose, u, v, 0.004f);
++            const V3 ux = playPoint(pose, u + r, v, 0.004f) - c, vy = playPoint(pose, u, v + r, 0.004f) - c;
++            glUseProgram(g_gl.cursor);
++            setMatrix(g_gl.cursor, "mvp", viewProj);
++            glUniform1f(glGetUniformLocation(g_gl.cursor, "time"), time);
++            glUniform1f(glGetUniformLocation(g_gl.cursor, "strength"), strength);
++            rect(c, ux, vy, false);
++        }
++
++        // ---- the gloves ----
++        // A hand from capsule-like segments in the aim pose's frame (x right, y up, -z forward; metres). The palm
++        // stands vertical with the knuckle row along -y (the index on top), as a hand holds a controller; fingers
++        // curl toward the palm side (-x for the right hand, +x for the left). curl: index, middle, ring, pinky, thumb
++        // (radians per joint).
++        void appendSegment(std::vector<float> &out, const M4 &frame, V3 a, V3 b, float ra, float rb)
++        {
++            constexpr int kSides = 12;
++            const V3 axis = b - a;
++            const float len = std::sqrt(dot(axis, axis));
++            if (len < 1e-5f)
++                return;
++            const V3 d = axis * (1.0f / len);
++            const V3 up = std::fabs(d.y) > 0.9f ? V3{1, 0, 0} : V3{0, 1, 0};
++            const V3 s1 = normalize(cross(d, up)), s2 = cross(s1, d);
++            auto world = [&](V3 p) {
++                return V3{frame.m[0] * p.x + frame.m[4] * p.y + frame.m[8] * p.z + frame.m[12],
++                          frame.m[1] * p.x + frame.m[5] * p.y + frame.m[9] * p.z + frame.m[13],
++                          frame.m[2] * p.x + frame.m[6] * p.y + frame.m[10] * p.z + frame.m[14]};
++            };
++            auto dir = [&](V3 n) {
++                return V3{frame.m[0] * n.x + frame.m[4] * n.y + frame.m[8] * n.z, frame.m[1] * n.x + frame.m[5] * n.y + frame.m[9] * n.z,
++                          frame.m[2] * n.x + frame.m[6] * n.y + frame.m[10] * n.z};
++            };
++            auto push = [&](V3 p, V3 n) {
++                const V3 wp = world(p), wn = dir(n);
++                out.insert(out.end(), {wp.x, wp.y, wp.z, wn.x, wn.y, wn.z});
++            };
++            for (int i = 0; i < kSides; ++i)
++            {
++                const float t0 = 6.2831853f * float(i) / kSides, t1 = 6.2831853f * float(i + 1) / kSides;
++                const V3 n0 = s1 * std::cos(t0) + s2 * std::sin(t0), n1 = s1 * std::cos(t1) + s2 * std::sin(t1);
++                const V3 p0 = a + n0 * ra, p1 = a + n1 * ra, q0 = b + n0 * rb, q1 = b + n1 * rb;
++                push(p0, n0), push(q0, n0), push(q1, n1);
++                push(p0, n0), push(q1, n1), push(p1, n1);
++                // Caps: a cone at each end (rounded look from the fresnel).
++                const V3 tipB = b + d * rb, tipA = a - d * ra;
++                push(q0, n0 * 0.5f + d * 0.5f), push(tipB, d), push(q1, n1 * 0.5f + d * 0.5f);
++                push(p1, n1 * 0.5f - d * 0.5f), push(tipA, d * -1.0f), push(p0, n0 * 0.5f - d * 0.5f);
++            }
++        }
++
++        // A finger: base point, the straight direction, the curl axis, joint lengths, curl per joint.
++        void appendFinger(std::vector<float> &out, const M4 &frame, V3 base, V3 straight, V3 axis, const float *lengths,
++                          float radius, float curl)
++        {
++            V3 p = base, d = straight;
++            for (int j = 0; j < 3; ++j)
++            {
++                // Rotate d about axis by curl (Rodrigues).
++                const float c = std::cos(curl), s = std::sin(curl);
++                d = d * c + cross(axis, d) * s + axis * (dot(axis, d) * (1.0f - c));
++                const V3 q = p + d * lengths[j];
++                const float r0 = radius * (1.0f - 0.12f * float(j)), r1 = radius * (1.0f - 0.12f * float(j + 1));
++                appendSegment(out, frame, p, q, r0, r1);
++                p = q;
++            }
++        }
++
++        void drawGlove(const M4 &viewProj, V3 eye, const M4 &aimPose, bool left, float trigger, float grip, bool grabbing,
++                       float strength)
++        {
++            // The aim pose sits at the controller's tip: the knuckles 9 cm behind it, so the pointing index finger
++            // ends about there (where the pointer is).
++            const float side = left ? 1.0f : -1.0f; // the palm side along x
++            const V3 axis{0, side > 0 ? -1.0f : 1.0f, 0}; // curling turns -z toward the palm side
++            const V3 fwd{0, 0, -1};
++            const float point = std::clamp((trigger - 0.1f) / 0.6f, 0.0f, 1.0f);
++            const float fist = std::clamp((grip - 0.1f) / 0.6f, 0.0f, 1.0f);
++            // Rest: a relaxed open hand; trigger: point (index straight, the rest curled); grip: a fist.
++            auto mix = [](float a, float b, float t) { return a + (b - a) * t; };
++            const float relaxed = 0.22f, curled = 0.62f;
++            float curlIndex = mix(relaxed, 0.04f, point), curlOthers = mix(relaxed, curled, point);
++            curlIndex = mix(curlIndex, curled, fist);
++            curlOthers = mix(curlOthers, curled + 0.05f, fist);
++            const float curlThumb = mix(mix(0.25f, 0.55f, point), 0.6f, fist);
++            std::vector<float> mesh;
++            mesh.reserve(6 * 8 * 12 * 18);
++            const float k = -0.09f; // knuckle row z (behind the aim point)
++            // Palm: from the wrist to the knuckles, as two broad segments.
++            // Palm: a flat hand is three slim bones side by side from the wrist to the knuckles.
++            for (int b = 0; b < 3; ++b)
++            {
++                const float y0 = -0.006f - 0.016f * float(b), y1 = 0.012f - 0.022f * float(b);
++                appendSegment(mesh, aimPose, V3{side * 0.004f, y0, k + 0.078f}, V3{side * 0.002f, y1, k + 0.006f}, 0.0125f, 0.0135f);
++            }
++            appendSegment(mesh, aimPose, V3{side * 0.004f, -0.020f, k + 0.090f}, V3{side * 0.004f, -0.020f, k + 0.070f}, 0.016f, 0.017f); // wrist
++            const float lengths[4][3] = {{0.040f, 0.024f, 0.020f}, {0.044f, 0.027f, 0.021f}, {0.041f, 0.025f, 0.020f}, {0.032f, 0.019f, 0.018f}};
++            for (int f = 0; f < 4; ++f)
++            {
++                const V3 base{0.0f, 0.020f - 0.017f * float(f), k - 0.004f * float(f == 1)};
++                appendFinger(mesh, aimPose, base, fwd, axis, lengths[f], f == 3 ? 0.0075f : 0.0088f, f == 0 ? curlIndex : curlOthers);
++            }
++            // Thumb: from the palm's top, toward the front and the palm side.
++            {
++                const V3 base{side * 0.016f, 0.024f, k + 0.045f};
++                const V3 straight = normalize(V3{side * 0.45f, 0.35f, -0.82f});
++                const float tl[3] = {0.034f, 0.026f, 0.020f};
++                appendFinger(mesh, aimPose, base, straight, normalize(V3{0, 1, 0.3f}) * (side > 0 ? -1.0f : 1.0f), tl, 0.0095f,
++                             curlThumb);
++            }
++            glUseProgram(g_tableGl.hand);
++            setMatrix(g_tableGl.hand, "mvp", viewProj);
++            glUniform3f(glGetUniformLocation(g_tableGl.hand, "eye"), eye.x, eye.y, eye.z);
++            // Blue gloves, orange while grabbing (BattleGroupVR's colours).
++            if (grabbing)
++                glUniform3f(glGetUniformLocation(g_tableGl.hand, "color"), 1.0f, 0.55f, 0.15f);
++            else
++                glUniform3f(glGetUniformLocation(g_tableGl.hand, "color"), 0.30f, 0.65f, 1.0f);
++            glUniform1f(glGetUniformLocation(g_tableGl.hand, "strength"), strength);
++            drawArrays(g_tableGl.vao6, g_tableGl.vbo6, mesh, 6);
++        }
++
++        struct TableView
++        {
++            bool active = false;
++            ga2_battletable::State state;
++            ga2_battletable::Pose pose;
++            M4 aim[2];
++            bool aimValid[2] = {false, false};
++            float trigger[2] = {0, 0}, grip[2] = {0, 0};
++            bool grabbing[2] = {false, false};
++        } g_tableView;
++
++        // The HUD of the battle map in the 2D layer (picture uv): the radar, the clock, the unit panel, the pilot's
++        // portrait and the angel list; they stay on the screen beyond the table.
++        void tableMasks(bool wide, float out[20])
++        {
++            (void)wide;
++            const float r[5][4] = {{0.00f, 0.00f, 0.20f, 0.33f}, {0.79f, 0.00f, 1.00f, 0.10f}, {0.70f, 0.78f, 1.00f, 1.00f},
++                                   {0.00f, 0.74f, 0.16f, 1.00f}, {-1.0f, -1.0f, -1.0f, -1.0f}};
++            std::memcpy(out, r, sizeof(r));
++        }
++
++        // The guide's panel and the table's "?" (with the guide's code below).
++        constexpr int kGuideWidth = 1024, kGuideHeight = 448;
++        void drawGuide(const M4 &viewProj, V3 eye, V3 centre, V3 right, V3 up, float time);
++        V3 tableHelpPoint(const ga2_battletable::Pose &pose);
++
++        void drawTable(const M4 &viewProj, V3 eye, GLuint picture, float extentX, float extentY, bool wide, float time)
++        {
++            initTableGl();
++            const TableView &tv = g_tableView;
++            const ga2_battletable::State &st = tv.state;
++            const ga2_battletable::Pose &pose = tv.pose;
++
++            // The full picture on a screen beyond the table (HUD, dialogue, the game's menus).
++            {
++                const ScreenGeometry s = screenGeometry(wide);
++                const float scale = 0.55f;
++                const V3 c = playPoint(pose, 0.0f, pose.halfDepth + 1.6f, 0.75f);
++                const V3 right = playPoint(pose, 1.0f, pose.halfDepth + 1.6f, 0.75f) - c;
++                glUseProgram(g_gl.quad);
++                setMatrix(g_gl.quad, "mvp", viewProj);
++                glBindTexture(GL_TEXTURE_2D, picture);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++                glUniform1i(glGetUniformLocation(g_gl.quad, "tex"), 0);
++                glUniform2f(glGetUniformLocation(g_gl.quad, "extent"), extentX, extentY);
++                rect(c, right * (s.halfWidth * scale), V3{0, s.halfHeight * scale, 0}, false);
++            }
++
++            // The table: a grid of vertices over it, each with its map point's place in the picture.
++            constexpr int kU = 48, kV = 32;
++            std::vector<float> mesh;
++            mesh.reserve(size_t(kU) * kV * 6 * 7);
++            auto vertex = [&](int i, int j) {
++                const float a = -1.0f + 2.0f * float(i) / kU, b = -1.0f + 2.0f * float(j) / kV;
++                const float u = a * pose.halfWidth, v = b * pose.halfDepth;
++                const V3 p = playPoint(pose, u, v, 0.0f);
++                float x = 0, z = 0, pu = -1, pv = -1;
++                ga2_battletable::tableToMap(st, u, v, x, z);
++                if (!ga2_battletable::mapToPicture(st, x, z, pu, pv))
++                    pu = pv = -1.0f;
++                mesh.insert(mesh.end(), {p.x, p.y, p.z, pu, pv, a, b});
++            };
++            for (int j = 0; j < kV; ++j)
++                for (int i = 0; i < kU; ++i)
++                {
++                    vertex(i, j), vertex(i + 1, j), vertex(i + 1, j + 1);
++                    vertex(i, j), vertex(i + 1, j + 1), vertex(i, j + 1);
++                }
++            glEnable(GL_BLEND);
++            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++            glDepthMask(GL_FALSE);
++            glUseProgram(g_tableGl.table);
++            setMatrix(g_tableGl.table, "mvp", viewProj);
++            glBindTexture(GL_TEXTURE_2D, picture);
++            glUniform1i(glGetUniformLocation(g_tableGl.table, "tex"), 0);
++            glUniform2f(glGetUniformLocation(g_tableGl.table, "extent"), extentX, extentY);
++            glUniform1f(glGetUniformLocation(g_tableGl.table, "time"), time);
++            float masks[20];
++            tableMasks(wide, masks);
++            glUniform4fv(glGetUniformLocation(g_tableGl.table, "masks"), 5, masks);
++            drawArrays(g_tableGl.vao7, g_tableGl.vbo7, mesh, 7);
++
++            // The units: a ring on the table, a stalk and the icon as a disc over it (facing the player).
++            glBlendFunc(GL_ONE, GL_ONE);
++            for (int n = 0; n < st.unitCount; ++n)
++            {
++                const ga2_battletable::Unit &unit = st.units[n];
++                float u = 0, v = 0;
++                ga2_battletable::mapToTable(st, unit.x, unit.z, u, v);
++                if (std::fabs(u) > pose.halfWidth * 0.97f || std::fabs(v) > pose.halfDepth * 0.97f)
++                    continue;
++                const float lift = unit.hovered ? 0.075f : 0.06f;
++                const V3 foot = playPoint(pose, u, v, 0.002f), head = playPoint(pose, u, v, lift);
++                const V3 tint = unit.focused ? V3{1.0f, 0.6f, 0.2f} : V3{0.3f, 0.7f, 1.0f};
++                drawLine(viewProj, eye, foot, head, 0.003f, tint, unit.hovered ? 0.9f : 0.45f);
++                drawTableRing(viewProj, pose, u, v, unit.hovered ? 0.028f : 0.018f, unit.hovered ? 1.0f : 0.5f, time);
++                // The icon disc, a billboard turned toward the eye about the vertical.
++                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++                glUseProgram(g_tableGl.icon);
++                setMatrix(g_tableGl.icon, "mvp", viewProj);
++                glUniform2f(glGetUniformLocation(g_tableGl.icon, "extent"), extentX, extentY);
++                const float iconHalf = 24.0f;
++                glUniform4f(glGetUniformLocation(g_tableGl.icon, "src"), unit.sx / 640.0f, unit.sy / 480.0f, iconHalf / 640.0f,
++                            iconHalf / 480.0f);
++                glUniform3f(glGetUniformLocation(g_tableGl.icon, "tint"), tint.x, tint.y, tint.z);
++                glUniform1f(glGetUniformLocation(g_tableGl.icon, "glow"), unit.hovered ? 1.0f : 0.0f);
++                const V3 toEye = eye - head;
++                const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
++                const V3 right = normalize(cross(V3{0, 1, 0}, flat));
++                const float size = unit.hovered ? 0.030f : 0.022f;
++                rect(head + V3{0, size, 0}, right * size, V3{0, size, 0}, false);
++                glBlendFunc(GL_ONE, GL_ONE);
++            }
++
++            // The order being dragged: a beam from the hand's fingertip to the target, a ring there.
++            if (st.drag)
++            {
++                const int h = std::clamp(st.dragHand, 0, 1);
++                float u = 0, v = 0;
++                ga2_battletable::mapToTable(st, st.dragX, st.dragZ, u, v);
++                const V3 target = playPoint(pose, u, v, 0.003f);
++                const ga2_battletable::Hand &hand = pose.hands[h];
++                if (hand.valid)
++                    drawLine(viewProj, eye, V3{hand.tip[0], hand.tip[1], hand.tip[2]}, target, 0.006f, V3{0.35f, 0.75f, 1.0f},
++                             0.9f);
++                drawTableRing(viewProj, pose, u, v, 0.03f + 0.006f * std::sin(time * 8.0f), 1.0f, time);
++            }
++
++            // The "?" that replays the battle part of the guide.
++            {
++                const V3 q = tableHelpPoint(pose);
++                const V3 toEye = normalize(eye - q);
++                const V3 u = normalize(cross(V3{0, 1, 0}, toEye)), v = normalize(cross(toEye, u));
++                glUseProgram(g_gl.cursor);
++                setMatrix(g_gl.cursor, "mvp", viewProj);
++                glUniform1f(glGetUniformLocation(g_gl.cursor, "time"), time);
++                glUniform1f(glGetUniformLocation(g_gl.cursor, "strength"), 0.8f);
++                rect(q, u * 0.022f, v * 0.022f, false);
++                drawLine(viewProj, eye, q + V3{0, -0.006f, 0}, q + V3{0, 0.004f, 0}, 0.003f, V3{0.5f, 0.85f, 1.0f}, 1.0f);
++                drawLine(viewProj, eye, q + V3{0, 0.008f, 0}, q + V3{0, 0.010f, 0}, 0.003f, V3{0.5f, 0.85f, 1.0f}, 1.0f);
++            }
++            {
++                const V3 c = playPoint(pose, -pose.halfWidth * 0.55f, pose.halfDepth + 0.05f, 0.32f);
++                const V3 toEye = eye - c;
++                const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
++                const V3 right = normalize(cross(V3{0, 1, 0}, flat));
++                const float h = 0.16f, w = h * float(kGuideWidth) / float(kGuideHeight);
++                drawGuide(viewProj, eye, c, right * w, V3{0, h, 0}, time);
++                glEnable(GL_BLEND);
++                glBlendFunc(GL_ONE, GL_ONE);
++                glDepthMask(GL_FALSE);
++            }
++            // The gloves.
++            for (int h = 0; h < 2; ++h)
++                if (tv.aimValid[h])
++                    drawGlove(viewProj, eye, tv.aim[h], h == 0, tv.trigger[h], tv.grip[h], tv.grabbing[h], 1.0f);
++            glDepthMask(GL_TRUE);
++            glDisable(GL_BLEND);
++        }
++
++        // ---- the VR guide (ga2_vrguide.h) -------------------------------------------------------
++        ga2_vrguide::Guide g_guide;
++        ga2_vrguide::Card g_guideCard;
++        struct GuideFrame
++        {
++            ga2_vr_input::Inputs in; // this frame's sampled controls
++            bool recentered = false, pointerHit = false;
++            float grabMoved = 0.0f, zoomChange = 0.0f, twist = 0.0f;
++            bool replayBattle = false;
++        } g_guideFrame;
++        GLuint g_guideTexture = 0;
++
++        // The card as an image (raylib, the UI font): a holographic panel with the title, the step and its dots.
++        GLuint renderGuide(const ga2_vrguide::Card &card, bool japanese)
++        {
++            static RenderTexture2D target{};
++            if (!target.id)
++            {
++                target = LoadRenderTexture(kGuideWidth, kGuideHeight);
++                SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
++            }
++            if (!target.id)
++                return 0;
++            rlDrawRenderBatchActive();
++            BeginTextureMode(target);
++            rlEnableColorBlend();
++            ClearBackground(BLANK);
++            rlSetBlendFactorsSeparate(RL_SRC_ALPHA, RL_ONE_MINUS_SRC_ALPHA, RL_ONE, RL_ONE_MINUS_SRC_ALPHA, RL_FUNC_ADD, RL_FUNC_ADD);
++            BeginBlendMode(BLEND_CUSTOM_SEPARATE);
++            const Rectangle panel{8, 8, float(kGuideWidth - 16), float(kGuideHeight - 16)};
++            DrawRectangleRounded(panel, 0.08f, 12, Color{8, 22, 48, 240});
++            DrawRectangleRoundedLinesEx(panel, 0.08f, 12, 4.0f, Color{90, 180, 255, 255});
++            const Color cyan{120, 200, 255, 255}, white{235, 242, 255, 255}, dim{150, 170, 200, 255};
++            ga2_ui_font::draw(card.title, 40.0f, 28.0f, 46.0f, cyan);
++            // The body, wrapped to the panel (at spaces; anywhere in Japanese).
++            const float size = 34.0f, width = float(kGuideWidth) - 80.0f;
++            float y = 96.0f;
++            std::string line, word;
++            auto flush = [&] {
++                if (!line.empty())
++                    ga2_ui_font::draw(line, 40.0f, y, size, white);
++                y += size * 1.3f;
++                line.clear();
++            };
++            const std::string &body = card.body;
++            for (size_t i = 0; i <= body.size(); ++i)
++            {
++                const bool end = i == body.size();
++                const unsigned char c = end ? 0 : static_cast<unsigned char>(body[i]);
++                if (end || c == ' ' || c == '\n' || (c >= 0xE0 && japanese))
++                {
++                    // A word ends here (a Japanese character is a word of its own).
++                    std::string next = line.empty() ? word : line + (line.back() == ' ' || japanese ? "" : " ") + word;
++                    if (!word.empty() && ga2_ui_font::measure(next, size) > width)
++                    {
++                        flush();
++                        next = word;
++                    }
++                    line = next;
++                    word.clear();
++                    if (c == '\n')
++                        flush();
++                    if (!end && c >= 0xE0 && japanese)
++                    {
++                        // Take the whole UTF-8 character as the next word.
++                        const size_t n = c >= 0xF0 ? 4 : 3;
++                        word = body.substr(i, n);
++                        i += n - 1;
++                    }
++                }
++                else
++                    word += char(c);
++            }
++            if (!word.empty())
++                line += (line.empty() || japanese ? "" : " ") + word;
++            flush();
++            // Progress dots and the way out.
++            if (card.part != ga2_vrguide::Part::GameTutorial)
++            {
++                for (int i = 0; i < card.steps; ++i)
++                    DrawCircle(48 + i * 26, kGuideHeight - 42, i == card.step ? 8.0f : 6.0f, i <= card.step ? cyan : Color{60, 80, 110, 255});
++                const char *skip = japanese ? "B 長押しでスキップ" : "Hold B to skip";
++                ga2_ui_font::draw(skip, float(kGuideWidth) - 40.0f - ga2_ui_font::measure(skip, 26.0f), float(kGuideHeight) - 58.0f, 26.0f, dim);
++            }
++            EndBlendMode();
++            EndTextureMode();
++            rlDrawRenderBatchActive();
++            return target.texture.id;
++        }
++
++        // Where on a controller (the aim pose's frame, as drawGlove) the marker for a target sits; false: none there.
++        bool guideMarker(ga2_vrguide::Target t, int hand, V3 &out)
++        {
++            using T = ga2_vrguide::Target;
++            const float side = hand == 0 ? 1.0f : -1.0f;
++            switch (t)
++            {
++            case T::Trigger: out = V3{0.0f, -0.012f, -0.055f}; return true;
++            case T::Grip: case T::BothGrips: out = V3{side * 0.03f, -0.04f, -0.03f}; return true;
++            case T::A: case T::B: out = V3{0.0f, 0.032f, -0.04f}; return hand == 1;
++            case T::X: case T::Y: out = V3{0.0f, 0.032f, -0.04f}; return hand == 0;
++            case T::Menu: out = V3{0.0f, 0.032f, -0.02f}; return hand == 0;
++            case T::Sticks: out = V3{0.0f, 0.034f, -0.058f}; return true;
++            default: return false;
++            }
++        }
++
++        // The card's panel (corners a..d from its centre and half axes) and the markers on the gloves.
++        void drawGuide(const M4 &viewProj, V3 eye, V3 centre, V3 right, V3 up, float time)
++        {
++            if (!g_guideCard.visible || !g_guideTexture)
++                return;
++            initTableGl();
++            glEnable(GL_BLEND);
++            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++            glDepthMask(GL_FALSE);
++            glUseProgram(g_gl.menu); // straight alpha image, premultiplied in the shader
++            setMatrix(g_gl.menu, "mvp", viewProj);
++            glActiveTexture(GL_TEXTURE0);
++            glBindTexture(GL_TEXTURE_2D, g_guideTexture);
++            glUniform1i(glGetUniformLocation(g_gl.menu, "tex"), 0);
++            rect(centre, right, up, true);
++            // Markers: a pulsing ring on the control, and a guide line from the panel to it.
++            glBlendFunc(GL_ONE, GL_ONE);
++            for (int h = 0; h < 2; ++h)
++            {
++                V3 local;
++                if (!g_tableView.aimValid[h] || !guideMarker(g_guideCard.target, h, local))
++                    continue;
++                const M4 &a = g_tableView.aim[h];
++                const V3 p{a.m[0] * local.x + a.m[4] * local.y + a.m[8] * local.z + a.m[12],
++                           a.m[1] * local.x + a.m[5] * local.y + a.m[9] * local.z + a.m[13],
++                           a.m[2] * local.x + a.m[6] * local.y + a.m[10] * local.z + a.m[14]};
++                const V3 toEye = normalize(eye - p);
++                const V3 u = normalize(cross(V3{0, 1, 0}, toEye)), v = normalize(cross(toEye, u));
++                const float r = 0.016f * (1.0f + 0.25f * std::sin(time * 6.0f));
++                glUseProgram(g_gl.cursor);
++                setMatrix(g_gl.cursor, "mvp", viewProj);
++                glUniform1f(glGetUniformLocation(g_gl.cursor, "time"), time);
++                glUniform1f(glGetUniformLocation(g_gl.cursor, "strength"), 1.0f);
++                rect(p + toEye * 0.01f, u * r, v * r, false);
++                drawLine(viewProj, eye, centre - up * 0.9f, p, 0.002f, V3{0.4f, 0.8f, 1.0f}, 0.5f);
++            }
++            glDepthMask(GL_TRUE);
++            glDisable(GL_BLEND);
++        }
++
++        // Once per headset frame: feed the guide, re-render its card when it changes, keep the option current.
++        void updateGuide(bool stereo)
++        {
++            const ga2_battletable::State &st = g_tableView.state;
++            ga2_vrguide::Inputs gi;
++            gi.table = g_tableView.active;
++            gi.theater = !g_tableView.active && !stereo;
++            gi.pointerOnScreen = g_guideFrame.pointerHit;
++            gi.trigger = std::max(g_tableView.trigger[0], g_tableView.trigger[1]) > 0.6f;
++            const ga2_vr_input::Inputs &in = g_guideFrame.in;
++            gi.a = in.circle, gi.b = in.cross, gi.x = in.square, gi.y = in.triangle, gi.menu = in.menu;
++            gi.recentered = g_guideFrame.recentered;
++            gi.grabMoved = g_guideFrame.grabMoved;
++            gi.zoomChange = g_guideFrame.zoomChange;
++            gi.twist = g_guideFrame.twist;
++            for (int n = 0; gi.table && n < st.unitCount; ++n)
++                gi.hover = gi.hover || st.units[n].hovered;
++            gi.presses = st.presses;
++            gi.orders = st.orders;
++            gi.gates = gi.table ? st.gates : uint32_t(ga2_vrguide::GateAllActions);
++            gi.state = ga2_settings::get(ga2_options::VrGuide);
++            gi.replayBattle = g_guideFrame.replayBattle;
++            g_guideFrame.replayBattle = false;
++            const bool japanese = std::strcmp(ga2_settings::value(ga2_options::Language), "ja") == 0;
++            const ga2_vrguide::Card card = g_guide.step(gi, GetTime(), japanese);
++            if (g_guide.state() != gi.state)
++                ga2_settings::set(ga2_options::VrGuide, g_guide.state());
++            static std::string shown;
++            const std::string key = card.visible ? card.title + "\n" + card.body + "\n" + std::to_string(card.step) : std::string();
++            if (!card.visible)
++                g_guideTexture = 0;
++            else if (key != shown || !g_guideTexture)
++            {
++                g_guideTexture = renderGuide(card, japanese);
++                if (g_guideTexture)
++                {
++                    glBindTexture(GL_TEXTURE_2D, g_guideTexture);
++                    glGenerateMipmap(GL_TEXTURE_2D);
++                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
++                }
++            }
++            shown = key;
++            g_guideCard = card;
++        }
++
++        // The table's "?" (replays the battle part of the guide): a ring at the front right corner.
++        V3 tableHelpPoint(const ga2_battletable::Pose &pose)
++        {
++            return playPoint(pose, pose.halfWidth - 0.06f, -pose.halfDepth + 0.06f, 0.02f);
++        }
++
+         void drawScene(const M4 &view, const M4 &proj, V3 eye, GLuint picture, float extentX, float extentY, bool wide,
+                        const std::array<Laser, 2> &lasers)
+         {
+@@ -571,6 +1234,15 @@ void main() {
+             glDepthMask(GL_TRUE);
+ 
+             const M4 viewProj = mul(proj, view);
++            if (g_tableView.active)
++            {
++                if (g_menu.texture)
++                    drawMenuQuad(viewProj, M4{}, playPoint(g_tableView.pose, 0.0f, 0.0f, 0.35f), 0.25f);
++                drawTable(viewProj, eye, picture, extentX, extentY, wide, time);
++                glUseProgram(0);
++                glBindVertexArray(0);
++                return;
++            }
+             const ScreenGeometry s = screenGeometry(wide);
+             // Screen.
+             glUseProgram(g_gl.quad);
+@@ -601,6 +1273,11 @@ void main() {
+             drawHands(viewProj, eye, lasers, time);
+             glDepthMask(GL_TRUE);
+             glDisable(GL_BLEND);
++            {
++                // In front of the screen's lower left, nearer than the screen, turned a little toward the player.
++                const float h = 0.20f, w = h * float(kGuideWidth) / float(kGuideHeight);
++                drawGuide(viewProj, eye, V3{-0.50f, -0.40f, -1.2f}, normalize(V3{1.0f, 0.0f, 0.25f}) * w, V3{0, h, 0}, time);
++            }
+             glUseProgram(0);
+             glBindVertexArray(0);
+         }
+@@ -652,6 +1329,7 @@ void main() {
+             XrAction dpad = XR_NULL_HANDLE, leftStick = XR_NULL_HANDLE, rightStick = XR_NULL_HANDLE;
+             XrAction facePad = XR_NULL_HANDLE, facePadClick = XR_NULL_HANDLE;
+             XrAction dpadUp = XR_NULL_HANDLE, dpadDown = XR_NULL_HANDLE, dpadLeft = XR_NULL_HANDLE, dpadRight = XR_NULL_HANDLE;
++            XrAction haptic = XR_NULL_HANDLE; // vibration output, per hand (the battle table's pulses)
+             XrPath hands[2] = {XR_NULL_PATH, XR_NULL_PATH};
+             XrSpace aimSpace[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+             int activeHand = 1;
+@@ -708,6 +1386,7 @@ void main() {
+             XR_FN(xrCreateActionSpace);
+             XR_FN(xrGetCurrentInteractionProfile);
+             XR_FN(xrPathToString);
++            XR_FN(xrApplyHapticFeedback);
+         } xr;
+ #undef XR_FN
+ 
+@@ -837,7 +1516,8 @@ void main() {
+                 action(g_xr.dpadUp, "dpad_up", "D-pad up (button)", kBool) &&
+                 action(g_xr.dpadDown, "dpad_down", "D-pad down (button)", kBool) &&
+                 action(g_xr.dpadLeft, "dpad_left", "D-pad left (button)", kBool) &&
+-                action(g_xr.dpadRight, "dpad_right", "D-pad right (button)", kBool);
++                action(g_xr.dpadRight, "dpad_right", "D-pad right (button)", kBool) &&
++                action(g_xr.haptic, "haptic", "Vibration", XR_ACTION_TYPE_VIBRATION_OUTPUT, true);
+             if (!ok)
+                 return false;
+ 
+@@ -858,9 +1538,19 @@ void main() {
+                     list.push_back({byAct[size_t(b.action)], path(b.path.c_str())});
+                 XrInteractionProfileSuggestedBinding info{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+                 info.interactionProfile = path(profile.name.c_str());
+-                info.countSuggestedBindings = uint32_t(list.size());
+-                info.suggestedBindings = list.data();
+-                const XrResult r = xr.xrSuggestInteractionProfileBindings(g_xr.instance, &info);
++                // Vibration on both hands (every standard profile has it); without it if the runtime refuses.
++                std::vector<XrActionSuggestedBinding> withHaptics = list;
++                withHaptics.push_back({g_xr.haptic, path("/user/hand/left/output/haptic")});
++                withHaptics.push_back({g_xr.haptic, path("/user/hand/right/output/haptic")});
++                info.countSuggestedBindings = uint32_t(withHaptics.size());
++                info.suggestedBindings = withHaptics.data();
++                XrResult r = xr.xrSuggestInteractionProfileBindings(g_xr.instance, &info);
++                if (!XR_SUCCEEDED(r))
++                {
++                    info.countSuggestedBindings = uint32_t(list.size());
++                    info.suggestedBindings = list.data();
++                    r = xr.xrSuggestInteractionProfileBindings(g_xr.instance, &info);
++                }
+                 if (XR_SUCCEEDED(r))
+                     ++suggested;
+                 else
+@@ -1016,6 +1706,7 @@ void main() {
+                       load(i, "xrGetActionStateFloat", xr.xrGetActionStateFloat) &&
+                       load(i, "xrGetActionStateVector2f", xr.xrGetActionStateVector2f) &&
+                       load(i, "xrCreateActionSpace", xr.xrCreateActionSpace) &&
++                      load(i, "xrApplyHapticFeedback", xr.xrApplyHapticFeedback) &&
+                       load(i, "xrGetCurrentInteractionProfile", xr.xrGetCurrentInteractionProfile) &&
+                       load(i, "xrPathToString", xr.xrPathToString);
+             if (!ok)
+@@ -1112,6 +1803,161 @@ void main() {
+             return XR_SUCCEEDED(xr.xrGetActionStateFloat(g_xr.session, &info, &state)) && state.isActive ? state.currentState : 0.0f;
+         }
+ 
++        void pulse(int hand, float seconds, float amplitude)
++        {
++            if (!xr.xrApplyHapticFeedback || !g_xr.haptic)
++                return;
++            XrHapticVibration v{XR_TYPE_HAPTIC_VIBRATION};
++            v.duration = XrDuration(double(seconds) * 1e9);
++            v.frequency = XR_FREQUENCY_UNSPECIFIED;
++            v.amplitude = amplitude;
++            XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
++            info.action = g_xr.haptic;
++            info.subactionPath = g_xr.hands[hand & 1];
++            xr.xrApplyHapticFeedback(g_xr.session, &info, reinterpret_cast<const XrHapticBaseHeader *>(&v));
++        }
++
++        // The battle table's place, the hands and the head for the game (once per headset frame); both grips turn
++        // the table (the twist of the line between the hands, as BattleGroupVR's radar); the game's haptic pulses.
++        void publishTablePose(const std::vector<XrView> &views, const M4 &world)
++        {
++            static ga2_battletable::Pose table = [] {
++                ga2_battletable::Pose t;
++                // GA2_VR_TABLE=<height below the eyes>,<distance in front>,<width> (metres; default 0.45,0.55,1.2).
++                if (const char *v = std::getenv("GA2_VR_TABLE"); v && *v)
++                {
++                    float h = 0.45f, d = 0.55f, w = 1.2f;
++                    if (std::sscanf(v, "%f,%f,%f", &h, &d, &w) >= 1)
++                    {
++                        t.center[1] = -h;
++                        t.center[2] = -d;
++                        t.halfWidth = std::clamp(w, 0.3f, 3.0f) * 0.5f;
++                        t.halfDepth = t.halfWidth * (2.0f / 3.0f);
++                    }
++                }
++                return t;
++            }();
++            static bool twisting = false;
++            static float yaw0 = 0.0f, angle0 = 0.0f;
++            TableView &tv = g_tableView;
++            table.valid = true;
++            ++table.serial;
++            for (int h = 0; h < 2; ++h)
++            {
++                ga2_battletable::Hand &hand = table.hands[h];
++                hand.valid = tv.aimValid[h];
++                hand.trigger = tv.trigger[h];
++                hand.grip = tv.grip[h];
++                if (!hand.valid)
++                    continue;
++                const M4 &a = tv.aim[h];
++                const V3 from{a.m[12], a.m[13], a.m[14]};
++                const V3 fwd = normalize(V3{-a.m[8], -a.m[9], -a.m[10]});
++                const V3 up{a.m[4], a.m[5], a.m[6]};
++                // The pointing index fingertip ends at the aim point (drawGlove); the palm 8 cm behind it.
++                const V3 palm = from - fwd * 0.08f - up * 0.015f;
++                hand.tip[0] = from.x, hand.tip[1] = from.y, hand.tip[2] = from.z;
++                hand.aim[0] = fwd.x, hand.aim[1] = fwd.y, hand.aim[2] = fwd.z;
++                hand.palm[0] = palm.x, hand.palm[1] = palm.y, hand.palm[2] = palm.z;
++            }
++            {
++                const XrPosef &l = views[0].pose, &r = views[1].pose;
++                const V3 mid = (V3{l.position.x, l.position.y, l.position.z} + V3{r.position.x, r.position.y, r.position.z}) * 0.5f;
++                const M4 head = mul(world, pose(Q{l.orientation.x, l.orientation.y, l.orientation.z, l.orientation.w}, mid));
++                table.head[0] = head.m[12], table.head[1] = head.m[13], table.head[2] = head.m[14];
++                const V3 gaze = normalize(V3{-head.m[8], -head.m[9], -head.m[10]});
++                table.gaze[0] = gaze.x, table.gaze[1] = gaze.y, table.gaze[2] = gaze.z;
++            }
++            const bool both = tv.active && table.hands[0].valid && table.hands[1].valid && tv.grip[0] > 0.6f && tv.grip[1] > 0.6f;
++            if (both)
++            {
++                const float dx = table.hands[1].palm[0] - table.hands[0].palm[0], dz = table.hands[1].palm[2] - table.hands[0].palm[2];
++                const float angle = std::atan2(-dz, dx); // counter-clockwise seen from above (-z is ahead)
++                if (!twisting)
++                {
++                    twisting = true;
++                    yaw0 = table.yaw;
++                    angle0 = angle;
++                }
++                else
++                {
++                    float d = angle - angle0;
++                    while (d > 3.14159265f)
++                        d -= 6.2831853f;
++                    while (d < -3.14159265f)
++                        d += 6.2831853f;
++                    table.yaw = yaw0 + d;
++                }
++            }
++            else
++                twisting = false;
++            // For the guide: how far a grabbing palm moved, the zoom and the turn of this frame; the table's "?".
++            {
++                static float lastPalm[2][3] = {}, lastDistance = 0.0f, lastYaw = 0.0f;
++                static bool had[2] = {false, false};
++                static double helpAt = -10.0;
++                const bool g0 = tv.active && table.hands[0].valid && tv.grip[0] > 0.6f, g1 = tv.active && table.hands[1].valid && tv.grip[1] > 0.6f;
++                g_guideFrame.grabMoved = g_guideFrame.zoomChange = g_guideFrame.twist = 0.0f;
++                for (int h = 0; h < 2; ++h)
++                {
++                    const float *pp = table.hands[h].palm;
++                    if ((h == 0 ? g0 : g1) && !(g0 && g1) && had[h])
++                        g_guideFrame.grabMoved += std::sqrt((pp[0] - lastPalm[h][0]) * (pp[0] - lastPalm[h][0]) +
++                                                            (pp[1] - lastPalm[h][1]) * (pp[1] - lastPalm[h][1]) +
++                                                            (pp[2] - lastPalm[h][2]) * (pp[2] - lastPalm[h][2]));
++                    std::memcpy(lastPalm[h], pp, sizeof(lastPalm[h]));
++                    had[h] = table.hands[h].valid;
++                }
++                const float dx = table.hands[1].palm[0] - table.hands[0].palm[0], dy = table.hands[1].palm[1] - table.hands[0].palm[1],
++                            dz = table.hands[1].palm[2] - table.hands[0].palm[2];
++                const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
++                if (g0 && g1 && lastDistance > 0.05f && distance > 0.05f)
++                {
++                    g_guideFrame.zoomChange = std::fabs(std::log(distance / lastDistance));
++                    g_guideFrame.twist = std::fabs(table.yaw - lastYaw);
++                }
++                lastDistance = distance;
++                lastYaw = table.yaw;
++                if (tv.active)
++                {
++                    const V3 q = tableHelpPoint(table);
++                    for (int h = 0; h < 2; ++h)
++                    {
++                        const ga2_battletable::Hand &hand = table.hands[h];
++                        const V3 d = V3{hand.tip[0], hand.tip[1], hand.tip[2]} - q;
++                        if (hand.valid && dot(d, d) < 0.035f * 0.035f && GetTime() - helpAt > 2.0)
++                        {
++                            helpAt = GetTime();
++                            g_guideFrame.replayBattle = true;
++                            pulse(h, 0.1f, 0.5f);
++                        }
++                    }
++                }
++            }
++            ga2_battletable::publishPose(table);
++            tv.pose = table;
++
++            // Haptics: the game counts its pulses; a big one wins over a small one in the same frame.
++            static uint32_t small[2] = {0, 0}, big[2] = {0, 0};
++            static bool primed = false;
++            const ga2_battletable::State &st = tv.state;
++            if (!primed)
++            {
++                std::memcpy(small, st.hapticSmall, sizeof(small));
++                std::memcpy(big, st.hapticBig, sizeof(big));
++                primed = true;
++            }
++            for (int h = 0; h < 2; ++h)
++            {
++                if (st.hapticBig[h] != big[h])
++                    pulse(h, 0.1f, 0.5f);
++                else if (st.hapticSmall[h] != small[h])
++                    pulse(h, 0.05f, 0.25f);
++                small[h] = st.hapticSmall[h];
++                big[h] = st.hapticBig[h];
++            }
++        }
++
+         // Actions without subaction paths (every PS2 input except the pointer).
+         float scalar(XrAction action)
+         {
+@@ -1590,6 +2436,17 @@ void main() {
+         const ga2_vr_input::Inputs *script = scriptedInputs(ga2_activity::gameSeconds());
+         float triggers[2] = {script ? script->trigger[0] : value(g_xr.trigger, 0),
+                              script ? script->trigger[1] : value(g_xr.trigger, 1)};
++        // The battle table (ga2_battletable.h): the game says when the tactical map is shown in table mode.
++        g_tableView.state = ga2_battletable::latest();
++        g_tableView.active = g_tableView.state.active;
++        g_tableView.aimValid[0] = g_tableView.aimValid[1] = false;
++        const float grips[2] = {script ? script->l1 : scalar(g_xr.l1), script ? script->r1 : scalar(g_xr.r1)};
++        for (int h = 0; h < 2; ++h)
++        {
++            g_tableView.trigger[h] = triggers[h];
++            g_tableView.grip[h] = grips[h];
++            g_tableView.grabbing[h] = g_tableView.active && grips[h] > 0.6f;
++        }
+         for (int h = 0; h < 2; ++h)
+         {
+             if (triggers[h] > 0.6f)
+@@ -1604,8 +2461,11 @@ void main() {
+                                             V3{loc.pose.position.x, loc.pose.position.y, loc.pose.position.z}));
+             const V3 from{aim.m[12], aim.m[13], aim.m[14]};
+             const V3 dir = normalize(V3{-aim.m[8], -aim.m[9], -aim.m[10]});
++            g_tableView.aim[h] = aim;
++            g_tableView.aimValid[h] = true;
+             Laser &l = lasers[size_t(h)];
+             l.visible = true;
++            l.beam = true;
+             l.from = from;
+             V3 point;
+             float px = 0, py = 0;
+@@ -1622,7 +2482,7 @@ void main() {
+         const bool stereo = stereoShowing();
+         // Scripted input (GA2_VR_INPUT_SCRIPT) replaces the hands entirely: the lasers point at nothing (and the
+         // window's own mouse, which a headless desktop may wiggle, stays out of the menus).
+-        const bool pointerOffScreen = script != nullptr;
++        const bool pointerOffScreen = script != nullptr || g_tableView.active;
+         if (pointerOffScreen)
+         {
+             pointerHit = false;
+@@ -1646,12 +2506,16 @@ void main() {
+         {
+             pointerHit = false; // no screen to point at
+             // The game's view fills the eyes: the hands show as their
+-            // reticles with a short guide beam that fades out.
++            // reticles with a short guide beam that fades out. On the battle map with "VR battle selection" Hand,
++            // the hand itself is the pointer (what it covers is picked): no beam there.
++            const bool handSelect = ga2_vrpointer::scene() == ga2_vrpointer::Scene::TacticalMap &&
++                                    std::strcmp(ga2_settings::value(ga2_options::VrBattleSelect), "hand") == 0;
+             for (Laser &l : lasers)
+                 if (l.visible)
+                 {
+                     l.hit = false;
+                     l.to = l.from + normalize(l.to - l.from) * 0.45f;
++                    l.beam = !handSelect;
+                 }
+         }
+         ps2_mouse::setExternalPointer(pointerHit || pointerOffScreen, pointerX, pointerY, triggers[g_xr.activeHand] > 0.6f && !cheatMenuOpen, false, false, 0.0f);
+@@ -1669,11 +2533,19 @@ void main() {
+             case ga2_vrpointer::Scene::UnitCamera: in.scene = ga2_vr_input::Scene::UnitCamera; break;
+             default: in.scene = stereo ? ga2_vr_input::Scene::Stereo : ga2_vr_input::Scene::Flat; break;
+             }
++            if (g_tableView.active)
++            {
++                in.scene = ga2_vr_input::Scene::TacticalTable;
++                in.orderOnRelease = g_tableView.state.orderOnRelease;
++            }
+             if (cheatMenuOpen)
+                 in.scene = ga2_vr_input::Scene::Stereo; // the trigger is Circle in the menu
+             const ga2_vr_input::Output out = g_xr.mapper.step(in, GetTime());
+             if (out.recenter)
+                 recenter(frameState.predictedDisplayTime);
++            g_guideFrame.in = in;
++            g_guideFrame.recentered = out.recenter;
++            g_guideFrame.pointerHit = pointerHit;
+             PadState pad;
+             pad.buttons = out.buttons;
+             pad.leftStick = out.leftActive;
+@@ -1706,7 +2578,10 @@ void main() {
+             {
+                 // Stereo setup for the game's next frame: the head between the
+                 // eyes, a field of view covering both.
+-                if (ga2_pgs::stereo() && viewCount >= 2 && ga2_activity::scene3d())
++                if (viewCount >= 2)
++                    publishTablePose(views, world);
++                updateGuide(stereo);
++                if (ga2_pgs::stereo() && viewCount >= 2 && ga2_activity::scene3d() && !g_tableView.active)
+                 {
+                     ga2_stereo::Setup setup;
+                     setup.active = true;
+diff --git a/ps2xRuntime/src/lib/ga2_vr_input.h b/ps2xRuntime/src/lib/ga2_vr_input.h
+index 6884be7..58993a7 100644
+--- a/ps2xRuntime/src/lib/ga2_vr_input.h
++++ b/ps2xRuntime/src/lib/ga2_vr_input.h
+@@ -14,7 +14,10 @@
+ //     L1 nor R1);
+ //   - a face pad (a trackpad whose click is the four face buttons by
+ //     quadrant) for controllers without face buttons;
+-//   - what the triggers press depends on the scene the game shows (Scene).
++//   - what the triggers press depends on the scene the game shows (Scene);
++//   - on the battle table (TacticalTable) the grips belong to the table (grab, stretch: the game side) and a
++//     trigger is press-drag-release: Circle while held, and Circle once more after the release when the game
++//     says the drag ends in an order (orderOnRelease).
+ //
+ // Which PS2 inputs the games read where is in docs/vr/stereo.md (bindings).
+ #include <algorithm>
+@@ -52,6 +55,7 @@ namespace ga2_vr_input
+         TacticalMap, // battle map: the trigger confirms (Circle) on what the hand points at
+         Cockpit,     // battle cockpit / attack view: the triggers fire (Cross, held)
+         UnitCamera,  // battle camera view of one unit: the triggers are L2 / R2 (zoom)
++        TacticalTable, // battle map as a table (VR battle selection Hand): either trigger, press-drag-release
+     };
+ 
+     struct Vec2
+@@ -73,6 +77,7 @@ namespace ga2_vr_input
+         bool facePadClick = false; // ... whose click presses Circle / Cross / Square / Triangle by direction
+         int activeHand = 1;     // the hand that pointed last (its trigger confirms)
+         Scene scene = Scene::Flat;
++        bool orderOnRelease = false; // TacticalTable: the release of the held trigger gives the order
+     };
+ 
+     struct Output
+@@ -94,6 +99,7 @@ namespace ga2_vr_input
+     constexpr double kTapPulse = 0.12;    // Start stays pressed this long after a tap
+     constexpr double kRecenterHold = 1.0; // seconds of both grips
+     constexpr float kFacePadDeadzone = 0.3f;
++    constexpr double kOrderGap = 0.05, kOrderPulse = 0.12; // TacticalTable: Circle up, then down again this long
+ 
+     class Mapper
+     {
+@@ -157,6 +163,8 @@ namespace ga2_vr_input
+             // the unit camera view, where the right stick turns the camera and
+             // R1 / R2 pressure zooms: there the triggers are L2 / R2.
+             float l1 = in.l1, r1 = in.r1, l2 = in.l2, r2 = in.r2;
++            if (in.scene == Scene::TacticalTable)
++                l1 = r1 = 0.0f; // the grips grab the table
+             if (in.scene != Scene::UnitCamera)
+             {
+                 const float x = in.rightStick.x, y = in.rightStick.y;
+@@ -223,6 +231,20 @@ namespace ga2_vr_input
+                 latch(triggerOn_, std::max(in.trigger[0], in.trigger[1]), kOn, kOff);
+                 if (triggerOn_) b |= kCross;
+                 break;
++            case Scene::TacticalTable:
++            {
++                const bool was = triggerOn_;
++                latch(triggerOn_, std::max(in.trigger[0], in.trigger[1]), kOn, kOff);
++                if (triggerOn_) b |= kCircle;
++                if (was && !triggerOn_ && in.orderOnRelease)
++                {
++                    orderFrom_ = now + kOrderGap;
++                    orderUntil_ = now + kOrderGap + kOrderPulse;
++                }
++                if (now >= orderFrom_ && now < orderUntil_)
++                    b |= kCircle;
++                break;
++            }
+             }
+             return out;
+         }
+@@ -258,6 +280,7 @@ namespace ga2_vr_input
+         bool l1On_ = false, r1On_ = false, l2On_ = false, r2On_ = false;
+         bool triggerOn_ = false;
+         double menuSince_ = -1.0, tapUntil_ = -1.0;
++        double orderFrom_ = -1.0, orderUntil_ = -1.0;
+         double bothSince_ = -1.0;
+         bool recentered_ = false;
+     };
+diff --git a/ps2xRuntime/src/lib/ga2_vrguide.h b/ps2xRuntime/src/lib/ga2_vrguide.h
+new file mode 100644
+index 0000000..44b207c
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_vrguide.h
+@@ -0,0 +1,325 @@
++#pragma once
++
++// The VR guide (pure: no OpenXR, no GL; ga2_vr feeds it and draws its card). An interactive guide to the VR
++// controls in two parts, each step done by doing it (after BattleGroupVR's tutorial: a card with the step and a
++// pulsing marker on the control to use):
++//   - Basics, on the theater screen: pointing, clicking, the face and menu buttons, recentring;
++//   - Battle, at the battle table: grabbing, zooming and turning the map, hovering, selecting, drag orders and
++//     the other battle buttons.
++// While the game's own battle tutorial runs (it enables only the buttons it teaches, its "gates"), a card says
++// how to do in VR what it asks for, in place of its pad buttons. Holding B skips the current part. Where each part
++// stands is the option "VR guide" (vr_guide: show / battle / basics / done); "Show again" replays both.
++#include <cstdint>
++#include <string>
++
++namespace ga2_vrguide
++{
++    // What the marker points at.
++    enum class Target : uint8_t
++    {
++        None,
++        Trigger,
++        Grip,
++        BothGrips,
++        A,
++        B,
++        X,
++        Y,
++        Menu,
++        Sticks,
++        Screen,
++    };
++
++    enum class Part : uint8_t
++    {
++        None,
++        Basics,
++        Battle,
++        GameTutorial,
++    };
++
++    // The game's tutorial gates as actions (ga2_battletable::State::gates).
++    enum Gate : uint32_t
++    {
++        GateSelect = 1u << 0,    // Circle
++        GateCancel = 1u << 1,    // Cross
++        GatePan = 1u << 2,       // the D-pad scroll
++        GateZoom = 1u << 3,      // R1 / R2 camera height
++        GateAll = 1u << 4,       // Square (order all angels)
++        GateHWeapon = 1u << 5,   // Triangle
++        GateCockpit = 1u << 6,   // L3
++        GateUnitCam = 1u << 7,   // R3
++        GateStart = 1u << 8,     // Start
++        GateAngelList = 1u << 9, // L2
++        GateAllActions = (1u << 10) - 1u,
++    };
++
++    // Option vr_guide's choices.
++    enum State : int
++    {
++        Show = 0,   // both parts to come
++        Battle = 1, // the battle part to come
++        Basics = 2, // the basics to come
++        Done = 3,
++    };
++
++    struct Inputs
++    {
++        bool theater = false, table = false; // where the player is
++        bool pointerOnScreen = false;
++        bool trigger = false;                           // either trigger held
++        bool a = false, b = false, x = false, y = false; // held
++        bool menu = false;
++        bool recentered = false;  // this frame
++        float grabMoved = 0.0f;   // metres a grabbing palm moved this frame
++        float zoomChange = 0.0f;  // |log| of the distance ratio of the two grabbing hands this frame
++        float twist = 0.0f;       // |radians| the table turned this frame
++        bool hover = false;       // a unit is hovered
++        uint32_t presses = 0, orders = 0; // the table's counters (press on a unit, order given)
++        uint32_t gates = GateAllActions;  // what the game allows now
++        int state = Show;
++        bool replayBattle = false; // the table's "?" was touched
++    };
++
++    struct Card
++    {
++        bool visible = false;
++        Part part = Part::None;
++        int step = 0, steps = 0;
++        std::string title, body;
++        Target target = Target::None;
++        int hand = -1; // -1: both / either
++    };
++
++    class Guide
++    {
++    public:
++        // One headset frame. state(): the option's new value (write it back when it changed).
++        Card step(const Inputs &in, double now, bool japanese)
++        {
++            state_ = in.state;
++            if (in.replayBattle)
++            {
++                state_ = state_ == Done ? Battle : state_ == Basics ? Show : state_;
++                beginPart(Part::Battle, now);
++            }
++            // The game's own tutorial wins at the table: say how to do what it asks for.
++            if (in.table && (in.gates & GateAllActions) != GateAllActions && (in.gates & GateAllActions) != 0)
++                return gameTutorial(in.gates, japanese);
++            Part want = Part::None;
++            if (in.theater && (state_ == Show || state_ == Basics))
++                want = Part::Basics;
++            else if (in.table && (state_ == Show || state_ == Battle))
++                want = Part::Battle;
++            if (want == Part::None)
++            {
++                part_ = Part::None;
++                return Card{};
++            }
++            if (want != part_)
++                beginPart(want, now);
++
++            // Hold B to skip the part.
++            if (in.b)
++            {
++                if (bSince_ < 0.0)
++                    bSince_ = now;
++                else if (now - bSince_ > kSkipHold)
++                {
++                    finishPart();
++                    bSince_ = -1.0;
++                    return Card{};
++                }
++            }
++            else
++                bSince_ = -1.0;
++
++            const bool pressA = in.a && !lastA_, pressTrigger = in.trigger && !lastTrigger_;
++            const bool pressAny = pressA || (in.b && !lastB_) || (in.x && !lastX_) || (in.y && !lastY_);
++            lastA_ = in.a, lastB_ = in.b, lastX_ = in.x, lastY_ = in.y, lastTrigger_ = in.trigger;
++            const bool pressMenu = in.menu && !lastMenu_;
++            lastMenu_ = in.menu;
++            const double inStep = now - stepAt_;
++            bool done = false;
++            if (part_ == Part::Basics)
++            {
++                switch (step_)
++                {
++                case 0: // point at the screen
++                    onScreenFor_ = in.pointerOnScreen ? onScreenFor_ + (now - last_) : 0.0;
++                    done = onScreenFor_ > 0.5;
++                    break;
++                case 1: done = pressTrigger && in.pointerOnScreen; break;
++                case 2: done = pressAny && inStep > 0.4; break;
++                case 3: done = pressMenu; break;
++                case 4: done = in.recentered; break;
++                default: done = (pressA && inStep > 0.6) || inStep > 10.0; break;
++                }
++            }
++            else if (part_ == Part::Battle)
++            {
++                switch (step_)
++                {
++                case 0:
++                    moved_ += in.grabMoved;
++                    done = moved_ > 0.12f;
++                    break;
++                case 1:
++                    zoomed_ += in.zoomChange + in.twist;
++                    done = zoomed_ > 0.35f;
++                    break;
++                case 2: done = in.hover; break;
++                case 3: done = in.presses != presses_; break;
++                case 4: done = in.orders != orders_; break;
++                default: done = (pressA && inStep > 0.6) || inStep > 14.0; break;
++                }
++            }
++            last_ = now;
++            presses_ = in.presses;
++            if (step_ != 4 || done)
++                orders_ = in.orders;
++            if (done)
++            {
++                ++step_;
++                stepAt_ = now;
++                if (step_ >= steps())
++                {
++                    finishPart();
++                    return Card{};
++                }
++            }
++            return card(japanese);
++        }
++
++        int state() const { return state_; }
++
++        static constexpr double kSkipHold = 1.5;
++
++    private:
++        int steps() const { return part_ == Part::Basics ? 6 : part_ == Part::Battle ? 7 : 0; }
++
++        void beginPart(Part p, double now)
++        {
++            part_ = p;
++            step_ = 0;
++            stepAt_ = now;
++            last_ = now;
++            onScreenFor_ = 0.0;
++            moved_ = zoomed_ = 0.0f;
++        }
++
++        void finishPart()
++        {
++            if (part_ == Part::Basics)
++                state_ = state_ == Show ? Battle : Done;
++            else if (part_ == Part::Battle)
++                state_ = state_ == Show ? Basics : Done;
++            part_ = Part::None;
++        }
++
++        struct Text
++        {
++            const char *en, *ja;
++            Target target;
++        };
++
++        Card card(bool japanese) const
++        {
++            static const Text basicsTitle{"VR controls", "VR の操作", Target::None};
++            static const Text basics[6] = {
++                {"Point a controller at the screen: a laser shows where you point.",
++                 "コントローラーを画面に向けてください。レーザーが指している場所を示します。", Target::Screen},
++                {"Pull the trigger to click where the laser points: menus, choices, the messages.",
++                 "トリガーを引くと、レーザーの先をクリックします（メニュー、選択肢、メッセージ）。", Target::Trigger},
++                {"A is Circle (confirm, next message), B is Cross (cancel), X is Square, Y is Triangle. Press one.",
++                 "A は○（決定・次のメッセージ）、B は×（キャンセル）、X は□、Y は△です。どれかを押してください。", Target::A},
++                {"The menu button: tap it for Start, hold it for Select (the system menu). Tap it now.",
++                 "メニューボタン：短く押すとスタート、長押しでセレクト（システムメニュー）です。押してみてください。", Target::Menu},
++                {"Lost the screen? Hold both grips for a second: it comes back in front of you.",
++                 "画面を見失ったら、両手のグリップを 1 秒握ると正面に戻ります。", Target::BothGrips},
++                {"In battles the map becomes a table in front of you; this guide goes on there. Replay it any time: Settings > VR guide. (A: done)",
++                 "戦闘ではマップが目の前のテーブルになり、このガイドはそこで続きます。設定の「VR guide」でいつでも再表示できます。（A：完了）", Target::A},
++            };
++            static const Text battleTitle{"The battle table", "バトルテーブル", Target::None};
++            static const Text battle[7] = {
++                {"Hold a grip and drag: the map follows your hand. Let go and it drifts on a little.",
++                 "グリップを握ってドラッグすると、マップが手について動きます。離すと少し滑ります。", Target::Grip},
++                {"Hold both grips: pull your hands apart to zoom in, together to zoom out, twist to turn the table.",
++                 "両手のグリップを握り、手を広げるとズームイン、近づけるとズームアウト、ひねるとテーブルが回ります。", Target::BothGrips},
++                {"Look at a unit and hold your fingertip over it, or touch its disc: it lights up.",
++                 "ユニットを見て指先を重ねるか、円盤に触れてください。ユニットが光ります。", Target::None},
++                {"Pull the trigger on one of your angels to select it.",
++                 "味方のエンジェルにトリガーを引いて選択してください。", Target::Trigger},
++                {"Keep holding, point at a spot on the map and let go: the angel goes there. Let go on an enemy to attack it.",
++                 "トリガーを押したままマップ上の場所を指して離すと、そこへ移動します。敵の上で離すと攻撃します。", Target::Trigger},
++                {"X: order all angels. Y: H-Weapon. B: cancel. Left stick click: cockpit (the triggers fire). Right stick click: the camera of the unit under your hand. (A: next)",
++                 "X：全エンジェルに命令、Y：H-Weapon、B：キャンセル。左スティック押し込み：コックピット（トリガーで射撃）、右スティック押し込み：手の下のユニットのカメラ。（A：次へ）",
++                 Target::X},
++                {"Prefer a laser and the map all around you? Settings > VR battle map > Surround. The ? at the table's corner replays this guide. (A: done)",
++                 "レーザーで周囲に広がるマップを使いたい場合は、設定の「VR battle map」で Surround を選んでください。テーブルの角の ? でこのガイドを再表示できます。（A：完了）",
++                 Target::A},
++            };
++            Card c;
++            c.visible = true;
++            c.part = part_;
++            c.step = step_;
++            c.steps = steps();
++            const Text &title = part_ == Part::Basics ? basicsTitle : battleTitle;
++            const Text &t = part_ == Part::Basics ? basics[step_] : battle[step_];
++            c.title = japanese ? title.ja : title.en;
++            c.body = japanese ? t.ja : t.en;
++            c.target = t.target;
++            return c;
++        }
++
++        static Card gameTutorial(uint32_t gates, bool japanese)
++        {
++            struct Line
++            {
++                uint32_t gate;
++                const char *en, *ja;
++                Target target;
++            };
++            static const Line lines[] = {
++                {GateSelect, "Trigger on a unit: select it; on the map: move there (the tutorial's Circle).",
++                 "ユニットにトリガー：選択、マップにトリガー：移動（チュートリアルの○）。", Target::Trigger},
++                {GateCancel, "B: cancel (Cross).", "B：キャンセル（×）。", Target::B},
++                {GatePan, "Grab the map with a grip and drag it (the D-pad scroll).", "グリップでマップをつかんでドラッグ（方向キーのスクロール）。",
++                 Target::Grip},
++                {GateZoom, "Both grips, hands apart / together: zoom (R1 / R2).", "両手のグリップで手を広げる／近づける：ズーム（R1／R2）。",
++                 Target::BothGrips},
++                {GateAll, "X: order all angels (Square).", "X：全エンジェルに命令（□）。", Target::X},
++                {GateHWeapon, "Y: H-Weapon (Triangle).", "Y：H-Weapon（△）。", Target::Y},
++                {GateCockpit, "Left stick click: cockpit view (L3).", "左スティック押し込み：コックピット（L3）。", Target::Sticks},
++                {GateUnitCam, "Right stick click: the unit's camera (R3).", "右スティック押し込み：ユニットのカメラ（R3）。", Target::Sticks},
++                {GateStart, "Menu button: Start.", "メニューボタン：スタート。", Target::Menu},
++                {GateAngelList, "Right stick to the left: the angel list (L2).", "右スティックを左へ：エンジェル一覧（L2）。", Target::Sticks},
++            };
++            Card c;
++            c.visible = true;
++            c.part = Part::GameTutorial;
++            c.title = japanese ? "チュートリアル（VR の操作）" : "Tutorial in VR";
++            int shown = 0;
++            for (const Line &l : lines)
++                if (gates & l.gate)
++                {
++                    if (!c.body.empty())
++                        c.body += "\n";
++                    c.body += japanese ? l.ja : l.en;
++                    if (c.target == Target::None)
++                        c.target = l.target;
++                    ++shown;
++                }
++            c.steps = shown;
++            return c;
++        }
++
++        Part part_ = Part::None;
++        int step_ = 0;
++        int state_ = Show;
++        double stepAt_ = 0.0, last_ = 0.0, bSince_ = -1.0, onScreenFor_ = 0.0;
++        float moved_ = 0.0f, zoomed_ = 0.0f;
++        uint32_t presses_ = 0, orders_ = 0;
++        bool lastA_ = false, lastB_ = false, lastX_ = false, lastY_ = false, lastTrigger_ = false, lastMenu_ = false;
++    };
++}
+diff --git a/ps2xTest/src/ga2_vr_input_tests.cpp b/ps2xTest/src/ga2_vr_input_tests.cpp
+index c3e21f5..1c57412 100644
+--- a/ps2xTest/src/ga2_vr_input_tests.cpp
++++ b/ps2xTest/src/ga2_vr_input_tests.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "ga2_vr_bindings.h"
+ #include "ga2_vr_input.h"
++#include "ga2_vrguide.h"
+ 
+ #include <map>
+ #include <set>
+@@ -464,6 +465,158 @@ void register_ga2_vr_input_tests()
+             t.Equals(m.step(c, 0.2).buttons, uint16_t(0), "released");
+         });
+ 
++        tc.Run("battle table: press-drag-release, grips belong to the table", [](TestCase &t) {
++            Mapper m;
++            Inputs in = sceneInputs(Scene::TacticalTable);
++            in.trigger[0] = 1.0f; // either hand
++            t.Equals(m.step(in, 0.0).buttons, uint16_t(kCircle), "press: Circle (select)");
++            t.Equals(m.step(in, 0.5).buttons, uint16_t(kCircle), "held while dragging");
++            in.trigger[0] = 0.0f;
++            in.orderOnRelease = true;
++            t.Equals(m.step(in, 0.6).buttons, uint16_t(0), "release: Circle up first");
++            t.Equals(m.step(in, 0.6 + kOrderGap + 0.01).buttons, uint16_t(kCircle), "then Circle again: the order");
++            t.Equals(m.step(in, 0.6 + kOrderGap + kOrderPulse + 0.01).buttons, uint16_t(0), "a single press");
++
++            Mapper q;
++            in = sceneInputs(Scene::TacticalTable);
++            in.trigger[1] = 1.0f;
++            q.step(in, 0.0);
++            in.trigger[1] = 0.0f; // a click on a unit: no order
++            t.Equals(q.step(in, 0.1).buttons, uint16_t(0), "release without an order: nothing more");
++            t.Equals(q.step(in, 0.1 + kOrderGap + 0.01).buttons, uint16_t(0), "still nothing");
++
++            Mapper g;
++            in = sceneInputs(Scene::TacticalTable);
++            in.l1 = in.r1 = 1.0f; // both grips (stretch)
++            Output o{};
++            for (double now = 0.0; now < 2.0; now += 0.1)
++                o = g.step(in, now);
++            t.IsFalse(has(o, kL1) || has(o, kR1), "grips are not L1 / R1 on the table");
++            t.IsFalse(o.recenter, "and both grips do not recentre");
++        });
++
++        tc.Run("VR guide: the basics step by step, then the battle part; the option follows", [](TestCase &t) {
++            using namespace ga2_vrguide;
++            Guide g;
++            ga2_vrguide::Inputs in;
++            in.theater = true;
++            double now = 0.0;
++            auto run = [&](double secs) {
++                Card c;
++                for (double end = now + secs; now < end; now += 0.05)
++                {
++                    c = g.step(in, now, false);
++                    in.state = g.state(); // as ga2_vr writes the option back
++                }
++                return c;
++            };
++            Card c = run(0.2);
++            t.IsTrue(c.visible && c.part == Part::Basics && c.step == 0, "basics shown on the screen");
++            in.pointerOnScreen = true;
++            c = run(0.7);
++            t.Equals(c.step, 1, "pointing at the screen: next");
++            in.trigger = true;
++            c = run(0.1);
++            in.trigger = false;
++            c = run(0.1);
++            t.Equals(c.step, 2, "a click: next");
++            c = run(0.5);
++            in.b = true;
++            c = run(0.1);
++            in.b = false;
++            c = run(0.1);
++            t.Equals(c.step, 3, "a face button: next");
++            in.menu = true;
++            c = run(0.1);
++            in.menu = false;
++            c = run(0.1);
++            t.Equals(c.step, 4, "the menu button: next");
++            in.recentered = true;
++            c = run(0.05);
++            in.recentered = false;
++            t.Equals(c.step, 5, "recentred: the last card");
++            c = run(0.8);
++            in.a = true;
++            c = run(0.1);
++            in.a = false;
++            t.IsFalse(c.visible, "A closes the basics");
++            t.Equals(g.state(), int(Battle), "the battle part is next");
++
++            // The battle part at the table.
++            in.theater = false;
++            in.table = true;
++            in.state = g.state();
++            c = run(0.1);
++            t.IsTrue(c.visible && c.part == Part::Battle && c.step == 0, "battle part at the table");
++            in.grabMoved = 0.01f;
++            c = run(1.0);
++            in.grabMoved = 0.0f;
++            t.Equals(c.step, 1, "dragging the map: next");
++            in.zoomChange = 0.05f;
++            c = run(0.5);
++            in.zoomChange = 0.0f;
++            t.Equals(c.step, 2, "zooming: next");
++            in.hover = true;
++            c = run(0.1);
++            in.hover = false;
++            t.Equals(c.step, 3, "hovering a unit: next");
++            in.presses = 1;
++            c = run(0.1);
++            t.Equals(c.step, 4, "a press on a unit: next");
++            c = run(0.5);
++            t.Equals(c.step, 4, "waits for the order");
++            in.orders = 1;
++            c = run(0.1);
++            t.Equals(c.step, 5, "an order: next");
++            for (int i = 0; i < 2; ++i)
++            {
++                c = run(0.8);
++                in.a = true;
++                c = run(0.1);
++                in.a = false;
++            }
++            t.IsFalse(c.visible, "A twice: done");
++            t.Equals(g.state(), int(Done), "the guide is done");
++        });
++
++        tc.Run("VR guide: hold B to skip; the table's ? replays; the game's tutorial gets VR instructions", [](TestCase &t) {
++            using namespace ga2_vrguide;
++            Guide g;
++            ga2_vrguide::Inputs in;
++            in.table = true;
++            in.state = Battle;
++            double now = 0.0;
++            Card c = g.step(in, now, false);
++            t.IsTrue(c.visible && c.part == Part::Battle, "battle part");
++            in.b = true;
++            for (; now < Guide::kSkipHold + 0.2; now += 0.05)
++            {
++                c = g.step(in, now, false);
++                in.state = g.state();
++            }
++            in.b = false;
++            t.IsFalse(c.visible, "skipped");
++            t.Equals(g.state(), int(Done), "and marked seen");
++
++            in.state = Done;
++            in.replayBattle = true;
++            c = g.step(in, now += 0.05, false);
++            in.replayBattle = false;
++            t.IsTrue(c.visible && c.part == Part::Battle && c.step == 0, "the ? replays the battle part");
++            t.Equals(g.state(), int(Battle), "the option says so");
++
++            in.state = Done;
++            in.gates = GateSelect | GateCancel;
++            Guide game;
++            c = game.step(in, now += 0.05, false);
++            t.IsTrue(c.visible && c.part == Part::GameTutorial, "the game's tutorial: its card");
++            t.IsTrue(c.body.find("Trigger") != std::string::npos && c.body.find("B: cancel") != std::string::npos, "the open actions");
++            t.IsTrue(c.body.find("H-Weapon") == std::string::npos, "not the closed ones");
++            t.IsTrue(c.target == Target::Trigger, "pointing at the trigger");
++            Card ja = game.step(in, now += 0.05, true);
++            t.IsTrue(ja.title != c.title, "in Japanese too");
++        });
++
+         tc.Run("a face pad's click is Circle / Cross / Square / Triangle by direction", [](TestCase &t) {
+             Mapper m;
+             Inputs in;
+-- 
+2.56.0
+

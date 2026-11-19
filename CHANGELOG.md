@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.12.0
+
+- VR battle table (after BattleGroupVR's tactical map): in VR the battle's
+  tactical map hovers flat in front of you as a holographic table (the game's
+  own map reprojected onto it, unit icons standing over it on stalks, the full
+  picture with the HUD on a screen beyond). Hover a unit by holding your
+  fingertip over it (or touching it), select it with the trigger, drag to a
+  spot or an enemy and let go to move or attack (a beam shows the target);
+  one grip drags the map (with drift), both grips zoom and turn it. Haptic
+  pulses on hover, select and order; translucent glove hands. Setting "VR
+  battle map": Battle table or Surround (the stereo map with the laser).
+- VR guide: an interactive guide to the VR controls (basics at the screen,
+  the battle part at the first battle table), replayable from Settings > VR
+  guide or the table's ?; during the game's Tutorial a card shows the VR
+  gesture for what it asks.
+
 ## 0.11.0
 
 - Portable: saves, settings, imported discs, mods, logs and caches live in the

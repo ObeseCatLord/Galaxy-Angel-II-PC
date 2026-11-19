@@ -65,10 +65,12 @@ guide are in [docs/PLAYING.md](docs/PLAYING.md).
   PS2 dither turned off.
 - Cheats menu (F1) and an in-game settings menu (F2).
 - VR through OpenXR (SteamVR, Monado). The game is shown on a big screen,
-  and the 3D scenes are drawn in stereo around you. Battles use motion
-  controls: point a controller at a unit and pull the trigger to select it,
-  then at empty space to move it there or at an enemy to attack; elsewhere the
-  laser pointer clicks on the screen.
+  and the 3D scenes are drawn in stereo around you. Battles are played
+  on a holographic battle table in front of you with motion controls: hold
+  your hand over a unit and pull the trigger to select it, drag to a spot or
+  an enemy and let go to move or attack, grab the map to move it, both hands
+  to zoom and turn it. A built-in VR guide teaches the controls (replay it in
+  Settings), and the game's own tutorial shows the VR gestures.
 - Native ARM64 build for the Steam Frame, flat or in VR
   ([docs/STEAM_FRAME.md](docs/STEAM_FRAME.md)).
 
