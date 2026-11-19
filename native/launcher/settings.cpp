@@ -10,6 +10,27 @@ namespace ga2
     namespace
     {
         void setEnv(const char *name, const std::string &value) { setEnvironment(name, value); }
+
+        // Command-line options: this run only (never saved).
+        struct Override
+        {
+            bool set = false;
+            int choice = 0, number = 0;
+        };
+        std::vector<Override> &overrides()
+        {
+            static std::vector<Override> list(options().size());
+            return list;
+        }
+        int g_windowScaleOverride = 0;
+    }
+
+    void Settings::overrideForThisRun(size_t option, int choice, int number) { overrides()[option] = {true, choice, number}; }
+    void Settings::overrideWindowScale(int scale) { g_windowScaleOverride = std::clamp(scale, 1, 8); }
+
+    int Settings::effectiveChoice(size_t option) const
+    {
+        return overrides()[option].set ? overrides()[option].choice : m_choices[option];
     }
 
     void Settings::set(size_t option, int choice)
@@ -39,7 +60,7 @@ namespace ga2
         const auto &table = options();
         for (size_t i = 0; i < table.size(); ++i)
             if (std::string(table[i].key) == key)
-                return table[i].choices[size_t(m_choices[i])].value;
+                return table[i].choices[size_t(effectiveChoice(i))].value;
         return {};
     }
 
@@ -54,6 +75,11 @@ namespace ga2
             const auto equals = line.find('=');
             if (equals == std::string::npos) continue;
             const std::string key = line.substr(0, equals), value = line.substr(equals + 1);
+            if (key == "last_game")
+            {
+                settings.lastGame = value;
+                continue;
+            }
             if (key == "window_scale")
             {
                 settings.windowScale = std::clamp(std::atoi(value.c_str()), 1, 8);
@@ -82,6 +108,7 @@ namespace ga2
         for (size_t i = 0; i < table.size(); ++i)
             out << table[i].key << '=' << ga2_options::storedValue(i, m_choices[i], m_numbers[i]) << '\n';
         out << "window_scale=" << windowScale << '\n';
+        if (!lastGame.empty()) out << "last_game=" << lastGame << '\n';
     }
 
     void Settings::applyToEnvironment(const std::filesystem::path &dataDir) const
@@ -89,8 +116,12 @@ namespace ga2
         const std::string dumpDir = pathUtf8(dataDir / "dumps" / "textures");
         const auto &table = options();
         for (size_t i = 0; i < table.size(); ++i)
-            setEnv(table[i].env, ga2_options::envValue(i, m_choices[i], dumpDir, m_numbers[i]));
-        setEnv("GA2_WINDOW_SCALE", std::to_string(windowScale));
+        {
+            const Override &o = overrides()[i];
+            setEnv(table[i].env, o.set ? ga2_options::envValue(i, o.choice, dumpDir, o.number)
+                                       : ga2_options::envValue(i, m_choices[i], dumpDir, m_numbers[i]));
+        }
+        setEnv("GA2_WINDOW_SCALE", std::to_string(g_windowScaleOverride ? g_windowScaleOverride : windowScale));
         // Where the engines read and save settings.ini (the in-game settings menu).
         setEnv("GA2_DATA_DIR", pathUtf8(dataDir));
         // Rendered from the player's discs after import (assets.cpp): one

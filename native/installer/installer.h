@@ -7,7 +7,7 @@
 // until everything is in place (an error puts the old files back). The files it installed are recorded in
 // <install>/.ga2-installer/installed.json, so an update deletes the files a newer version no longer ships and
 // an uninstall removes exactly what it installed. Files it did not install are never touched, and saves,
-// settings, imported discs and mods live in the separate data folder (%APPDATA%\ga2, ~/.local/share/ga2).
+// settings, imported discs and mods live in <install>/data, which no release contains.
 #pragma once
 
 #include <atomic>
@@ -103,7 +103,9 @@ namespace inst
     // The folder this run should offer: the installer's own folder when it holds the game, else the folder
     // remembered from the last install, else the platform's usual place for per-user programs.
     fs::path defaultInstallDir();
-    fs::path dataDir(); // the game's data folder (saves, settings, discs)
+    // The game's data folder for an install (saves, settings, discs): <install>/data, or the per-user folder of
+    // versions before 0.11 while that holds data (as the launcher decides).
+    fs::path dataDir(const fs::path &installDir);
 
     // Whether `dir` may be installed into: missing, empty (or holding only what a cancelled install left), or
     // a Galaxy Angel II PC folder already.
@@ -142,6 +144,4 @@ namespace inst
     fs::path pathFromUtf8(const std::string &text);
     std::string getEnv(const char *name);
 
-    // Remembers the folder of the last install (in the data folder's installer.ini).
-    void rememberInstallDir(const fs::path &dir);
 }

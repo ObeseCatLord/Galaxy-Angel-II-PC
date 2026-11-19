@@ -31,13 +31,13 @@ The installer sets up the newest release and keeps it up to date:
 - An update replaces only the files the release ships and removes the ones a
   newer version dropped. If something goes wrong (say the game is still
   running), the old files are put back. **Saves, settings, imported discs and
-  mods are in the data folder (below) and are never touched**, nor is anything
+  mods are in the `data` folder (below) and are never touched**, nor is anything
   you added to the install folder yourself.
 - Every install has the updater as `ga2-installer` (`ga2-installer.exe`) next
   to `ga2`; it updates the folder it is in. It also updates itself when a
   newer installer comes out.
 - **Uninstall** removes what the installer installed and its shortcuts; the
-  data folder stays.
+  `data` folder (your saves) stays in the install folder.
 - Without a window (SSH, scripts): `ga2-installer --check` (exit code 10 when
   an update is available), `--update`, `--install`, `--uninstall --yes`,
   `--dir <folder>`, `--no-shortcuts`; `--help` lists them.
@@ -182,7 +182,7 @@ game when it starts it; the same options can also be changed while playing
 | 3D widescreen (hor+) | On: 3D scenes show more to the sides at 16:10, 16:9, 21:9 or the window's own shape (Fill), same height as on the PS2; HUD, menus and text keep their proportions, and the battle HUD sits at the screen edges (radar top left, communications bottom left, unit panel and pilot portrait bottom right) |
 | Sides of 4:3 scenes | Black, blurred picture, or the game's own space skybox (rendered from your disc after import; needs Python 3 with Pillow) |
 | 2D scene size | Fill, or whole multiples (2x, 3x) for crisp pixels; 3D scenes always fill |
-| 2D picture filter | Bilinear, Smooth (removes the art's dither grain), Anime4K, Anime4K HQ, Sharp pixels, Nearest; 2D scenes only. At 2x and 4x, Anime4K works per layer: every CG, background, character sprite and UI picture is upscaled on its own (to the internal resolution) and the game composes the upscaled layers. A picture is upscaled the first time it is shown (it appears sharp a moment later) and kept in the cache folder (`~/.cache/ga2/anime4k`, `%LOCALAPPDATA%\ga2\cache\anime4k` on Windows) for later sessions. The text and the button prompts are drawn at the window's own resolution |
+| 2D picture filter | Bilinear, Smooth (removes the art's dither grain), Anime4K, Anime4K HQ, Sharp pixels, Nearest; 2D scenes only. At 2x and 4x, Anime4K works per layer: every CG, background, character sprite and UI picture is upscaled on its own (to the internal resolution) and the game composes the upscaled layers. A picture is upscaled the first time it is shown (it appears sharp a moment later) and kept in the cache folder (`data/cache/anime4k`) for later sessions. The text and the button prompts are drawn at the window's own resolution |
 | Frame rate | 60 (PS2, default), 75, 90, 100, 120, 144, 165, 170, 175, 180, 200 or 240 frames per second; **Monitor refresh rate** follows the monitor the window is on (read at the start and again when you move the window to another monitor or its rate changes; a monitor at 60 Hz or below means the PS2 rate, above 240 is capped at 240); **Custom** is any whole number from 61 to 240 (launcher: type it into the box, or use the mouse wheel over it; in game: Left / Right change it by 1, Shift by 10, or type the digits and press Enter; Enter or PageDown goes on to the next choice). The whole game (story, menus, ship map, battles) is drawn that often while it keeps its own speed. The rate drops automatically when the PC can't keep up (the processor or the graphics card, for example at 4x), so the game never runs slower than at 60; can also be changed while playing (F2). The battle's 30 fps camera views keep 30 fps. In VR the rate follows the headset. Stored in `settings.ini` as `fps=120`, `fps=173` (custom) or `fps=monitor` |
 | PS2 dithering | Off (default) or the original checkerboard |
 | Debanding | Low (default), High or Off: smooths the colour steps of the PS2's 16-bit gradients (backgrounds, CGs, nebula skies, fades) in 2D and 3D scenes; edges and text stay sharp |
@@ -205,8 +205,8 @@ PageUp / PageDown are previous / next value on any row. The launcher's screens
 follow the same rule. The game does not see your input while the menu is open. Every
 change is saved to the launcher's `settings.ini` at once, so the launcher and the game
 always agree; the file is `GA2_DATA_DIR/settings.ini` (the launcher sets it), or
-`~/.local/share/ga2/settings.ini` (`%APPDATA%\ga2` on Windows) for an engine
-started without the launcher.
+`data/settings.ini` next to the program for an engine started without the
+launcher.
 
 - **Take effect at once:** Display, Screen shape (the window takes the new shape
   too), 3D widescreen (hor+; the 3D cameras follow within a frame), Sides of 4:3
@@ -294,10 +294,40 @@ them; translations come as language packs that follow the Language option
 (how to install one: [LANGUAGE_PACKS.md](LANGUAGE_PACKS.md)). How to make
 mods: [docs/MODDING.md](MODDING.md).
 
+## Command line
+
+`ga2` is the only program to start; it runs the games itself. Every option
+of the Options screen is also a command-line option, for this run only (the
+saved settings stay as they are). `ga2 --help` lists them all with their
+values.
+
+```
+ga2                                   the launcher
+ga2 "Zettai Ryouiki no Tobira.iso"    import the disc (once) and play it
+ga2 --start zettai                    play without the launcher (zettai, mugen,
+                                      mugen-extra, eigou, eigou-2, or last)
+ga2 --start last --fullscreen         the game played last, fullscreen
+ga2 --start eigou --resolution 4x --fps 175 --language en
+ga2 --data-dir /path/to/data          another data folder (saves, settings)
+ga2 --import a.iso b.iso              import only
+ga2 --list                            the data folder, imported discs, games
+```
+
+Options take the values shown by `--help` (`--fps 175`, `--resolution 4x`,
+`--filter anime4k`, `--vr on`); `--fullscreen`, `--windowed`,
+`--window-scale <n>`, `--cache-dir <dir>` and `--engine-dir <dir>` are there
+too.
+
 ## Where things are
 
-The data folder is `~/.local/share/ga2` on Linux and `%APPDATA%\ga2` on
-Windows:
+Everything the game keeps is in the `data` folder next to `ga2`
+(`ga2.exe`): the install is portable, and deleting its folder removes the
+game completely. Two exceptions: data from a version before 0.11 in the old
+per-user folder (`~/.local/share/ga2`, `%APPDATA%\ga2`) stays in use until
+you run `ga2 --copy-data-here`, which copies it into `data` (the old folder
+is left alone, delete it when you like), and a program folder you can't
+write to (a system-wide install) uses that per-user folder. `--data-dir`
+picks any folder. In the data folder:
 
 - `memcards/` - your saves (one memory card shared by the three games, so
   Zettai and Mugen saves carry over as on the PS2)
@@ -306,3 +336,7 @@ Windows:
 - `mods/` - installed mods (see Mods above)
 - `assets/skybox/` - the space skies rendered from your discs
 - `dumps/textures/` - textures saved by the Dump textures option
+- `cache/` - compiled GPU pipelines and upscaled pictures (safe to delete)
+- `settings.ini`, `library.json` - your options and the imported discs
+
+Your graphics driver keeps its own shader cache, as it does for any game.

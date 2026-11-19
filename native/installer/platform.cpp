@@ -729,6 +729,22 @@ namespace inst::platform
 #endif
     }
 
+    std::optional<fs::path> shortcutInstallDir()
+    {
+#ifdef _WIN32
+        wchar_t buffer[32768];
+        DWORD size = sizeof(buffer);
+        if (RegGetValueW(HKEY_CURRENT_USER, kUninstallKey, L"InstallLocation", RRF_RT_REG_SZ, nullptr, buffer, &size) == ERROR_SUCCESS)
+            return fs::path(buffer);
+        return std::nullopt;
+#else
+        std::ifstream in(applicationsDir() / "galaxy-angel-2-pc.desktop");
+        for (std::string line; std::getline(in, line);)
+            if (line.rfind("Path=", 0) == 0 && line.size() > 5) return fs::path(line.substr(5));
+        return std::nullopt;
+#endif
+    }
+
     void removeShortcuts()
     {
         std::error_code ignored;

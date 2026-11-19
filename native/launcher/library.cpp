@@ -208,6 +208,9 @@ namespace ga2
 
         std::filesystem::path digestCachePath()
         {
+            // The data folder's cache (the launcher sets GA2_CACHE_DIR for itself and the engines).
+            if (const std::string dir = getEnvironment("GA2_CACHE_DIR"); !dir.empty())
+                return pathFromUtf8(dir) / "disc-verify.json";
 #ifdef _WIN32
             const std::string base = getEnvironment("LOCALAPPDATA");
             return base.empty() ? std::filesystem::path{} : pathFromUtf8(base) / "ga2" / "disc-verify.json";
@@ -259,18 +262,58 @@ namespace ga2
 #endif
     }
 
-    std::filesystem::path Library::defaultDataDir()
+    std::filesystem::path Library::legacyDataDir()
     {
 #ifdef _WIN32
         if (const std::string appdata = getEnvironment("APPDATA"); !appdata.empty())
             return pathFromUtf8(appdata) / "ga2";
-        return std::filesystem::current_path() / "ga2-data";
+        return {};
 #else
         if (const std::string xdg = getEnvironment("XDG_DATA_HOME"); !xdg.empty()) return pathFromUtf8(xdg) / "ga2";
         if (const std::string home = getEnvironment("HOME"); !home.empty())
             return pathFromUtf8(home) / ".local" / "share" / "ga2";
-        return std::filesystem::current_path() / "ga2-data";
+        return {};
 #endif
+    }
+
+    bool Library::holdsData(const std::filesystem::path &dir)
+    {
+        std::error_code error;
+        if (dir.empty()) return false;
+        for (const char *name : {"library.json", "settings.ini", "memcards"})
+            if (std::filesystem::exists(dir / name, error)) return true;
+        return false;
+    }
+
+    std::filesystem::path Library::portableDataDir() { return executableDirectory() / "data"; }
+
+    // Portable first: everything lives in <program folder>/data, so deleting the folder removes the game. Two
+    // exceptions keep things working: data from before 0.11 in the per-user folder stays in use (nothing of the
+    // player's moves by itself; --copy-data-here copies it over), and a program folder that can't be written
+    // (a system-wide install) uses the per-user folder.
+    std::filesystem::path Library::defaultDataDir()
+    {
+        const std::filesystem::path portable = portableDataDir(), legacy = legacyDataDir();
+        std::error_code error;
+        if (std::filesystem::exists(portable, error)) return portable;
+        if (holdsData(legacy)) return legacy;
+        std::filesystem::create_directories(portable, error);
+        if (!error)
+        {
+            // Can files be written there?
+            const auto probe = portable / ".write-test";
+            {
+                std::ofstream out(probe);
+                out << "ok";
+            }
+            if (std::filesystem::exists(probe, error))
+            {
+                std::filesystem::remove(probe, error);
+                return portable;
+            }
+        }
+        if (!legacy.empty()) return legacy;
+        return std::filesystem::current_path() / "ga2-data";
     }
 
     std::filesystem::path executableDirectory()
@@ -310,6 +353,32 @@ namespace ga2
         load();
     }
 
+    namespace
+    {
+        // Paths inside the data folder are stored relative to it, so the folder can be moved or copied whole.
+        std::string storedPath(const std::filesystem::path &path, const std::filesystem::path &dataDir)
+        {
+            std::error_code error;
+            const auto relative = std::filesystem::relative(path, dataDir, error);
+            if (!error && !relative.empty() && *relative.begin() != "..") return pathUtf8(relative);
+            return pathUtf8(path);
+        }
+
+        // A stored path; an absolute one that is gone is looked for at the same place in this data folder
+        // (a library written before relative paths, in a data folder copied by --copy-data-here or moved).
+        std::filesystem::path loadedPath(const std::string &text, const std::filesystem::path &dataDir, const char *sub,
+                                         const std::string &id)
+        {
+            const auto path = pathFromUtf8(text);
+            if (path.is_relative()) return dataDir / path;
+            std::error_code error;
+            if (std::filesystem::exists(path, error)) return path;
+            for (const auto &candidate : {dataDir / sub / id / path.filename(), dataDir / sub / path.filename()})
+                if (std::filesystem::exists(candidate, error)) return candidate;
+            return path;
+        }
+    }
+
     void Library::load()
     {
         m_discs.clear();
@@ -323,9 +392,10 @@ namespace ga2
                 throw std::runtime_error("unexpected library layout");
             for (const auto &item : json["discs"])
             {
-                ImportedDisc disc{item.at("id").get<std::string>(), pathFromUtf8(item.at("image").get<std::string>()),
-                                  pathFromUtf8(item.at("manifest").get<std::string>()),
-                                  pathFromUtf8(item.at("elf").get<std::string>()),
+                const std::string id = item.at("id").get<std::string>();
+                ImportedDisc disc{id, loadedPath(item.at("image").get<std::string>(), m_dataDir, "isos", id),
+                                  loadedPath(item.at("manifest").get<std::string>(), m_dataDir, "discs", id),
+                                  loadedPath(item.at("elf").get<std::string>(), m_dataDir, "discs", id),
                                   item.at("image_sha256").get<std::string>(), item.at("manifest_sha256").get<std::string>()};
                 if (!knownDisc(disc.id))
                     continue;
@@ -350,8 +420,9 @@ namespace ga2
     {
         nlohmann::json discs = nlohmann::json::array();
         for (const auto &disc : m_discs)
-            discs.push_back({{"id", disc.id}, {"image", pathUtf8(disc.image)}, {"manifest", pathUtf8(disc.manifest)},
-                             {"elf", pathUtf8(disc.elf)}, {"image_sha256", disc.imageSha256},
+            discs.push_back({{"id", disc.id}, {"image", storedPath(disc.image, m_dataDir)},
+                             {"manifest", storedPath(disc.manifest, m_dataDir)}, {"elf", storedPath(disc.elf, m_dataDir)},
+                             {"image_sha256", disc.imageSha256},
                              {"manifest_sha256", disc.manifestSha256}});
         const std::string text = nlohmann::json{{"schema_version", 1}, {"discs", discs}}.dump(2) + "\n";
         writeFile(m_dataDir / "library.json", text.data(), text.size());

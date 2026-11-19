@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -121,7 +123,6 @@ namespace inst
             return total;
         }
 
-        fs::path settingsIni() { return dataDir() / "installer.ini"; }
 
         // A path from installed.json that stays inside the install folder (the file is ours, but may be damaged).
         bool safeRecorded(const std::string &rel)
@@ -265,7 +266,7 @@ namespace inst
         return out;
     }
 
-    fs::path dataDir()
+    fs::path legacyDataDir()
     {
 #ifdef _WIN32
         if (const std::string appdata = getEnv("APPDATA"); !appdata.empty()) return pathFromUtf8(appdata) / "ga2";
@@ -273,7 +274,19 @@ namespace inst
         if (const std::string xdg = getEnv("XDG_DATA_HOME"); !xdg.empty()) return pathFromUtf8(xdg) / "ga2";
         if (const std::string home = getEnv("HOME"); !home.empty()) return pathFromUtf8(home) / ".local" / "share" / "ga2";
 #endif
-        return fs::current_path() / "ga2-data";
+        return {};
+    }
+
+    // As the launcher decides (native/launcher/library.cpp, Library::defaultDataDir).
+    fs::path dataDir(const fs::path &installDir)
+    {
+        std::error_code error;
+        const fs::path portable = installDir / "data", legacy = legacyDataDir();
+        if (fs::exists(portable, error)) return portable;
+        if (!legacy.empty())
+            for (const char *name : {"library.json", "settings.ini", "memcards"})
+                if (fs::exists(legacy / name, error)) return legacy;
+        return portable;
     }
 
     fs::path defaultInstallDir()
@@ -281,16 +294,9 @@ namespace inst
         std::error_code error;
         const fs::path self = platform::selfPath().parent_path();
         if (!self.empty() && (fs::exists(self / launcherName(), error) || fs::exists(stateDir(self), error))) return self;
-        std::ifstream in(settingsIni());
-        for (std::string line; std::getline(in, line);)
-        {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.rfind("install_dir=", 0) == 0)
-            {
-                const fs::path remembered = pathFromUtf8(line.substr(12));
-                if (fs::exists(remembered / launcherName(), error)) return remembered;
-            }
-        }
+        // The folder of the last install, from its shortcuts (Apps & features entry / menu entry).
+        if (const auto remembered = platform::shortcutInstallDir(); remembered && fs::exists(*remembered / launcherName(), error))
+            return *remembered;
 #ifdef _WIN32
         if (const std::string local = getEnv("LOCALAPPDATA"); !local.empty())
             return pathFromUtf8(local) / "Programs" / "Galaxy Angel II PC";
@@ -301,13 +307,6 @@ namespace inst
 #endif
     }
 
-    void rememberInstallDir(const fs::path &dir)
-    {
-        std::error_code error;
-        fs::create_directories(dataDir(), error);
-        std::ofstream out(settingsIni(), std::ios::trunc);
-        out << "install_dir=" << pathUtf8(dir) << "\n";
-    }
 
     std::string sha256File(const fs::path &file, Progress *progress)
     {
@@ -395,17 +394,11 @@ namespace inst
     std::string fetchText(const std::string &url, Progress &progress)
     {
         if (isLocal(url)) return readFile(localPath(url));
-        // In the player's own data folder, not the shared temp folder.
-        std::error_code made;
-        fs::create_directories(dataDir(), made);
-        const fs::path temp = dataDir() / ("installer-manifest-" + std::to_string(
-#ifdef _WIN32
-                                                                       GetCurrentProcessId()
-#else
-                                                                       getpid()
-#endif
-                                                                           ) +
-                                           ".json");
+        // An unpredictable name in the temp folder.
+        std::random_device random;
+        char name[40];
+        std::snprintf(name, sizeof(name), "ga2-installer-%08x%08x.json", unsigned(random()), unsigned(random()));
+        const fs::path temp = fs::temp_directory_path() / name;
         platform::httpDownload(url, temp, progress);
         std::string text = readFile(temp);
         std::error_code ignored;
@@ -492,6 +485,9 @@ namespace inst
         for (auto it = fs::recursive_directory_iterator(root); it != fs::recursive_directory_iterator(); ++it)
             if (!it->is_directory() || it->is_symlink()) files.push_back(generic(fs::relative(it->path(), root)));
         std::sort(files.begin(), files.end());
+        for (const auto &rel : files)
+            if (rel.rfind("data/", 0) == 0) // the player's folder (saves, settings): never part of a release
+                throw std::runtime_error("the downloaded archive would replace files in the data folder; nothing was changed");
         if (std::find(files.begin(), files.end(), launcherName()) == files.end())
             throw std::runtime_error("the downloaded archive holds no game launcher; nothing was changed");
 
@@ -576,7 +572,6 @@ namespace inst
         fs::remove_all(backup, error); // a replaced running installer stays until the next run cleans it up
         fs::remove_all(downloads, error);
         if (options.shortcuts) platform::createShortcuts(dir, manifest.version, folderSize(dir));
-        rememberInstallDir(dir);
     }
 
     void uninstall(const fs::path &dir, Progress &progress)
@@ -584,7 +579,7 @@ namespace inst
         const Installed installed = readInstalled(dir);
         if (!installed.recorded)
             throw std::runtime_error("this folder was not set up by the installer; delete it yourself (your saves are in " +
-                                     pathUtf8(dataDir()) + ")");
+                                     pathUtf8(dataDir(dir)) + ")");
         if (gameRunning(dir)) throw std::runtime_error("the game is running from this folder; close it first");
         progress.stage = Removing;
         progress.total = installed.files.size();
@@ -611,11 +606,10 @@ namespace inst
         }
         platform::removeShortcuts();
         fs::remove_all(stateDir(dir), error);
-        fs::remove(settingsIni(), error);
         if (selfInside)
             platform::deleteAfterExit(dir, self);
         else
-            fs::remove(dir, error); // only when empty
+            fs::remove(dir, error); // only when empty: <dir>/data (saves, settings) stays
         progress.stage = Finished;
     }
 

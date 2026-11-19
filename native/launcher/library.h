@@ -55,7 +55,12 @@ namespace ga2
     {
     public:
         explicit Library(std::filesystem::path dataDir);
+        // <program folder>/data (portable), else the per-user folder of earlier versions when it holds data, or when
+        // the program folder is read-only.
         static std::filesystem::path defaultDataDir();
+        static std::filesystem::path portableDataDir();
+        static std::filesystem::path legacyDataDir(); // %APPDATA%\ga2, ~/.local/share/ga2 (empty when unknown)
+        static bool holdsData(const std::filesystem::path &dir);
 
         const std::filesystem::path &dataDir() const { return m_dataDir; }
         // Thread-safe: imports run on a worker while the menu draws.

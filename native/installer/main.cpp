@@ -457,7 +457,7 @@ namespace
             y += 58;
 
             // Footer: where the saves are.
-            const std::string data = std::string(tr(T::dataNote)) + " " + inst::pathUtf8(inst::dataDir()) + " " + tr(T::dataNote2);
+            const std::string data = std::string(tr(T::dataNote)) + " " + inst::pathUtf8(inst::dataDir(m_dir)) + " " + tr(T::dataNote2);
             text(F.small, data, 34, H - 30, P.dim);
             const std::string link = tr(T::page);
             const float lw = textWidth(F.small, link);
@@ -833,7 +833,7 @@ namespace
             else if (r.kind == Result::Uninstall)
             {
                 m_installed = inst::readInstalled(m_dir);
-                m_message = std::string(tr(T::removed)) + " " + inst::pathUtf8(inst::dataDir());
+                m_message = std::string(tr(T::removed)) + " " + inst::pathUtf8(inst::dataDir(m_dir));
                 m_messageColor = P.ok;
                 return;
             }
@@ -908,7 +908,7 @@ namespace
             {
                 inst::uninstall(dir, progress);
                 std::printf("removed Galaxy Angel II PC from %s; saves and settings stay in %s\n", inst::pathUtf8(dir).c_str(),
-                            inst::pathUtf8(inst::dataDir()).c_str());
+                            inst::pathUtf8(inst::dataDir(dir)).c_str());
                 return 0;
             }
             const inst::Installed installed = inst::readInstalled(dir);

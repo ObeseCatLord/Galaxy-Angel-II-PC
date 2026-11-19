@@ -2,11 +2,14 @@
 // the games. Each disc's recompiled program is its own engine binary next to
 // this one; the engines switch discs (and programs) by themselves.
 //
+// Every setting is also a command-line option (ga2 --help lists them all).
+//
 //   ga2                         menu (drop .iso files on the window to import)
+//   ga2 <iso>...                import the images (once) and start the first one's game
 //   ga2 --import <iso>...       import from the command line
 //   ga2 --list                  show imported discs and start entries
-//   ga2 --start <entry>         start a game without the menu
-//   --data-dir <dir>            library, memory cards and logs (default: user data dir)
+//   ga2 --start <entry|last>    start a game without the menu
+//   --data-dir <dir>            library, memory cards, settings and logs (default: <program folder>/data)
 //   --engine-dir <dir>          where the ga2_<disc> engines are (default: next to ga2)
 #include "library.h"
 #include "runtime/ga2_menu_select.h"
@@ -162,6 +165,7 @@ namespace
             {
                 openWindow();
                 const ga2::StartEntry *start = loop();
+                if (start) m_settings.lastGame = start->id;
                 // Largest whole multiple of 640x448 that fits the monitor.
                 const int monitor = GetCurrentMonitor();
                 m_settings.windowScale = std::max(1, std::min(GetMonitorWidth(monitor) * 9 / 10 / 640,
@@ -815,40 +819,227 @@ namespace
     };
 }
 
+namespace
+{
+    std::string lower(std::string text)
+    {
+        for (char &c : text)
+            if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+        return text;
+    }
+
+    // --resolution 4x, --fps 175, --language en, --filter anime4k ...: a stored value ("2", "175", "en"), a menu
+    // label ("4x (2560x1792)", case ignored) or its first word ("4x", "native", "on").
+    bool parseOptionValue(size_t option, const std::string &raw, int &choice, int &number)
+    {
+        const auto &o = ga2::options()[option];
+        std::string text = lower(raw);
+        if (text == "true" || text == "yes") text = "on";
+        if (text == "false" || text == "no") text = "off";
+        if (ga2_options::parseStored(option, raw, choice, number) || ga2_options::parseStored(option, text, choice, number))
+            return true;
+        for (size_t c = 0; c < o.choices.size(); ++c)
+        {
+            if (int(c) == o.customChoice) continue;
+            const std::string label = lower(o.choices[c].label);
+            const std::string first = label.substr(0, label.find_first_of(" (:"));
+            if (text == label || text == first || text == lower(o.choices[c].value))
+            {
+                choice = int(c);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string optionFlag(const ga2::Option &o)
+    {
+        std::string flag = std::string("--") + o.key;
+        std::replace(flag.begin(), flag.end(), '_', '-');
+        return flag;
+    }
+
+    // An option with an "On" choice: the bare flag (--vr, --onscreen-pad) means on.
+    int onChoice(const ga2::Option &o)
+    {
+        for (size_t c = 0; c < o.choices.size(); ++c)
+            if (std::string(o.choices[c].value) == "1") return int(c);
+        return -1;
+    }
+
+    void usage()
+    {
+        std::cout <<
+            "Galaxy Angel II PC " GA2_VERSION "\n\n"
+            "usage: ga2 [options] [disc image.iso ...]\n\n"
+            "Without arguments the launcher opens. Disc images given on the command line are imported (once) and the\n"
+            "first one's game starts.\n\n"
+            "  --start <game>         start a game without the launcher: zettai, mugen, mugen-extra, eigou, eigou-2,\n"
+            "                         or last (the game started last)\n"
+            "  --import <iso>...      import disc images, then exit (with --start: then start)\n"
+            "  --list                 imported discs and which games can start\n"
+            "  --data-dir <dir>       saves, settings, imported discs, mods, logs (default: the data folder next to\n"
+            "                         this program; the per-user folder of earlier versions while it holds data)\n"
+            "  --cache-dir <dir>      shader and upscaling caches (default: <data>/cache)\n"
+            "  --copy-data-here       copy the per-user data folder of earlier versions into the data folder next to\n"
+            "                         this program and use that from now on (the old one is left as it is)\n"
+            "  --fullscreen, --windowed\n"
+            "  --window-scale <n>     window size as a multiple of 640x448 (1-8)\n"
+            "  --engine-dir <dir>     where the ga2_<disc> programs are (default: next to ga2)\n"
+            "  --version, --help\n\n"
+            "Settings (this run only; the saved settings are unchanged). Values as in the Options screen:\n";
+        for (const auto &o : ga2::options())
+        {
+            std::string values;
+            for (size_t c = 0; c < o.choices.size(); ++c)
+            {
+                if (!values.empty()) values += ", ";
+                values += int(c) == o.customChoice ? std::to_string(o.customMin) + "-" + std::to_string(o.customMax)
+                                                   : std::string(o.choices[c].value);
+            }
+            std::string flag = optionFlag(o) + " <value>";
+            flag.resize(std::max<size_t>(flag.size() + 1, 25), ' ');
+            std::cout << "  " << flag << o.label << ": " << values << "\n";
+        }
+        std::cout << "\nExamples: ga2 --start zettai --resolution 4x --fps 175 --fullscreen\n"
+                     "          ga2 --data-dir /games/ga2-data \"Galaxy Angel II - Zettai Ryouiki no Tobira (Japan).iso\"\n";
+    }
+
+    // --copy-data-here: the old per-user folder, copied whole (nothing is moved or deleted).
+    bool copyLegacyData(std::filesystem::path &dataDir)
+    {
+        const auto legacy = ga2::Library::legacyDataDir(), portable = ga2::Library::portableDataDir();
+        if (!ga2::Library::holdsData(legacy))
+        {
+            std::cerr << "no data from an earlier version in " << legacy.string() << "\n";
+            return false;
+        }
+        if (ga2::Library::holdsData(portable))
+        {
+            std::cerr << portable.string() << " already holds data; nothing was copied\n";
+            return false;
+        }
+        std::error_code error;
+        std::filesystem::create_directories(portable, error);
+        std::filesystem::copy(legacy, portable, std::filesystem::copy_options::recursive | std::filesystem::copy_options::skip_existing, error);
+        if (error)
+        {
+            std::cerr << "copying " << legacy.string() << " to " << portable.string() << " failed: " << error.message() << "\n";
+            return false;
+        }
+        std::cout << "copied " << legacy.string() << " to " << portable.string() << "; it is used from now on (the old folder can be deleted)\n";
+        dataDir = portable;
+        return true;
+    }
+
+    bool isDiscImage(const std::string &arg)
+    {
+        const std::string l = lower(arg);
+        return l.size() > 4 && (l.ends_with(".iso") || l.ends_with(".bin") || l.ends_with(".img"));
+    }
+}
+
 int main(int argc, char **rawArgv)
 {
     const std::vector<std::string> args = ga2::commandLineArguments(argc, rawArgv);
-    std::filesystem::path dataDir = ga2::Library::defaultDataDir();
+    std::filesystem::path dataDir, cacheDir;
     std::filesystem::path engineDir = ga2::executableDirectory();
-    std::vector<std::filesystem::path> imports;
+    std::vector<std::filesystem::path> imports, images;
     std::string start;
-    bool list = false;
+    bool list = false, copyData = false;
+    const auto &table = ga2::options();
     const int count = int(args.size());
-    for (int i = 1; i < count; ++i)
+    auto value = [&](int &i, std::string_view name) -> std::string {
+        if (i + 1 >= count) throw std::runtime_error(std::string(name) + " needs a value (see --help)");
+        return args[size_t(++i)];
+    };
+    try
     {
-        const std::string_view arg = args[size_t(i)];
-        if (arg == "--data-dir" && i + 1 < count) dataDir = ga2::pathFromUtf8(args[size_t(++i)]);
-        else if (arg == "--engine-dir" && i + 1 < count) engineDir = ga2::pathFromUtf8(args[size_t(++i)]);
-        else if (arg == "--start" && i + 1 < count) start = args[size_t(++i)];
-        else if (arg == "--list") list = true;
-        else if (arg == "--version")
+        for (int i = 1; i < count; ++i)
         {
-            std::cout << "Galaxy Angel II PC " GA2_VERSION "\n";
-            return 0;
-        }
-        else if (arg == "--import")
-            while (i + 1 < count && std::string_view(args[size_t(i + 1)]).substr(0, 2) != "--")
-                imports.push_back(ga2::pathFromUtf8(args[size_t(++i)]));
-        else
-        {
-            std::cerr << "unknown option " << arg << "\n";
-            return 2;
+            std::string arg = args[size_t(i)];
+            std::string inlineValue;
+            bool hasInline = false;
+            if (arg.rfind("--", 0) == 0)
+                if (const auto equals = arg.find('='); equals != std::string::npos)
+                {
+                    inlineValue = arg.substr(equals + 1);
+                    arg = arg.substr(0, equals);
+                    hasInline = true;
+                }
+            auto next = [&](std::string_view name) { return hasInline ? inlineValue : value(i, name); };
+            if (arg == "--help" || arg == "-h")
+            {
+                usage();
+                return 0;
+            }
+            else if (arg == "--version")
+            {
+                std::cout << "Galaxy Angel II PC " GA2_VERSION "\n";
+                return 0;
+            }
+            else if (arg == "--data-dir") dataDir = ga2::pathFromUtf8(next(arg));
+            else if (arg == "--cache-dir") cacheDir = ga2::pathFromUtf8(next(arg));
+            else if (arg == "--engine-dir") engineDir = ga2::pathFromUtf8(next(arg));
+            else if (arg == "--start") start = next(arg);
+            else if (arg == "--list") list = true;
+            else if (arg == "--copy-data-here") copyData = true;
+            else if (arg == "--windowed") Settings::overrideForThisRun(ga2_options::Fullscreen, 0, 0);
+            else if (arg == "--window-scale") Settings::overrideWindowScale(std::atoi(next(arg).c_str()));
+            else if (arg == "--import")
+                while (i + 1 < count && std::string_view(args[size_t(i + 1)]).substr(0, 2) != "--")
+                    imports.push_back(ga2::pathFromUtf8(args[size_t(++i)]));
+            else if (arg.rfind("--", 0) != 0)
+                images.push_back(ga2::pathFromUtf8(arg)); // ga2 <image>: import and play
+            else
+            {
+                size_t option = table.size();
+                for (size_t o = 0; o < table.size(); ++o)
+                    if (arg == optionFlag(table[o])) option = o;
+                if (option == table.size())
+                {
+                    std::cerr << "unknown option " << arg << " (see --help)\n";
+                    return 2;
+                }
+                const auto &o = table[option];
+                int choice = 0, number = o.customDefault;
+                const bool bare = !hasInline && (i + 1 >= count || std::string_view(args[size_t(i + 1)]).substr(0, 2) == "--" ||
+                                                 isDiscImage(args[size_t(i + 1)]));
+                if (bare && onChoice(o) >= 0)
+                    choice = onChoice(o); // --fullscreen, --vr
+                else
+                {
+                    const std::string text = next(arg);
+                    if (!parseOptionValue(option, text, choice, number))
+                    {
+                        std::cerr << arg << ": unknown value " << text << " (see --help)\n";
+                        return 2;
+                    }
+                }
+                Settings::overrideForThisRun(option, choice, number);
+            }
         }
     }
+    catch (const std::exception &error)
+    {
+        std::cerr << "ga2: " << error.what() << '\n';
+        return 2;
+    }
+    if (dataDir.empty())
+        if (const std::string env = ga2::getEnvironment("GA2_DATA_DIR"); !env.empty()) dataDir = ga2::pathFromUtf8(env);
+    if (copyData && !copyLegacyData(dataDir)) return 1;
+    if (dataDir.empty()) dataDir = ga2::Library::defaultDataDir();
+    // Caches in the data folder too (the engines read GA2_CACHE_DIR), unless given.
+    if (cacheDir.empty())
+        if (const std::string env = ga2::getEnvironment("GA2_CACHE_DIR"); !env.empty()) cacheDir = ga2::pathFromUtf8(env);
+    if (cacheDir.empty()) cacheDir = dataDir / "cache";
+    ga2::setEnvironment("GA2_CACHE_DIR", ga2::pathUtf8(cacheDir));
     try
     {
         ga2::Library library(dataDir);
         int failures = 0;
+        std::string imageStart;
+        imports.insert(imports.end(), images.begin(), images.end());
         for (const auto &image : imports)
         {
             try
@@ -858,6 +1049,14 @@ int main(int argc, char **rawArgv)
                 std::string why;
                 if (!ga2::ensureSkybox(library, *ga2::knownDisc(id), engineDir, why))
                     std::cerr << "  no space skybox: " << why << '\n';
+                // ga2 <image>: the game that boots from the first image given.
+                if (imageStart.empty() && std::find(images.begin(), images.end(), image) != images.end())
+                    for (const auto &entry : ga2::startEntries())
+                        if (id == entry.bootDisc)
+                        {
+                            imageStart = entry.id;
+                            break;
+                        }
             }
             catch (const std::exception &error)
             {
@@ -865,8 +1064,10 @@ int main(int argc, char **rawArgv)
                 ++failures;
             }
         }
+        if (start.empty()) start = imageStart;
         if (list)
         {
+            std::cout << "data  " << library.dataDir().string() << '\n';
             for (const auto &disc : library.discs())
                 std::cout << "disc  " << disc.id << "  " << disc.image.string() << '\n';
             for (const auto &entry : ga2::startEntries())
@@ -874,13 +1075,24 @@ int main(int argc, char **rawArgv)
         }
         if (!start.empty())
         {
+            Settings settings = Settings::load(settingsFile(library));
+            if (start == "last")
+            {
+                if (settings.lastGame.empty())
+                {
+                    std::cerr << "no game started yet (--start last)\n";
+                    return 2;
+                }
+                start = settings.lastGame;
+            }
             const ga2::StartEntry *entry = entryById(start);
             if (!entry || !library.canStart(*entry))
             {
-                std::cerr << "cannot start " << start << '\n';
+                std::cerr << "cannot start " << start << (entry ? " (import its discs first)" : " (see --help)") << '\n';
                 return 2;
             }
-            const Settings settings = Settings::load(settingsFile(library));
+            settings.lastGame = entry->id;
+            settings.save(settingsFile(library));
             settings.applyToEnvironment(library.dataDir());
             prepareMods(library, settings.value("language"));
             return runEngine(library.engineCommand(*entry, engineDir), logFor(library, *entry),

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.0
+
+- Portable: saves, settings, imported discs, mods, logs and caches live in the
+  `data` folder next to `ga2`, so deleting the game's folder removes it
+  completely and the folder can be moved. Data from earlier versions in the
+  per-user folder (`~/.local/share/ga2`, `%APPDATA%\ga2`) stays in use until
+  `ga2 --copy-data-here` copies it over; a read-only program folder uses the
+  per-user folder.
+- Every option is a command-line flag for that run (`--fps 175`,
+  `--resolution 4x`, `--language en`, `--fullscreen`, ...; `ga2 --help` lists
+  them), plus `--cache-dir` and `--window-scale`. `ga2 <disc image>` imports
+  the disc and starts its game; `--start last` starts the game played last.
+- The installer keeps the `data` folder through updates and uninstalls, never
+  ships one, and remembers the install folder from its own shortcuts.
+- New README screenshots with the native text, and VR screenshots (a story
+  scene on the big screen in the space skybox; a battle in stereo).
+
 ## 0.10.0
 
 - An installer and updater for Windows, Linux x86-64 and Linux ARM64: it

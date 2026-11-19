@@ -9,6 +9,11 @@
   <img src="docs/images/story-en.png" width="42%" alt="A story scene in Eigou Kaiki no Toki, in English">
 </p>
 <p align="center"><sub>Eigou Kaiki no Toki in English at 4x internal resolution with Anime4K and debanding: a battle in 16:9 widescreen, and a story scene.</sub></p>
+<p align="center">
+  <img src="docs/images/vr-story-en.png" width="40%" alt="VR: a story scene on the big screen, floating in the game's space skybox">
+  <img src="docs/images/vr-battle-en.png" width="58%" alt="VR: the battle map around the player in stereo (left and right eye)">
+</p>
+<p align="center"><sub>In VR: story scenes play on a big screen in the game's own space skybox; battles surround you in stereo (left and right eye).</sub></p>
 
 A native PC port of the Galaxy Angel II trilogy for the PlayStation 2:
 *Zettai Ryouiki no Tobira*, *Mugen Kairou no Kagi* and *Eigou Kaiki no Toki*.
@@ -35,8 +40,11 @@ game data is included.
 3. Drag your `.iso` files onto the window (or put them in the `isos` folder
    of the data folder), then pick a game.
 
-You need a GPU with Vulkan 1.3. Details, all options and the VR guide are in
-[docs/PLAYING.md](docs/PLAYING.md).
+You need a GPU with Vulkan 1.3. From 0.11.0 the install is portable: saves, settings and
+caches stay in the `data` folder next to `ga2`, so deleting the folder removes
+everything. Every option is also a command-line flag (`ga2 --help`, 0.11.0), and
+`ga2 game.iso` goes straight into a game. Details, all options and the VR
+guide are in [docs/PLAYING.md](docs/PLAYING.md).
 
 ## Features
 

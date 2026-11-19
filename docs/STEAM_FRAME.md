@@ -20,8 +20,8 @@ headset, or in VR.
    - Or download `galaxy-angel-2-pc-<version>-linux-arm64.tar.xz` from
      [Releases](../../../releases) and extract it somewhere in your home
      folder, for example `~/Games/galaxy-angel-2-pc`.
-2. Copy your disc images (`.iso`) into `~/.local/share/ga2/isos/`. The
-   launcher creates this folder the first time it runs.
+2. Copy your disc images (`.iso`) into `data/isos/` in the install folder.
+   The launcher creates this folder the first time it runs.
 3. In Desktop Mode, open Steam, choose **Add a Game > Add a Non-Steam Game**
    and pick `ga2` from the install folder.
    - Leave the compatibility tool unset: this is a native build.
@@ -43,8 +43,7 @@ without a mouse or keyboard:
 | Menu (Start) | Options |
 | View (Select) | Mods |
 
-Disc images in `~/.local/share/ga2/isos/` (or in an `isos` folder next to
-`ga2`) are added automatically when the launcher starts. Press Y after
+Disc images in `data/isos/` (or in an `isos` folder next to `ga2`) are added automatically when the launcher starts. Press Y after
 copying more.
 
 In the games, the controllers are a PS2 pad: the face buttons are Circle,

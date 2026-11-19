@@ -37,6 +37,12 @@ namespace ga2
         std::string value(const char *key) const;
 
         int windowScale = 1; // windowed size as a multiple of 640x448 (from the monitor)
+        std::string lastGame; // start entry id of the last game started (ga2 --start last)
+
+        // Command-line options (ga2 --fps 175 ...): used instead of the saved choice for this run, never saved.
+        static void overrideForThisRun(size_t option, int choice, int number);
+        static void overrideWindowScale(int scale);
+        int effectiveChoice(size_t option) const;
 
         // Environment for the engines (dataDir: where assets such as the
         // extracted skybox live, and where the engines save settings.ini

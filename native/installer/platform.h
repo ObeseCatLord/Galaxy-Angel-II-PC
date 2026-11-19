@@ -31,6 +31,8 @@ namespace inst::platform
     // entry). Replaced on every install; removed by uninstall.
     void createShortcuts(const fs::path &dir, const std::string &version, uint64_t sizeBytes);
     void removeShortcuts();
+    // The install folder the shortcuts point at (the last install), if any.
+    std::optional<fs::path> shortcutInstallDir();
 
     bool gameRunning(const fs::path &dir);
     fs::path selfPath();

@@ -1,0 +1,115 @@
+From e54a3de9d5457cd72009ef4e696d1340d90e9e81 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 16:39:06 -0600
+Subject: [PATCH] Portable data folder: caches follow GA2_CACHE_DIR /
+ GA2_DATA_DIR
+
+The disc-verify cache honours GA2_CACHE_DIR (the launcher points it at
+<data>/cache), the pipeline and Anime4K caches fall back to
+<GA2_DATA_DIR>/cache before the per-user cache folders, and an engine
+started without the launcher uses <program folder>/data when it exists.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_settings.cpp   | 28 +++++++++++++++++++++++++-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp      |  2 ++
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp |  2 ++
+ ps2xRuntime/src/lib/ps2_disc_mount.cpp |  8 ++++++++
+ 4 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_settings.cpp b/ps2xRuntime/src/lib/ga2_settings.cpp
+index d47c905..8fdbdc3 100644
+--- a/ps2xRuntime/src/lib/ga2_settings.cpp
++++ b/ps2xRuntime/src/lib/ga2_settings.cpp
+@@ -12,6 +12,10 @@
+ #include <sstream>
+ #include <vector>
+ 
++#ifdef _WIN32
++extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameW(void *module, wchar_t *name, unsigned long size);
++#endif
++
+ namespace ga2_settings
+ {
+     namespace
+@@ -47,9 +51,31 @@ namespace ga2_settings
+             return std::filesystem::path(std::u8string(text.begin(), text.end()));
+         }
+ 
+-        // The launcher's folder (Library::defaultDataDir).
++        std::filesystem::path programDir()
++        {
++#ifdef _WIN32
++            std::wstring buffer(32768, L'\0');
++            const unsigned long length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<unsigned long>(buffer.size()));
++            if (length == 0 || length >= buffer.size()) return {};
++            buffer.resize(length);
++            return std::filesystem::path(buffer).parent_path();
++#else
++            std::error_code error;
++            const auto self = std::filesystem::read_symlink("/proc/self/exe", error);
++            return error ? std::filesystem::path{} : self.parent_path();
++#endif
++        }
++
++        // The launcher's folder (Library::defaultDataDir): <program folder>/data when it exists (portable), else the
++        // per-user folder of earlier versions. (The launcher always passes GA2_DATA_DIR; this is for engines started
++        // by hand.)
+         std::filesystem::path defaultDataDir()
+         {
++            if (const auto program = programDir(); !program.empty())
++            {
++                std::error_code error;
++                if (std::filesystem::is_directory(program / "data", error)) return program / "data";
++            }
+ #ifdef _WIN32
+             if (const std::string appdata = env("APPDATA"); !appdata.empty())
+                 return pathFromUtf8(appdata) / "ga2";
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 059ba32..59413fc 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -322,6 +322,8 @@ namespace
+         std::filesystem::path base;
+         if (const char *dir = std::getenv("GA2_CACHE_DIR"); dir && *dir)
+             base = dir;
++        else if (const char *data = std::getenv("GA2_DATA_DIR"); data && *data)
++            base = std::filesystem::path(data) / "cache";
+         else if (const char *xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+             base = std::filesystem::path(xdg) / "ga2";
+         else if (const char *home = std::getenv("HOME"); home && *home)
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index cc78616..ae96909 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -85,6 +85,8 @@ namespace ga2_layers
+             std::filesystem::path base;
+             if (const char *dir = std::getenv("GA2_CACHE_DIR"); dir && *dir)
+                 base = dir;
++            else if (const char *data = std::getenv("GA2_DATA_DIR"); data && *data)
++                base = std::filesystem::path(data) / "cache";
+             else if (const char *xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+                 base = std::filesystem::path(xdg) / "ga2";
+             else if (const char *local = std::getenv("LOCALAPPDATA"); local && *local)
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.cpp b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+index 8c93d0d..105b14a 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+@@ -167,6 +167,14 @@ namespace ps2_disc
+         // modified image with restored timestamps would be trusted.
+         std::filesystem::path digestCachePath()
+         {
++            // The launcher points GA2_CACHE_DIR at <data>/cache (the same file it seeds when importing).
++#ifdef _WIN32
++            if (const wchar_t *dir = _wgetenv(L"GA2_CACHE_DIR"); dir && *dir)
++                return std::filesystem::path(dir) / "disc-verify.json";
++#else
++            if (const char *dir = std::getenv("GA2_CACHE_DIR"); dir && *dir)
++                return std::filesystem::path(dir) / "disc-verify.json";
++#endif
+ #ifdef _WIN32
+             const wchar_t *base = _wgetenv(L"LOCALAPPDATA"); // wide: the narrow value loses non-ANSI characters
+             return base ? std::filesystem::path(base) / "ga2" / "disc-verify.json" : std::filesystem::path{};
+-- 
+2.56.0
+

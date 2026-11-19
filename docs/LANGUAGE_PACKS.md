@@ -19,9 +19,9 @@ newer version of the English pack than the one a release shipped with.
 
 ## Installing a language pack
 
-1. Open the data folder:
-   - Linux: `~/.local/share/ga2`
-   - Windows: `%APPDATA%\ga2` (paste it into the Explorer address bar)
+1. Open the data folder: `data` next to `ga2` (`ga2.exe`). With data from a
+   version before 0.11 it is still `~/.local/share/ga2` on Linux or
+   `%APPDATA%\ga2` on Windows (`ga2 --list` prints which).
 2. Create a `mods` folder there if there isn't one already.
 3. Put the pack's folder in `mods`. A downloaded `.zip` has to be extracted
    first. The pack's `mod.json` must end up one level down, like this:

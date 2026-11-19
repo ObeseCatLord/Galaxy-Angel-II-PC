@@ -7,8 +7,8 @@ Everything here works on all five discs.
 
 ## Where mods live
 
-The launcher's data folder (`~/.local/share/ga2` on Linux, `%APPDATA%\ga2`
-on Windows) has a `mods` folder. Each mod is a folder in it:
+The data folder (`data` next to `ga2`; see
+[PLAYING.md](PLAYING.md#where-things-are)) has a `mods` folder. Each mod is a folder in it:
 
 ```
 mods/
