@@ -13,7 +13,7 @@
   <img src="docs/images/vr-story-en.png" width="40%" alt="VR: a story scene on the big screen, floating in the game's space skybox">
   <img src="docs/images/vr-battle-en.png" width="58%" alt="VR: the battle map around the player in stereo (left and right eye)">
 </p>
-<p align="center"><sub>In VR: story scenes play on a big screen in the game's own space skybox; battles surround you in stereo (left and right eye).</sub></p>
+<p align="center"><sub>In VR: story scenes play on a big screen in the game's own space skybox; battles surround you in stereo (left and right eye) and are played with motion controls.</sub></p>
 
 A native PC port of the Galaxy Angel II trilogy for the PlayStation 2:
 *Zettai Ryouiki no Tobira*, *Mugen Kairou no Kagi* and *Eigou Kaiki no Toki*.
@@ -65,7 +65,11 @@ guide are in [docs/PLAYING.md](docs/PLAYING.md).
   PS2 dither turned off.
 - Cheats menu (F1) and an in-game settings menu (F2).
 - VR through OpenXR (SteamVR, Monado). The game is shown on a big screen,
-  and the 3D scenes are drawn in stereo around you.
+  and the 3D scenes are drawn in stereo around you. Battles use motion
+  controls: point a controller at a unit and pull the trigger to select it,
+  then at empty space to move it there or at an enemy to attack; elsewhere the
+  laser pointer clicks on the screen. (Checked with simulated controllers, not
+  yet on a headset; details in [docs/PLAYING.md](docs/PLAYING.md).)
 - Native ARM64 build for the Steam Frame, flat or in VR
   ([docs/STEAM_FRAME.md](docs/STEAM_FRAME.md)).
 
