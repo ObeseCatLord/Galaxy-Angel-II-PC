@@ -1,0 +1,343 @@
+From d1bf0a9a1e90b90dabe3514631643dec8c32a6b0 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 23:39:19 -0600
+Subject: [PATCH] Widescreen detail: hor+ pictures drawn with twice the
+ columns, not stretched
+
+A hor+ picture is the game's 640-wide frame widened. Where the screen gives it
+more columns than the internal resolution has (16:9 at 1080p or 4K,
+ultrawide), a second paraLLEl-GS instance in the eyes[1] slot draws the same
+packets moved left by half an output pixel (Hacks::jitter_x), and the host
+interleaves the two frames column by column (zero copy or read back) for wide
+3D frames: 5120 columns at 4x. The engine decides at start from the display
+and the shape setting (GA2_PGS_WIDE_DETAIL=0/1 overrides). Per-layer
+upscaling takes its scale from the frame height.
+
+Measured on a hidden 3440x1440 battle at 4x: edge rise across the screen
+1.9 px stretched, 1.1 px with widescreen detail.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/gs/gs_pgs.h |   3 +
+ ps2xRuntime/src/lib/ga2_present.cpp     |   8 +-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp       |  30 ++++-
+ ps2xRuntime/src/lib/ps2_runtime.cpp     | 151 +++++++++++++++++++++++-
+ 4 files changed, 185 insertions(+), 7 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index f500d79..e02bcc4 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -60,6 +60,9 @@ namespace ga2_pgs
+     // VR single-pass stereo: a right-eye GS instance runs (GA2_VR=1); each
+     // eye's newest frame with the stereo setup it was rendered with.
+     bool stereo();
++    // Widescreen detail: a second instance half an output pixel right of eye 0 (takeEyeFrame / zero copy eye 1), its
++    // columns to be interleaved with eye 0's for wide (hor+) pictures.
++    bool wideDetail();
+     // uiSplit (optional): the frame was drawn without its UI layer (see takeUiFrame).
+     // gameTime (optional): the game time of the iteration that drew it (GA2_PRESENT_SHOTS).
+     bool takeEyeFrame(int eye, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index af31afb..200ee8d 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -1294,9 +1294,11 @@ namespace ga2_present
+         const bool anime4k = s.filter == Filter::Anime4K || s.filter == Filter::Anime4KHQ;
+         // 2D scenes per layer with Anime4K; the battle HUD (the 2D layer over 3D scenes) per layer with
+         // "HD battle graphics" (on by default), whatever the 2D filter.
+-        if (g_ready && sizesMatch && frame.width % 640 == 0)
+-            ga2_layers::setEnabled(layersAllowed && anime4k && frame.width >= 1280, layersAllowed && s.hdBattle && frame.width >= 1280,
+-                                   frame.width / 640);
++        // (The scale from the height: a widescreen-detail picture is twice as wide as the internal resolution.)
++        const int frameScale = frame.height / 448;
++        if (g_ready && sizesMatch && frame.width % 640 == 0 && frame.height % 448 == 0)
++            ga2_layers::setEnabled(layersAllowed && anime4k && frameScale >= 2, layersAllowed && s.hdBattle && frameScale >= 2,
++                                   frameScale);
+         if (g_ready && ga2_layers::enabled())
+             processLayerJobs(s.filter == Filter::Anime4KHQ);
+         // Native text: the GS's rendering of the port's text taken out of a 2D picture rendered above 640x448; it is
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 59413fc..822edad 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -253,6 +253,9 @@ namespace
+         Eye eyes[6];
+         uint32_t eyeCount = 1;
+         uint32_t jitterCount = 0; // 0 or 3
++        // Widescreen detail: eyes[1] is not a stereo eye but eye 0 moved by half an output pixel to the right; the
++        // host interleaves their columns (twice the horizontal resolution for a hor+ picture wider than the frame).
++        bool wideDetail = false;
+         InstanceWorker jitterWorkers[3];
+         bool uiLayer = false;
+         uint32_t instanceCount() const { return eyeCount + jitterCount + (uiLayer ? 1u : 0u); }
+@@ -616,6 +619,20 @@ namespace
+             else
+                 std::fprintf(stderr, "[pgs] second GS instance failed; VR stays in theater mode\n");
+         }
++        // Widescreen detail (GA2_PGS_WIDE_DETAIL=1, set by the engine when a hor+ picture would show fewer columns
++        // than the screen has: 16:9 at 1080p or 4K, ultrawide): a second instance, its geometry moved left by half an
++        // output pixel (so it samples half a pixel to the right of eye 0), shown interleaved column by column with eye
++        // 0: the 3D view hor+ widens keeps its detail across the screen instead of being stretched.
++        if (s.eyeCount == 1 && envInt("GA2_PGS_WIDE_DETAIL", 0) == 1 && envInt("GA2_PGS_JITTER", 0) != 1)
++        {
++            if (initDevice(s.eyes[1]) && s.eyes[1].gs.init(&s.eyes[1].device, options))
++            {
++                s.eyeCount = 2;
++                s.wideDetail = true;
++            }
++            else
++                std::fprintf(stderr, "[pgs] widescreen detail: second instance failed; wide pictures are stretched\n");
++        }
+         // Above 4x on the desktop (GA2_PGS_JITTER=1 with GA2_PGS_SSAA=16): three more instances, each moved by half
+         // an internal pixel, interleaved with eye 0 into an 8x picture (a GS renders at most 16 samples per pixel).
+         if (s.eyeCount == 1 && s.ssaa >= 16 && envInt("GA2_PGS_JITTER", 0) == 1)
+@@ -677,6 +694,12 @@ namespace
+             }
+             else if (e != 0)
+                 eye.hacks.report_replaced = false;
++            // Widescreen detail: half an output pixel is 8 / (output pixels per PS2 pixel) sixteenths of a PS2 pixel.
++            if (s.wideDetail && e == 1)
++            {
++                const int scale = s.ssaa >= 16 ? 4 : s.ssaa >= 4 ? 2 : 1;
++                eye.hacks.jitter_x = -8 / scale;
++            }
+             eye.gs.set_hacks(eye.hacks);
+             eye.gs.set_texture_replacement_interface(ga2_texpacks::interface());
+         }
+@@ -684,7 +707,8 @@ namespace
+         g_rendering.store(true, std::memory_order_release);
+         std::fprintf(stderr, "[pgs] paraLLEl-GS active on %s, ssaa=%u, dither=%s%s\n",
+                      s.eyes[0].device.get_gpu_properties().deviceName, s.ssaa, hacks.disable_dither ? "off" : "on",
+-                     s.eyeCount == 2 ? (s.uiLayer ? ", stereo (two instances) + HUD panel layer" : ", stereo (two instances)")
++                     s.wideDetail ? ", widescreen detail (two instances, columns interleaved)"
++                     : s.eyeCount == 2 ? (s.uiLayer ? ", stereo (two instances) + HUD panel layer" : ", stereo (two instances)")
+                      : s.jitterCount ? ", 8x (four jittered instances)"
+                                      : "");
+         if (s.uiLayer)
+@@ -1427,7 +1451,8 @@ namespace ga2_pgs
+         vsyncTick(*t);
+     }
+ 
+-    bool stereo() { return state().eyeCount == 2; }
++    bool stereo() { return state().eyeCount == 2 && !state().wideDetail; }
++    bool wideDetail() { return state().wideDetail; }
+ 
+     bool waitFreshFrame(int timeoutMs)
+     {
+@@ -1772,6 +1797,7 @@ namespace ga2_pgs
+     void vsync(const GSRegisters &) {}
+     bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
+     bool stereo() { return false; }
++    bool wideDetail() { return false; }
+     bool waitFreshFrame(int) { return false; }
+     bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *, double *) { return false; }
+     bool uiLayer() { return false; }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index bad7b44..b4b38ba 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -9,6 +9,8 @@
+ #include "runtime/ga2_vuthread.h"
+ #include "runtime/ga2_framepace.h"
+ #include "runtime/ga2_settings.h"
++#include "runtime/ga2_display.h"
++#include "runtime/ga2_options.h"
+ #include "ga2_vr.h"
+ #include "ga2_cheat_menu.h"
+ #include "ga2_settings_menu.h"
+@@ -498,6 +500,59 @@ namespace
+     }
+ }
+ 
++// Widescreen detail (ga2_pgs::wideDetail): eye 0 and the instance half an output pixel to its right, columns
++// interleaved into a picture twice as wide.
++static const char *kWideJoin = R"(#version 330
++in vec2 fragTexCoord;
++uniform sampler2D texture0;
++uniform sampler2D right;
++uniform vec2 outSize;
++out vec4 finalColor;
++void main() {
++    ivec2 p = ivec2(floor(fragTexCoord * outSize));
++    ivec2 q = ivec2(p.x / 2, p.y);
++    vec4 c = (p.x & 1) == 0 ? texelFetch(texture0, q, 0) : texelFetch(right, q, 0);
++    finalColor = vec4(c.rgb, 1.0);
++})";
++
++// `left` and `right` (w x h each, the frames' orientation) into the joined texture (2w x h); false when it cannot.
++static bool JoinWide(unsigned left, unsigned right, int w, int h, Texture2D &joined)
++{
++    static RenderTexture2D s_target{};
++    static Shader s_shader{};
++    static int s_loaded = -1;
++    if (s_loaded < 0)
++    {
++        s_shader = LoadShaderFromMemory(nullptr, kWideJoin);
++        s_loaded = IsShaderValid(s_shader) ? 1 : 0;
++        if (s_loaded != 1)
++            std::fprintf(stderr, "[display] widescreen detail: join shader failed; wide pictures are stretched\n");
++    }
++    if (s_loaded != 1 || !left || !right || w <= 0 || h <= 0)
++        return false;
++    if (s_target.texture.width != 2 * w || s_target.texture.height != h)
++    {
++        if (s_target.id)
++            UnloadRenderTexture(s_target);
++        s_target = LoadRenderTexture(2 * w, h);
++        SetTextureFilter(s_target.texture, TEXTURE_FILTER_BILINEAR);
++    }
++    const Texture2D l{left, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8}, r{right, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++    rlDrawRenderBatchActive();
++    BeginTextureMode(s_target);
++    BeginShaderMode(s_shader);
++    const float outSize[2] = {float(2 * w), float(h)};
++    SetShaderValue(s_shader, GetShaderLocation(s_shader, "outSize"), outSize, SHADER_UNIFORM_VEC2);
++    SetShaderValueTexture(s_shader, GetShaderLocation(s_shader, "right"), r);
++    // Upside down into the render target, so its texture has the frames' orientation.
++    DrawTexturePro(l, Rectangle{0.0f, 0.0f, float(w), -float(h)}, Rectangle{0.0f, 0.0f, outSize[0], outSize[1]}, Vector2{0, 0},
++                   0.0f, WHITE);
++    EndShaderMode();
++    EndTextureMode();
++    joined = s_target.texture;
++    return true;
++}
++
+ // shown: the texture to draw this loop. With zero copy (ga2_zerocopy) it is the GS's shared image, else `tex`.
+ static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+@@ -554,6 +609,35 @@ static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32
+                 ga2_vr::setUiFrame(s_uiTex.id, s_uiTex.width, s_uiTex.height, uiSplit);
+             }
+         }
++        // Widescreen detail: the second instance's newest frame (shared, or uploaded when read back).
++        static unsigned s_wideRight = 0u;
++        static uint32_t s_wideRightW = 0u, s_wideRightH = 0u;
++        if (ga2_pgs::wideDetail())
++        {
++            static std::vector<uint8_t> s_rightSmall;
++            static Texture2D s_rightTex{};
++            unsigned rid = 0u;
++            uint32_t rw = 0u, rh = 0u, rsw = 0u, rsh = 0u;
++            bool rshared = false, rsplit = false;
++            ga2_stereo::Setup rsetup;
++            if (ga2_zerocopy::take(1, rid, rw, rh, rshared, s_rightSmall, rsw, rsh, rsetup, &rsplit))
++            {
++                if (!rshared)
++                {
++                    if (s_rightTex.width != int(rsw) || s_rightTex.height != int(rsh))
++                    {
++                        if (s_rightTex.id)
++                            UnloadTexture(s_rightTex);
++                        Image image = GenImageColor(int(rsw), int(rsh), BLACK);
++                        s_rightTex = LoadTextureFromImage(image);
++                        UnloadImage(image);
++                    }
++                    UpdateTexture(s_rightTex, s_rightSmall.data());
++                    rid = s_rightTex.id, rw = rsw, rh = rsh;
++                }
++                s_wideRight = rid, s_wideRightW = rw, s_wideRightH = rh;
++            }
++        }
+         unsigned id = 0u;
+         uint32_t fw = 0u, fh = 0u, sw = 0u, sh = 0u;
+         bool shared = false, split = false;
+@@ -595,6 +679,14 @@ static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32
+             if (ga2_pgs::stereo())
+                 ga2_vr::setEyeFrame(0, shown.id, shown.width, shown.height, float(fw), float(fh), setup, split);
+             ps2_mouse::setFrame(s_small.data(), sw, sh);
++            // A wide (hor+) picture: eye 0 and the instance beside it, columns interleaved.
++            Texture2D joined{};
++            if (ga2_pgs::wideDetail() && ga2_activity::wideFrame() && s_wideRight && s_wideRightW == fw && s_wideRightH == fh &&
++                JoinWide(shown.id, s_wideRight, int(fw), int(fh), joined))
++            {
++                shown = joined;
++                s_width = 2u * fw;
++            }
+             ga2_zerocopy::presentShot(shown.id, shown.width, shown.height, gameTime);
+         }
+         else if (!s_sharedShown)
+@@ -609,6 +701,7 @@ static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32
+         // GPU GS: present the newest scanout; the texture follows its size.
+         static std::vector<uint8_t> s_pgsFrame;
+         static uint32_t s_pgsWidth = 0u, s_pgsHeight = 0u;
++        static Texture2D s_joinedShown{}; // widescreen detail: the joined picture shown (until the next frame)
+         if (ga2_pgs::jittered())
+         {
+             uint32_t jw = 0u, jh = 0u;
+@@ -696,9 +789,39 @@ static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32
+             if (ga2_pgs::stereo())
+                 ga2_vr::setEyeFrame(0, tex.id, tex.width, tex.height, float(w), float(h), setup, eye0Split);
+             ps2_mouse::setFrame(s_pgsFrame.data(), w, h);
+-            ga2_zerocopy::presentShot(tex.id, tex.width, tex.height, gameTime);
++            // Widescreen detail: the second instance's frame beside eye 0's, columns interleaved (wide pictures).
++            s_joinedShown = Texture2D{};
++            if (ga2_pgs::wideDetail())
++            {
++                static std::vector<uint8_t> s_rightFrame;
++                static Texture2D s_rightTex{};
++                uint32_t rw = 0u, rh = 0u;
++                ga2_stereo::Setup rsetup;
++                if (ga2_pgs::takeEyeFrame(1, s_rightFrame, rw, rh, rsetup, nullptr) && rw && rh &&
++                    s_rightFrame.size() >= size_t(rw) * rh * 4u)
++                {
++                    if (s_rightTex.width != int(rw) || s_rightTex.height != int(rh))
++                    {
++                        if (s_rightTex.id)
++                            UnloadTexture(s_rightTex);
++                        Image image = GenImageColor(int(rw), int(rh), BLACK);
++                        s_rightTex = LoadTextureFromImage(image);
++                        UnloadImage(image);
++                    }
++                    UpdateTexture(s_rightTex, s_rightFrame.data());
++                }
++                Texture2D joined{};
++                if (ga2_activity::wideFrame() && s_rightTex.width == int(w) && s_rightTex.height == int(h) &&
++                    JoinWide(tex.id, s_rightTex.id, int(w), int(h), joined))
++                {
++                    s_joinedShown = joined;
++                    s_pgsWidth = 2u * w;
++                }
++            }
++            ga2_zerocopy::presentShot(s_joinedShown.id ? s_joinedShown.id : tex.id, s_joinedShown.id ? s_joinedShown.width : tex.width,
++                                      s_joinedShown.id ? s_joinedShown.height : tex.height, gameTime);
+         }
+-        shown = tex;
++        shown = s_joinedShown.id ? s_joinedShown : tex;
+         outWidth = s_pgsWidth ? s_pgsWidth : FB_WIDTH;
+         outHeight = s_pgsHeight ? s_pgsHeight : DEFAULT_DISPLAY_HEIGHT;
+         return;
+@@ -1302,6 +1425,30 @@ bool PS2Runtime::initialize(const char *title)
+             std::fprintf(stderr, "[display] %dx%d: internal resolution %s (automatic)\n", GetMonitorWidth(monitor), height,
+                          std::string(pick) == "16" ? "4x" : std::string(pick) == "4" ? "2x" : "native");
+         }
++        // Widescreen detail: a hor+ picture is the game's 640-wide frame widened; where the screen gives that picture
++        // more columns than the frame has (16:9 at 1080p or 4K, ultrawide), a second GS instance doubles the columns
++        // (gs_pgs.cpp) instead of the picture being stretched. GA2_PGS_WIDE_DETAIL=0/1 overrides.
++        if (!std::getenv("GA2_PGS_WIDE_DETAIL") && !vrMode)
++        {
++            const char *wide3d = ga2_settings::value(ga2_options::Widescreen3d);
++            const int monitor = GetCurrentMonitor();
++            const float mw = float(std::max(GetMonitorWidth(monitor), 1)), mh = float(std::max(GetMonitorHeight(monitor), 1));
++            float aspect = ga2_display::parseAspect(ga2_settings::value(ga2_options::Aspect));
++            if (aspect <= 0.0f || aspect > mw / mh) // "fill" (the screen's own shape), or wider than the screen
++                aspect = mw / mh;
++            const int ssaa = std::atoi(std::getenv("GA2_PGS_SSAA") ? std::getenv("GA2_PGS_SSAA") : "1");
++            const float frameColumns = 640.0f * float(ssaa >= 16 ? 4 : ssaa >= 4 ? 2 : 1);
++            const float pictureColumns = std::min(mw, mh * aspect);
++            const bool on = !(wide3d && *wide3d == '0') && aspect > 4.0f / 3.0f + 0.01f && pictureColumns > frameColumns * 1.1f;
++#if defined(_WIN32)
++            _putenv_s("GA2_PGS_WIDE_DETAIL", on ? "1" : "0");
++#else
++            setenv("GA2_PGS_WIDE_DETAIL", on ? "1" : "0", 1);
++#endif
++            if (on)
++                std::fprintf(stderr, "[display] widescreen detail: a %.0f-column picture from a %.0f-column frame, columns doubled\n",
++                             pictureColumns, frameColumns);
++        }
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+-- 
+2.56.0
+

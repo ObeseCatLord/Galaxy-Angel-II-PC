@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -734,10 +735,89 @@ namespace
         return false;
     }
 
+    // ga2_hud::captureAreas: this frame's item rectangles (by guest vblank), and the last whole frame's areas.
+    std::atomic<bool> g_capture{false};
+    std::vector<ga2_hud::Area> g_captureItems;
+    uint64_t g_captureFrame = 0;
+    std::mutex g_areaMutex;
+    std::vector<ga2_hud::Area> g_lastAreas;
+
+    // Merges touching rectangles (within 6 px) into areas.
+    std::vector<ga2_hud::Area> mergeAreas(std::vector<ga2_hud::Area> in)
+    {
+        bool merged = true;
+        while (merged)
+        {
+            merged = false;
+            for (size_t a = 0; a < in.size() && !merged; ++a)
+                for (size_t b = a + 1; b < in.size() && !merged; ++b)
+                {
+                    const ga2_hud::Area &p = in[a], &q = in[b];
+                    if (p.x0 - 6.0f <= q.x1 && q.x0 - 6.0f <= p.x1 && p.y0 - 6.0f <= q.y1 && q.y0 - 6.0f <= p.y1)
+                    {
+                        in[a] = {std::min(p.x0, q.x0), std::min(p.y0, q.y0), std::max(p.x1, q.x1), std::max(p.y1, q.y1),
+                                 p.side == q.side ? p.side : 0};
+                        in.erase(in.begin() + std::ptrdiff_t(b));
+                        merged = true;
+                    }
+                }
+        }
+        // Each area's side by its own extent (pieces of one panel may sit in different thirds).
+        for (ga2_hud::Area &a : in)
+        {
+            const Anchor side = sideOf(a.x0, a.x1);
+            a.side = side == AnchorLeft ? -1 : side == AnchorRight ? 1 : 0;
+        }
+        return in;
+    }
+
+    void captureItem(const uint8_t *rdram, uint32_t item, uint32_t kind)
+    {
+        const uint64_t frame = ga2_activity::vsyncs.load(std::memory_order_relaxed);
+        if (frame != g_captureFrame)
+        {
+            // A new frame: the items collected so far were the last one's.
+            std::vector<ga2_hud::Area> done = mergeAreas(std::move(g_captureItems));
+            g_captureItems.clear();
+            g_captureFrame = frame;
+            std::lock_guard<std::mutex> lock(g_areaMutex);
+            g_lastAreas = std::move(done);
+        }
+        if (kind == 4u)
+        {
+            // A layout draws its children itself (not through this hook): each child's rectangle.
+            const uint32_t record = word(rdram, item + 0x28), children = word(rdram, item + 0x2c);
+            const uint32_t count = record ? word(rdram, record + 0x14) : 0u;
+            if (count == 0 || count > 256 || children < 0x100000u || children >= 0x2000000u)
+                return;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t child = word(rdram, children + 4u * i);
+                if (child >= 0x100000u && child < 0x2000000u)
+                    captureItem(rdram, child, word(rdram, child + 8));
+            }
+            return;
+        }
+        Rect r;
+        if (kind == 2u || !itemRect(rdram, item, r) || r.x1 - r.x0 < 4.0f || r.y1 - r.y0 < 4.0f)
+            return;
+        if ((!g_centreItems.empty() && g_centreItems.count(item)) || onUnitIcon(r) || (r.x1 - r.x0 > 560.0f && r.y1 - r.y0 > 400.0f))
+            return;
+        const Anchor side = sideOf(r.x0, r.x1);
+        if (ga2_activity::wideFrame())
+        {
+            r.x0 = placeXAt(side, r.x0);
+            r.x1 = placeXAt(side, r.x1);
+        }
+        g_captureItems.push_back({r.x0, r.y0, r.x1, r.y1, side == AnchorLeft ? -1 : side == AnchorRight ? 1 : 0});
+    }
+
     template <size_t I>
     void itemDraw(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_rdram = rdram;
+        if (g_capture.load(std::memory_order_relaxed))
+            captureItem(rdram, GPR_U32(ctx, 4), word(rdram, GPR_U32(ctx, 4) + 8));
         if (!ga2_activity::wideFrame())
         {
             g_original<I, ItemDraw>(rdram, ctx, runtime);
@@ -921,9 +1001,20 @@ namespace
     template <size_t I>
     void bind(PS2Runtime &runtime)
     {
-        if (!horPlusPossible())
-            return;
         const DiscFeatures &d = kDiscs[I];
+        if (!horPlusPossible())
+        {
+            // VR: no hor+, only the item draw (ga2_hud::captureAreas: the battle table's HUD panels; outside a wide
+            // frame it draws items as they are).
+            if (runtime.hasFunction(d.itemDraw))
+            {
+                g_sys = d.sys;
+                g_original<I, ItemDraw> = runtime.lookupFunction(d.itemDraw);
+                runtime.replaceFunction(d.itemDraw, itemDraw<I>);
+                std::cerr << "[ga2 features] " << d.disc << ": HUD capture bound (VR)\n";
+            }
+            return;
+        }
         g_sys = d.sys;
         auto hook = [&](uint32_t address, PS2Runtime::RecompiledFunction &original, PS2Runtime::RecompiledFunction replacement) {
             if (!runtime.hasFunction(address))
@@ -976,6 +1067,21 @@ void ga2_hud::setUnitIcons(const float *xy, int count)
 void ga2_hud::keepCentred(uint32_t item)
 {
     g_centreItems.insert(item);
+}
+
+void ga2_hud::captureAreas(bool on)
+{
+    g_capture.store(on, std::memory_order_relaxed);
+}
+
+int ga2_hud::areas(Area *out, int max)
+{
+    std::lock_guard<std::mutex> lock(g_areaMutex);
+    int n = 0;
+    for (const Area &a : g_lastAreas)
+        if (n < max)
+            out[n++] = a;
+    return n;
 }
 
 PS2_REGISTER_GAME_OVERRIDE("GA2 features zettai", "SLPM_662.43", 0x00100008u, 0x5E58C415u, bind<0>)

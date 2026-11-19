@@ -176,18 +176,20 @@ game when it starts it; the same options can also be changed while playing
 | Option | Choices |
 | --- | --- |
 | Language | Japanese / English: the window title, and which language pack mod is used |
-| Internal resolution | Native, 2x, 4x: detail of the 3D scenes; at 2x and 4x the text is drawn from a vector font with its own letter spacing, in 2D scenes at the window's own resolution (the 2D art is native 640x448 art). A picture larger than the window is shrunk smoothly (area-averaged), so thin lines and text keep their weight |
-| Display | Window / Fullscreen (F11 or Alt+Enter while playing) |
-| Screen shape | 16:9, 16:10, 21:9 ultrawide, 4:3, or fill the window |
-| 3D widescreen (hor+) | On: 3D scenes show more to the sides at 16:10, 16:9, 21:9 or the window's own shape (Fill), same height as on the PS2; HUD, menus and text keep their proportions, and the battle HUD sits at the screen edges (radar top left, communications bottom left, unit panel and pilot portrait bottom right) |
+| Internal resolution | Automatic (default), Native, 2x, 4x: detail of the 3D scenes. Automatic picks it from the display the game starts on, like a PC game, at least as tall as the display where it can: 4x (2560x1792) from 1200 lines up (1440p, ultrawide 3440x1440, 4K), 2x (1280x896) on 1080p and the like, native only under 700 lines; 2x in VR and on ARM (the Steam Frame). The log says what it chose (`[display] 3440x1440: internal resolution 4x (automatic)`); at 2x and 4x the text is drawn from a vector font with its own letter spacing, in 2D scenes at the window's own resolution (the 2D art is native 640x448 art). A picture larger than the window is shrunk smoothly (area-averaged), so thin lines and text keep their weight |
+| Display | Borderless fullscreen (default: the display's own resolution, other apps a click away) / Window (F11 or Alt+Enter switch while playing) |
+| Screen shape | Fill the screen (default: its own shape, so 3440x1440 is played at 43:18 with hor+ 3D) or a fixed 16:9, 16:10, 21:9 ultrawide, 4:3 |
+| 3D widescreen (hor+) | On: 3D scenes show more to the sides at 16:10, 16:9, 21:9 or the window's own shape (Fill), same height as on the PS2; HUD, menus and text keep their proportions, and the battle HUD sits at the screen edges (radar top left, communications bottom left, unit panel and pilot portrait bottom right). The wider view is drawn with its own detail, not stretched: where the screen gives the picture more columns than the internal resolution has (16:9 at 1080p or 4K, ultrawide such as 3440x1440), a second renderer samples half a pixel beside the first and the two are interleaved, doubling the columns (about twice the GPU work; the log says `[display] widescreen detail: ...`; `GA2_PGS_WIDE_DETAIL=0` turns it off) |
 | Sides of 4:3 scenes | Black, blurred picture, or the game's own space skybox (rendered from your disc after import; needs Python 3 with Pillow) |
 | 2D scene size | Fill, or whole multiples (2x, 3x) for crisp pixels; 3D scenes always fill |
 | 2D picture filter | Bilinear, Smooth (removes the art's dither grain), Anime4K, Anime4K HQ, Sharp pixels, Nearest; 2D scenes only. At 2x and 4x, Anime4K works per layer: every CG, background, character sprite and UI picture is upscaled on its own (to the internal resolution) and the game composes the upscaled layers. A picture is upscaled the first time it is shown (it appears sharp a moment later) and kept in the cache folder (`data/cache/anime4k`) for later sessions. The text and the button prompts are drawn at the window's own resolution |
 | Frame rate | 60 (PS2, default), 75, 90, 100, 120, 144, 165, 170, 175, 180, 200 or 240 frames per second; **Monitor refresh rate** follows the monitor the window is on (read at the start and again when you move the window to another monitor or its rate changes; a monitor at 60 Hz or below means the PS2 rate, above 240 is capped at 240); **Custom** is any whole number from 61 to 240 (launcher: type it into the box, or use the mouse wheel over it; in game: Left / Right change it by 1, Shift by 10, or type the digits and press Enter; Enter or PageDown goes on to the next choice). The whole game (story, menus, ship map, battles) is drawn that often while it keeps its own speed. The rate drops automatically when the PC can't keep up (the processor or the graphics card, for example at 4x), so the game never runs slower than at 60; can also be changed while playing (F2). The battle's 30 fps camera views keep 30 fps. In VR the rate follows the headset. Stored in `settings.ini` as `fps=120`, `fps=173` (custom) or `fps=monitor` |
 | PS2 dithering | Off (default) or the original checkerboard |
 | Debanding | Low (default), High or Off: smooths the colour steps of the PS2's 16-bit gradients (backgrounds, CGs, nebula skies, fades) in 2D and 3D scenes; edges and text stay sharp |
+| HD battle graphics | On (default) or Off (original): at 2x and 4x the battle HUD is drawn sharp, whatever the 2D filter. Its flat-coloured pieces (the units' HP rings, stars, arrows, the clock's digits, enemy icons) are redrawn as clean shapes (rings and discs as true circles), the rest (panels, portraits) upscaled with Anime4K, each the first time it is shown |
 | Button prompts | Automatic (follows the controller or keyboard you use), PlayStation, Xbox, Keyboard |
 | VR mode | Off / On (see below) |
+| VR battle map, VR guide, VR finger tracking | the VR options (see below) |
 | On-screen pad | Off (default) / clickable pad buttons beside the picture |
 | Dump textures (modding) | Saves every texture shown, for making mods (docs/MODDING.md) |
 
@@ -210,7 +212,7 @@ launcher.
 
 - **Take effect at once:** Display, Screen shape (the window takes the new shape
   too), 3D widescreen (hor+; the 3D cameras follow within a frame), Sides of 4:3
-  scenes, 2D scene size, 2D picture filter, PS2 dithering, Debanding, Button prompts,
+  scenes, 2D scene size, 2D picture filter, PS2 dithering, Debanding, HD battle graphics, Button prompts,
   On-screen pad, and the Frame rate (any choice, up to 240). Dump textures applies to
   the textures the game loads from then on.
 - **Marked "restart" and applied the next time a game starts:** Language, Internal
@@ -267,23 +269,40 @@ movies stay on the screen. If the world feels too big or too small, set
 
 **The battle table** (Settings > **VR battle map** > *Battle table*, the
 default; modelled on BattleGroupVR's tactical map). The battle's tactical map
-hovers flat in front of you as a holographic table, about waist high: the
-game's own map, with each unit's icon standing over it as a disc on a stalk.
-The full picture (the radar, the clock, the unit panel, dialogue and the
-game's menus) is on a screen beyond the table. Your hands are translucent
-gloves.
+hovers flat in front of you as a holographic table at about chest height
+(standing; desk height seated): the game's own map, with each unit standing
+over it as a disc on a stalk, blue for friends, red for enemies, gold with a
+second ring for the angel you have selected. The HUD is not a flat screen:
+each piece stands around the table as its own panel, leaning toward you (the
+radar and the talk window on the left, the clock and the unit panel on the
+right, pop-up boxes, the tutorial's boxes and menus above the far edge).
+Your hands are translucent holograms; the hand that selected an angel turns
+orange until the order is given.
 
 | Gesture | Does |
 | --- | --- |
 | Look at a unit and hold your fingertip over it, or touch its disc | hovers it (it lights up; a short buzz) |
-| Trigger on one of your angels | selects it |
-| Hold the trigger, point at a spot and let go | a beam shows the target; letting go moves the angel there, or attacks the enemy / supports the friend under your hand |
-| Trigger on the table with an angel selected | moves it there |
-| One grip, drag | moves the map (it follows your hand, then drifts on a little) |
-| Both grips | apart / together zooms in / out; twisting turns the table |
+| Trigger on one of your angels | selects it (on another angel while one is selected: selects that one instead) |
+| Hold the trigger on the selected angel, point and let go | a beam shows what letting go does: cyan move, red attack, green support (follow, supply, repair), grey nothing (off the table); letting go gives the order and a ring flashes at the target |
+| Trigger on the ground or an enemy with an angel selected | moves there or attacks it at once |
+| One grip, drag | moves the map (it follows your hand with light ticks, then drifts on a little; a trigger stops the drift) |
+| Both grips | apart / together zooms in / out about the point between your hands; twisting turns the table |
+| Both grips held still for a second | brings the table back in front of you, facing ahead |
 | X / Y / B | all angels / H-Weapon / cancel, as on the pad |
 | Left / right stick click | cockpit (the triggers fire) / the camera of the unit (the triggers zoom) |
-| The ? at the table's front right corner | replays the battle part of the VR guide |
+| Touch the ? at the table's front right corner and pull the trigger | replays the battle part of the VR guide |
+
+Losing tracking for a moment does not drop a drag; after a quarter of a second
+the drag is cancelled without an order. With the cheat menu open the hands
+work the menu, not the table.
+
+**Finger tracking** (Settings > **VR finger tracking**, on by default): where
+the headset tracks your fingers (Valve Index controllers, the Steam Frame,
+bare-hand tracking), the hands follow your real fingers; with a controller the
+pointer stays on the controller. With bare hands a pinch is the trigger, a fist
+is the grip and the hand's direction aims; buttons the guide waits for are
+skipped. *Not yet tried on a headset*: if the hands misbehave, turn it off for
+hand poses from the trigger and grip only.
 
 `GA2_VR_TABLE=<height below the eyes>,<distance>,<width>` (metres, default
 `0.45,0.55,1.2`) places the table. *Surround* instead draws the tactical map
@@ -298,7 +317,7 @@ above.
 walks you through pointing, clicking, the buttons and recentring, and at the
 first battle table through grabbing, zooming, selecting and drag orders; each
 step finishes when you do it, and holding B skips a part. Replay it any time:
-Settings > **VR guide** > *Show again*, or touch the ? on the battle table.
+Settings > **VR guide** > *Show again*, or touch the ? on the battle table and pull the trigger.
 During the game's own Tutorial (title screen), a card at the table says how to
 do in VR what the tutorial asks for, in place of its pad buttons.
 

@@ -24,4 +24,18 @@ namespace ga2_hud
     // centre, wherever it is put (the tactical map's cursor ring, which follows
     // the mouse; the edge rules would move it away from the pointer).
     void keepCentred(uint32_t item);
+
+    // The HUD as separate pieces (for the VR battle table, which shows the map itself and the HUD around it): while
+    // capturing, every 2D layer item drawn with a rectangle (not the unit icons, the cursor ring, markers or
+    // screen-wide backdrops) is collected per frame, and overlapping or touching ones are merged into areas, in the
+    // 2D layer's 640 x 480 space as the player sees them (hor+ placement applied).
+    struct Area
+    {
+        float x0, y0, x1, y1;
+        int side; // -1 left, 0 centre, 1 right
+    };
+    constexpr int kMaxAreas = 8;
+    void captureAreas(bool on);
+    // The last whole frame's areas; returns their count.
+    int areas(Area *out, int max);
 }

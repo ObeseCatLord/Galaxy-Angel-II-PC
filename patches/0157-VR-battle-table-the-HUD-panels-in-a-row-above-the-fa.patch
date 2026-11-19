@@ -1,0 +1,71 @@
+From 1b926cc9d96b2f0535e7b7d7f6f01dafd2ec3ac1 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:12:30 -0600
+Subject: [PATCH] VR battle table: the HUD panels in a row above the far edge,
+ the guide above them
+
+The HUD pieces stand above the table's far edge where they sit on the screen
+(left ones left, higher ones higher), in view; beside the table they were half
+out of the field of view. The guide card moves up, centred, above the row.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_vr.cpp | 28 ++++++++++------------------
+ 1 file changed, 10 insertions(+), 18 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index dd258b4..aa3ef8d 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -898,11 +898,9 @@ void main()
+             }
+         }
+ 
+-        // The HUD's pieces as panels around the table (instead of the whole picture on a flat screen): the left ones
+-        // stand beside the table's left edge, the right ones beside its right edge (the radar and the talk window on
+-        // the left, the clock and the unit panel on the right; higher in the picture is further away), the centred
+-        // ones (pop-up panels, the tutorial's boxes, menus) above its far edge. Each leans back a little and turns to
+-        // face the player.
++        // The HUD's pieces as panels around the table (instead of the whole picture on a flat screen): standing in a
++        // row above its far edge as they sit on the screen (left ones on the left, higher ones higher), each leaning
++        // back a little and turned to face the player.
+         void drawHudPanels(const M4 &viewProj, V3 eye, GLuint picture, float extentX, float extentY,
+                            const ga2_battletable::State &st, const ga2_battletable::Pose &pose)
+         {
+@@ -918,18 +916,12 @@ void main()
+                 const ga2_battletable::State::HudArea &a = st.hud[i];
+                 const float w = (a.x1 - a.x0) * kMetresPerPixel * 0.5f, h = (a.y1 - a.y0) * kMetresPerPixel * 0.5f;
+                 const float cy = 0.5f * (a.y0 + a.y1) / 480.0f; // 0 top .. 1 bottom
+-                V3 c;
+-                if (a.side != 0)
+-                {
+-                    const float u = float(a.side) * (pose.halfWidth + 0.04f + w);
+-                    const float v = pose.halfDepth * (0.75f - 1.3f * cy);
+-                    c = playPoint(pose, u, v, 0.06f + h);
+-                }
+-                else
+-                {
+-                    const float u = (0.5f * (a.x0 + a.x1) - 320.0f) / 320.0f * pose.halfWidth * 0.8f;
+-                    c = playPoint(pose, u, pose.halfDepth + 0.06f, 0.16f + h + (1.0f - cy) * 0.12f);
+-                }
++                // Above the table's far edge, where the piece sits on the screen: across by its x, higher for
++                // higher on the screen (the radar and the clock top left and right, the unit panel and the talk
++                // window lower), in front of the guide's card height.
++                const float cx = 0.5f * (a.x0 + a.x1) / 640.0f; // 0 left .. 1 right
++                const float u = (cx - 0.5f) * 2.0f * (pose.halfWidth + 0.05f);
++                const V3 c = playPoint(pose, u, pose.halfDepth + 0.08f, 0.08f + h + (1.0f - cy) * 0.30f);
+                 const V3 toEye = eye - c;
+                 const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
+                 const V3 right = normalize(cross(V3{0, 1, 0}, flat));
+@@ -1111,7 +1103,7 @@ void main()
+                 drawLine(viewProj, eye, q - upv * 1.05f, q - upv * 1.3f, 0.003f, c, 1.0f);
+             }
+             {
+-                const V3 c = playPoint(pose, -pose.halfWidth * 0.55f, pose.halfDepth + 0.05f, 0.32f);
++                const V3 c = playPoint(pose, 0.0f, pose.halfDepth + 0.12f, 0.68f); // above the HUD panels' row
+                 const V3 toEye = eye - c;
+                 const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
+                 const V3 right = normalize(cross(V3{0, 1, 0}, flat));
+-- 
+2.56.0
+

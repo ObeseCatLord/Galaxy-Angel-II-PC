@@ -23,6 +23,8 @@ namespace ga2
             return list;
         }
         int g_windowScaleOverride = 0;
+        // settings.ini's format: 2 since 0.11.0 (Automatic resolution, borderless fullscreen and the screen's own shape are the defaults).
+        constexpr int kSettingsVersion = 2;
     }
 
     void Settings::overrideForThisRun(size_t option, int choice, int number) { overrides()[option] = {true, choice, number}; }
@@ -69,12 +71,19 @@ namespace ga2
         Settings settings;
         std::ifstream in(file);
         const auto &table = options();
+        bool any = false, current = false;
         for (std::string line; std::getline(in, line);)
         {
+            any = true;
             if (!line.empty() && line.back() == '\r') line.pop_back();
             const auto equals = line.find('=');
             if (equals == std::string::npos) continue;
             const std::string key = line.substr(0, equals), value = line.substr(equals + 1);
+            if (key == "settings_version")
+            {
+                current = std::atoi(value.c_str()) >= kSettingsVersion;
+                continue;
+            }
             if (key == "last_game")
             {
                 settings.lastGame = value;
@@ -98,6 +107,19 @@ namespace ga2
                     }
                 }
         }
+        // Files from before 0.11.0 hold the old defaults, Native, Window and 16:9: they become the new ones once,
+        // Automatic, Borderless fullscreen and the screen's own shape (other choices stay as they are).
+        if (any && !current)
+        {
+            const size_t resolution = ga2_options::Resolution, fullscreen = ga2_options::Fullscreen;
+            if (std::string(table[resolution].choices[size_t(settings.m_choices[resolution])].value) == "0")
+                settings.m_choices[resolution] = ga2_options::choiceIndex(resolution, "auto");
+            if (std::string(table[fullscreen].choices[size_t(settings.m_choices[fullscreen])].value) == "0")
+                settings.m_choices[fullscreen] = ga2_options::choiceIndex(fullscreen, "1");
+            const size_t aspect = ga2_options::Aspect;
+            if (std::string(table[aspect].choices[size_t(settings.m_choices[aspect])].value) == "16:9")
+                settings.m_choices[aspect] = ga2_options::choiceIndex(aspect, "fit");
+        }
         return settings;
     }
 
@@ -108,6 +130,7 @@ namespace ga2
         for (size_t i = 0; i < table.size(); ++i)
             out << table[i].key << '=' << ga2_options::storedValue(i, m_choices[i], m_numbers[i]) << '\n';
         out << "window_scale=" << windowScale << '\n';
+        out << "settings_version=" << kSettingsVersion << '\n';
         if (!lastGame.empty()) out << "last_game=" << lastGame << '\n';
     }
 

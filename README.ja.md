@@ -5,15 +5,19 @@
 [![CI](https://github.com/ObeseCatLord/galaxy-angel-2-pc/actions/workflows/ci.yml/badge.svg)](https://github.com/ObeseCatLord/galaxy-angel-2-pc/actions/workflows/ci.yml)
 
 <p align="center">
+  <img src="docs/images/battle-ultrawide-en.png" width="100%" alt="3440x1440 ウルトラワイドでの戦闘画面（英語版）">
+</p>
+<p align="center"><sub>3440x1440 ウルトラワイドでの戦闘（英語版）：ディスプレイの形のままのボーダーレスフルスクリーン、引き伸ばさずに描かれる広い 3D 視界、HD 戦闘グラフィック。</sub></p>
+<p align="center">
   <img src="docs/images/battle-ja.png" width="56%" alt="永劫回帰の刻の戦闘画面（16:9 ワイド）">
   <img src="docs/images/story-ja.png" width="42%" alt="永劫回帰の刻のストーリー場面">
 </p>
 <p align="center"><sub>『永劫回帰の刻』、内部解像度 4 倍・Anime4K・デバンディング有効：16:9 ワイドの戦闘画面とストーリー場面。</sub></p>
 <p align="center">
   <img src="docs/images/vr-story-en.png" width="40%" alt="VR：宇宙のスカイボックスに浮かぶ大画面のストーリー場面">
-  <img src="docs/images/vr-battle-en.png" width="58%" alt="VR：周囲に広がる立体視の戦闘マップ（左右の目）">
+  <img src="docs/images/vr-table-en.png" width="58%" alt="VR：目の前のバトルテーブル、ホログラムの手、陣営色のユニット、命令のビーム、パネルになった HUD">
 </p>
-<p align="center"><sub>VR：ストーリー場面はゲームの宇宙スカイボックスに浮かぶ大画面で、戦闘は立体視で周囲に広がり、モーションコントロールで操作します（左右の目の画像、英語版）。</sub></p>
+<p align="center"><sub>VR：ストーリー場面はゲームの宇宙スカイボックスに浮かぶ大画面で、戦闘は目の前のホログラムのテーブルを手で操作します（HUD はテーブルの周りのパネル、英語版）。</sub></p>
 
 プレイステーション 2 用『ギャラクシーエンジェルII』三部作
 （『絶対領域の扉』『無限回廊の鍵』『永劫回帰の刻』）の PC ネイティブ移植です。
@@ -59,14 +63,19 @@ Vulkan 1.3 対応の GPU が必要です。0.11.0 からポータブル構成で
   （[docs/LANGUAGE_PACKS.md](docs/LANGUAGE_PACKS.md)）。
 - MOD：差し替えファイルと高解像度テクスチャ（[docs/MODDING.md](docs/MODDING.md)）。
 - 2D 画像用フィルター（Smooth、Anime4K、シャープ）、デバンディング、PS2 の
-  ディザリングの除去。
+  ディザリングの除去。2x・4x では戦闘 HUD を高解像度化（リング・矢印・星・数字は
+  くっきりした図形として描き直し、パネルと顔グラフィックは拡大。設定の
+  「HD battle graphics」で Off にすると元の画像）。
 - チートメニュー（F1）とゲーム内設定メニュー（F2）。
 - OpenXR（SteamVR、Monado）による VR。ゲーム画面は大きなスクリーンに映り、
   3D シーンは周囲を立体視で包みます。戦闘は目の前のホログラムのバトル
   テーブルでモーションコントロールで操作します（ユニットに手を重ねてトリガーで
   選択、目的地や敵までドラッグして離すと移動・攻撃、マップをつかんで移動、両手で
-  ズームと回転）。VR ガイドで操作を学べ（設定から再表示可能）、ゲームの
-  チュートリアルでは VR での操作が表示されます。
+  ズームと回転）。戦闘 HUD はテーブルの周りに個別のパネルとして立ちます。
+  ホログラムの手は、ヘッドセットが指を追跡できる場合（Index コントローラー、
+  Steam Frame、素手）実際の指の動きに合わせて動きます（ヘッドセットでは未検証）。
+  VR ガイドで操作を学べ（設定から再表示可能）、ゲームのチュートリアルでは
+  VR での操作が表示されます。
 - Steam Frame 向けのネイティブ ARM64 ビルド（通常表示・VR とも対応、
   [docs/STEAM_FRAME.md](docs/STEAM_FRAME.md)）。
 

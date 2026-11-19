@@ -461,25 +461,112 @@ namespace
     {
         uint64_t poseSerial = 0;
         int64_t poseSeen = 0;
-        int hand = 1;           // the hand that pointed last
-        bool pressed = false;   // the trigger of `hand` is held
-        uint32_t pressUnit = 0; // the unit hovered at the press
+        int hand = 1;             // the hand that pointed last
+        bool pressed = false;     // the trigger of `hand` is held
+        uint32_t pressUnit = 0;   // the unit hovered at the press
+        bool pressSelected = false; // the game selected pressUnit: a drag from it gives an order
         float pressU = 0, pressV = 0;
         int64_t pressAt = 0;
-        bool order = false;     // the release gives an order
-        float orderX = 0, orderZ = 0;
-        uint32_t orderUnit = 0;
-        bool orderGround = false;
-        int64_t holdUntil = 0;  // after the release: keep the order's target as the pick
+        int64_t lostAt = 0;       // the pressing hand's tracking was lost (0: tracked)
+        ga2_battletable::Hand lastHand; // the pressing hand as last tracked
+        // A press the game is asked for: until its frames are over, the pick stays on its target.
+        uint64_t holdUntilSerial = 0;
+        uint32_t holdUnit = 0;
+        bool holdGround = false;
+        float holdX = 0, holdZ = 0;
         uint32_t lastHover[2] = {0, 0};
+        int ownerHand = -1;       // the hand that selected the angel now selected
         ga2_battletable::State state;
     } g_table;
+
+    // A unit's type id (the game's class function reads it: 1.. the angels, 10..49 enemies, 50 the flagship, ...).
+    constexpr uint32_t kUnitType = 0x168;
+
+    // GA2_TABLE_SELFTEST=1 (tests without a headset's hands): from the table's first frame the hands follow a
+    // timeline over the real units (an angel and an enemy picked from the last table frame): hover, select, a drag
+    // order, select another angel, re-select the first, grab and pan, zoom with both hands. Each phase is logged
+    // with the game's map state ("[table test]").
+    struct SelfTest
+    {
+        bool on = std::getenv("GA2_TABLE_SELFTEST") != nullptr;
+        int64_t start = 0;
+        float ally[3] = {}, ally2[3] = {}, enemy[3] = {};
+        bool haveAlly = false, haveAlly2 = false, haveEnemy = false;
+        uint32_t allyUnit = 0, ally2Unit = 0, enemyUnit = 0; // followed every frame (units move)
+        int phase = -1;
+    } g_selfTest;
+
+    ga2_battletable::Pose tablePose()
+    {
+        ga2_battletable::Pose pose = ga2_battletable::pose();
+        SelfTest &t = g_selfTest;
+        if (!t.on || !pose.valid)
+            return pose;
+        const int64_t now = nowNanos();
+        if (!t.start)
+            t.start = now;
+        const float sec = float(double(now - t.start) * 1e-9);
+        ga2_battletable::Hand &r = pose.hands[1], &l = pose.hands[0];
+        auto setTip = [&](ga2_battletable::Hand &hand, const float *p, float lift) {
+            hand.tip[0] = p[0], hand.tip[1] = p[1] + lift, hand.tip[2] = p[2];
+            hand.aim[0] = 0, hand.aim[1] = -1, hand.aim[2] = 0;
+            hand.valid = true;
+        };
+        auto toward = [&](ga2_battletable::Hand &hand, const float *from, const float *to, float f) {
+            // The fingertip 12 cm above a point between, pointing down at the target.
+            float p[3];
+            for (int k = 0; k < 3; ++k)
+                p[k] = from[k] + (to[k] - from[k]) * f;
+            hand.tip[0] = p[0], hand.tip[1] = p[1] + 0.12f, hand.tip[2] = p[2];
+            float d[3] = {to[0] - hand.tip[0], to[1] - hand.tip[1], to[2] - hand.tip[2]};
+            const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            for (int k = 0; k < 3; ++k)
+                hand.aim[k] = d[k] / std::max(len, 1e-4f);
+            hand.valid = true;
+        };
+        r.trigger = r.grip = l.trigger = l.grip = 0.0f;
+        int phase = 0;
+        auto bothGrips = [&](float d) {
+            r.grip = l.grip = 1.0f;
+            r.palm[0] = pose.center[0] + d, l.palm[0] = pose.center[0] - d;
+            r.palm[1] = l.palm[1] = pose.center[1] + 0.05f;
+            r.palm[2] = l.palm[2] = pose.center[2];
+            r.valid = l.valid = true;
+        };
+        if (sec < 3.0f) phase = 0;                                                                 // rest
+        else if (sec < 6.0f) { phase = 1; bothGrips(0.20f - 0.12f * std::min(1.0f, (sec - 3.5f) / 2.0f)); } // zoom out
+        else if (sec < 7.0f) phase = 2;                                                            // rest
+        else if (sec < 9.0f && t.haveAlly) { phase = 3; setTip(r, t.ally, 0.0f); }                    // hover the angel
+        else if (sec < 10.0f && t.haveAlly) { phase = 4; setTip(r, t.ally, 0.0f); r.trigger = 1.0f; } // select
+        else if (sec < 12.0f && t.haveAlly && t.haveEnemy) { phase = 5; toward(r, t.ally, t.enemy, (sec - 10.0f) / 2.0f); r.trigger = 1.0f; } // drag
+        else if (sec < 13.0f && t.haveEnemy) { phase = 6; toward(r, t.ally, t.enemy, 1.0f); }          // let go: the order
+        else if (sec < 15.0f && t.haveAlly2) { phase = 7; setTip(r, t.ally2, 0.0f); r.trigger = sec < 14.0f ? 1.0f : 0.0f; } // select another
+        else if (sec < 17.0f && t.haveAlly) { phase = 8; setTip(r, t.ally, 0.0f); r.trigger = sec < 16.0f ? 1.0f : 0.0f; }  // re-select the first
+        else if (sec < 18.0f) phase = 9;                                                           // gap
+        else if (sec < 20.0f)
+        {
+            phase = 10; // one grip: pan 15 cm to the right
+            r.grip = 1.0f;
+            r.palm[0] = pose.center[0] + 0.15f * (sec - 18.0f) / 2.0f, r.palm[1] = pose.center[1] + 0.05f, r.palm[2] = pose.center[2];
+            r.valid = true;
+        }
+        else
+            phase = 11;
+        if (phase != t.phase)
+        {
+            t.phase = phase;
+            static const char *names[] = {"rest", "two-hand zoom out", "rest", "hover", "select", "drag", "release",
+                                          "select another", "re-select", "gap", "grab pan", "done"};
+            std::fprintf(stderr, "[table test] t=%.1f phase %s\n", sec, names[phase]);
+        }
+        return pose;
+    }
 
     bool tableWanted()
     {
         if (std::strcmp(ga2_settings::value(ga2_options::VrBattleSelect), "laser") == 0)
             return false;
-        const ga2_battletable::Pose pose = ga2_battletable::pose();
+        const ga2_battletable::Pose pose = tablePose();
         const int64_t now = nowNanos();
         if (pose.valid && pose.serial != g_table.poseSerial)
         {
@@ -553,13 +640,18 @@ namespace
     bool tablePick(uint8_t *ram, uint32_t mapview, uint32_t mgr, uint32_t last, uint32_t &best)
     {
         const Disc &D = kDiscs[I];
-        const ga2_battletable::Pose pose = ga2_battletable::pose();
+        const ga2_battletable::Pose pose = tablePose();
         ga2_battletable::State st;
         st.serial = g_table.state.serial + 1;
+        std::memcpy(st.hapticMicro, g_table.state.hapticMicro, sizeof(st.hapticMicro));
         std::memcpy(st.hapticSmall, g_table.state.hapticSmall, sizeof(st.hapticSmall));
         std::memcpy(st.hapticBig, g_table.state.hapticBig, sizeof(st.hapticBig));
         st.presses = g_table.state.presses;
         st.orders = g_table.state.orders;
+        st.pressCount = g_table.state.pressCount;
+        std::memcpy(st.pressKind, g_table.state.pressKind, sizeof(st.pressKind));
+        st.flashes = g_table.state.flashes;
+        st.flashX = g_table.state.flashX, st.flashZ = g_table.state.flashZ, st.flashKind = g_table.state.flashKind;
         if (!tableFrame<I>(ram, mgr, pose, st))
             return false;
         st.active = true;
@@ -594,19 +686,74 @@ namespace
         }
         st.unitCount = n;
 
-        // Hover per hand: touch, else the eye scan.
+        // The game's map state: sub-state 0 free, 1 an angel selected (orders go to it), 2 orders to all.
+        const uint32_t sub = word(ram, mapview + 8);
+        const uint32_t selected = sub == 1 ? word(ram, mapview + 0x28) : 0u;
+        auto enemyAt = [&](uint32_t unit) {
+            const uint32_t type = word(ram, unit + kUnitType);
+            return type >= 10u && type < 50u;
+        };
+        for (int k = 0; k < n; ++k)
+        {
+            ga2_battletable::Unit &u = st.units[k];
+            u.enemy = enemyAt(discs[k].unit);
+            u.selected = discs[k].unit == selected && selected != 0;
+            u.onPlate = std::fabs(discs[k].u) <= pose.halfWidth * 0.97f && std::fabs(discs[k].v) <= pose.halfDepth * 0.97f;
+        }
+        static const bool logTypes = std::getenv("GA2_BATTLEPTR_LOG") != nullptr;
+        if (logTypes)
+        {
+            static int64_t lastLog = 0;
+            if (now - lastLog > 5'000'000'000)
+            {
+                lastLog = now;
+                std::string list;
+                for (int k = 0; k < n; ++k)
+                    list += " " + std::to_string(word(ram, discs[k].unit + kUnitType));
+                std::fprintf(stderr, "[battleptr] table: sub-state %u, selected %06x, unit types:%s\n", sub, selected, list.c_str());
+                ga2_hud::Area areas[ga2_battletable::State::kMaxHud];
+                const int count = ga2_hud::areas(areas, ga2_battletable::State::kMaxHud);
+                for (int k = 0; k < count; ++k)
+                    std::fprintf(stderr, "[battleptr] hud area %d: %.0f,%.0f - %.0f,%.0f side %d\n", k, areas[k].x0, areas[k].y0, areas[k].x1,
+                                 areas[k].y1, areas[k].side);
+            }
+        }
+
+        // The hand that presses: tracked or, briefly after losing tracking, as last seen (a drag survives a dropout).
+        ga2_battletable::Hand hands[2] = {pose.hands[0], pose.hands[1]};
+        if (g_table.pressed)
+        {
+            ga2_battletable::Hand &ph = hands[g_table.hand];
+            if (ph.valid)
+            {
+                g_table.lastHand = ph;
+                g_table.lostAt = 0;
+            }
+            else
+            {
+                if (!g_table.lostAt)
+                    g_table.lostAt = now;
+                ph = g_table.lastHand;
+            }
+        }
+
+        // Hover per hand: touch, else the eye scan; the unit hovered last stays hovered a little further out. While a
+        // trigger is held only that hand hovers (BattleGroupVR's hover owner).
         uint32_t hovered[2] = {0, 0};
         for (int h = 0; h < 2; ++h)
         {
-            const ga2_battletable::Hand &hand = pose.hands[h];
-            if (!hand.valid)
+            const ga2_battletable::Hand &hand = hands[h];
+            if (!hand.valid || (g_table.pressed && h != g_table.hand))
                 continue;
+            const uint32_t last = g_table.lastHover[h];
             float bestScore = 1e9f;
             for (int k = 0; k < n; ++k)
             {
+                if (!st.units[k].onPlate)
+                    continue;
                 const float dx = discs[k].p[0] - hand.tip[0], dy = discs[k].p[1] - hand.tip[1], dz = discs[k].p[2] - hand.tip[2];
                 const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                if (dist < 0.04f && dist < bestScore)
+                if (dist < (discs[k].unit == last ? 0.05f : 0.04f) && dist < bestScore)
                 {
                     bestScore = dist;
                     hovered[h] = discs[k].unit;
@@ -621,9 +768,13 @@ namespace
             float bestAngle = 1e9f, bestDist = 1e9f;
             for (int k = 0; k < n; ++k)
             {
+                if (!st.units[k].onPlate)
+                    continue;
                 const float toDisc[3] = {discs[k].p[0] - pose.head[0], discs[k].p[1] - pose.head[1], discs[k].p[2] - pose.head[2]};
                 const float dist = std::sqrt(toDisc[0] * toDisc[0] + toDisc[1] * toDisc[1] + toDisc[2] * toDisc[2]);
-                const float a = angleBetween(toDisc, toTip);
+                float a = angleBetween(toDisc, toTip);
+                if (discs[k].unit == last)
+                    a = std::max(0.0f, a - 0.026f); // 1.5 degrees of stickiness
                 if (a > 0.0873f || dist + 0.05f < tipDist) // 5 degrees; beyond the fingertip
                     continue;
                 const float rounded = std::round(a * 57.29578f);
@@ -644,21 +795,23 @@ namespace
 
         // The pointing hand: the one whose trigger is held, else the one that hovers, else the last.
         for (int h = 0; h < 2; ++h)
-            if (pose.hands[h].valid && pose.hands[h].trigger > 0.6f && !g_table.pressed)
+            if (hands[h].valid && hands[h].trigger > 0.6f && !g_table.pressed)
                 g_table.hand = h;
         if (!g_table.pressed && !hovered[g_table.hand] && hovered[g_table.hand ^ 1])
             g_table.hand ^= 1;
         const int h = g_table.hand;
-        const ga2_battletable::Hand &hand = pose.hands[h];
-        const bool down = hand.valid && hand.trigger > 0.6f, up = !hand.valid || hand.trigger < 0.4f;
+        const ga2_battletable::Hand &hand = hands[h];
+        const bool down = hand.valid && hand.trigger > 0.6f, up = hand.valid && hand.trigger < 0.4f;
 
         // The ground under the hand: from the head through the fingertip (hovering), the fingertip's forward ray
-        // while a unit is being dragged (BattleGroupVR's order line).
+        // while an order is dragged (BattleGroupVR's order line: then the unit nearest that ray's ground point is the
+        // target, the units under the eye do not count).
+        const bool dragging = g_table.pressed && g_table.pressSelected;
         bool ground = false;
         float gu = 0, gv = 0;
         if (hand.valid)
         {
-            if (g_table.pressed && g_table.pressUnit)
+            if (dragging)
                 ground = rayTable(pose, hand.tip, hand.aim, gu, gv);
             else
             {
@@ -670,30 +823,117 @@ namespace
         if (ground)
             ga2_battletable::tableToMap(st, gu, gv, X, Z);
         best = hovered[h];
+        if (dragging)
+        {
+            best = 0;
+            float bestD = 0.035f;
+            for (int k = 0; k < n && ground; ++k)
+            {
+                const float d = std::hypot(discs[k].u - gu, discs[k].v - gv);
+                if (st.units[k].onPlate && discs[k].unit != g_table.pressUnit && d < bestD)
+                {
+                    bestD = d;
+                    best = discs[k].unit;
+                }
+            }
+        }
 
-        // Press, drag, release.
+        // Presses the game is asked for (the pad mapper presses them one after another, two game frames each).
+        auto press = [&](ga2_battletable::Press kind) {
+            st.pressKind[st.pressCount % ga2_battletable::State::kPressRing] = kind;
+            ++st.pressCount;
+        };
+        // Until those frames are over the pick stays on what was pressed.
+        auto hold = [&](uint32_t unit, bool onGround, float x, float z, int presses) {
+            g_table.holdUntilSerial = st.serial + uint64_t(presses) * 4u + 4u;
+            g_table.holdUnit = unit;
+            g_table.holdGround = onGround;
+            g_table.holdX = x;
+            g_table.holdZ = z;
+        };
+        auto flash = [&](uint32_t unit, float x, float z, ga2_battletable::DragKind kind) {
+            for (int k = 0; k < n; ++k)
+                if (discs[k].unit == unit)
+                    x = st.units[k].x, z = st.units[k].z;
+            st.flashX = x, st.flashZ = z, st.flashKind = kind;
+            ++st.flashes;
+        };
+        auto kindOf = [&](uint32_t unit, bool onGround) {
+            if (unit)
+                return enemyAt(unit) ? ga2_battletable::DragKind::Attack : ga2_battletable::DragKind::Support;
+            return onGround ? ga2_battletable::DragKind::Move : ga2_battletable::DragKind::Invalid;
+        };
+
+        // Press: on an angel select it (BattleGroupVR: the trigger on a unit selects it; on another angel while one is
+        // selected, Cross then Circle re-selects); with an angel selected, on an enemy or the ground the press is the
+        // order (a tap); on the selected angel it starts a drag.
         if (!g_table.pressed && down)
         {
             g_table.pressed = true;
             g_table.pressUnit = best;
+            g_table.pressSelected = false;
             g_table.pressAt = now;
+            g_table.lostAt = 0;
+            g_table.lastHand = hand;
             float th;
             ga2_battletable::toTable(pose, hand.tip, g_table.pressU, g_table.pressV, th);
-            ++st.hapticBig[h];
-            if (best)
+            const bool ordering = sub == 1 || sub == 2;
+            if (best && !enemyAt(best) && (sub == 0 || (sub == 1 && best != selected)))
+            {
+                if (sub == 1)
+                    press(ga2_battletable::Press::Cross);
+                press(ga2_battletable::Press::Circle);
+                hold(best, false, 0, 0, sub == 1 ? 2 : 1);
+                g_table.ownerHand = h;
+                ++st.hapticBig[h];
                 ++st.presses;
+            }
+            else if (best && sub == 1 && best == selected)
+            {
+                g_table.pressSelected = true; // drag from the selected angel
+                g_table.ownerHand = h;
+                ++st.hapticSmall[h];
+            }
+            else if (ordering && (best || ground))
+            {
+                press(ga2_battletable::Press::Circle); // the order, here
+                hold(best, ground && !best, X, Z, 1);
+                flash(best, X, Z, kindOf(best, ground));
+                ++st.hapticBig[h];
+                ++st.orders;
+                g_table.pressUnit = 0;
+            }
+            else
+            {
+                // Anything else is Circle as on the pad: an H-Weapon target (sub-state 3), the angel list, a message
+                // to advance, empty space (nothing happens there).
+                press(ga2_battletable::Press::Circle);
+                if (best)
+                    hold(best, false, 0, 0, 1);
+                ++st.hapticMicro[h];
+            }
         }
         if (g_table.pressed)
         {
-            float tu, tv, th;
-            ga2_battletable::toTable(pose, hand.tip, tu, tv, th);
-            const float moved = std::hypot(tu - g_table.pressU, tv - g_table.pressV);
-            const bool target = (best != 0 && best != g_table.pressUnit) || (best == 0 && ground);
-            g_table.order = g_table.pressUnit != 0 && target && (moved > 0.03f || now - g_table.pressAt > 250'000'000);
-            if (g_table.pressUnit)
+            // The selection landed: a drag from it orders.
+            if (!g_table.pressSelected && g_table.pressUnit && sub == 1 && selected == g_table.pressUnit)
+                g_table.pressSelected = true;
+            if (g_table.lostAt && now - g_table.lostAt > 250'000'000)
             {
-                st.drag = true;
+                g_table.pressed = false; // tracking lost: the drag is dropped, no order
+                ++st.hapticMicro[h];
+            }
+            else if (g_table.pressSelected)
+            {
+                float tu, tv, th;
+                ga2_battletable::toTable(pose, hand.tip, tu, tv, th);
+                const float moved = std::hypot(tu - g_table.pressU, tv - g_table.pressV);
+                // A drag once the hand moves (BattleGroupVR): holding still on the selected angel and letting go
+                // gives no order.
+                const bool armed = moved > 0.03f;
+                st.drag = armed;
                 st.dragHand = h;
+                st.dragKind = kindOf(best, ground);
                 if (best)
                 {
                     for (int k = 0; k < n; ++k)
@@ -702,36 +942,35 @@ namespace
                 }
                 else if (ground)
                     st.dragX = X, st.dragZ = Z;
-                else
-                    st.drag = false;
-            }
-            g_table.orderUnit = best;
-            g_table.orderGround = ground;
-            g_table.orderX = X;
-            g_table.orderZ = Z;
-            if (up)
-            {
-                g_table.pressed = false;
-                if (g_table.order)
+                if (up)
                 {
-                    g_table.holdUntil = now + 400'000'000; // the release's Circle arrives a little later
-                    ++st.hapticBig[h];
-                    ++st.orders;
+                    g_table.pressed = false;
+                    if (armed && st.dragKind != ga2_battletable::DragKind::Invalid)
+                    {
+                        press(ga2_battletable::Press::Circle);
+                        hold(best, ground && !best, X, Z, 1);
+                        flash(best, X, Z, st.dragKind);
+                        ++st.hapticBig[h];
+                        ++st.orders;
+                    }
+                    else if (armed)
+                        ++st.hapticMicro[h]; // let go off the table: nothing
+                    st.drag = false;
                 }
             }
+            else if (up)
+                g_table.pressed = false;
         }
-        st.orderOnRelease = g_table.order;
-        if (!g_table.pressed && now < g_table.holdUntil)
+        if (st.serial < g_table.holdUntilSerial)
         {
-            // The order's press: the target of the drag.
-            best = g_table.orderUnit;
-            ground = g_table.orderGround;
-            X = g_table.orderX;
-            Z = g_table.orderZ;
-            st.orderOnRelease = true;
+            best = g_table.holdUnit;
+            ground = g_table.holdGround;
+            X = g_table.holdX;
+            Z = g_table.holdZ;
         }
-        else if (!g_table.pressed)
-            g_table.order = false;
+        if (sub != 1)
+            g_table.ownerHand = -1;
+        st.ownerHand = g_table.ownerHand;
         for (int k = 0; k < n; ++k)
             st.units[k].hovered = discs[k].unit == hovered[0] || discs[k].unit == hovered[1];
 
@@ -758,6 +997,60 @@ namespace
                        (open(0x11) || open(0x13) ? 8u : 0u) | (open(k.square) ? 16u : 0u) | (open(k.triangle) ? 32u : 0u) |
                        (open(k.l3) ? 64u : 0u) | (open(k.r3) ? 128u : 0u) | (open(k.start) ? 256u : 0u) | (open(k.l2) ? 512u : 0u);
         }
+        if (g_selfTest.on)
+        {
+            SelfTest &t = g_selfTest;
+            // Targets (once zoomed out): the first two angels on the table and the enemy nearest its centre, followed
+            // as they move.
+            if (t.phase >= 2)
+            {
+                float bestD = 1e9f;
+                for (int k = 0; k < n; ++k)
+                {
+                    if (!st.units[k].onPlate)
+                        continue;
+                    const uint32_t unit = discs[k].unit, type = word(ram, unit + kUnitType);
+                    const float d = std::hypot(discs[k].u, discs[k].v);
+                    if (st.units[k].enemy && !t.haveEnemy && d < bestD)
+                        bestD = d, t.enemyUnit = unit;
+                    if (!st.units[k].enemy && type >= 1 && type <= 7)
+                    {
+                        if (!t.allyUnit)
+                            t.allyUnit = unit;
+                        else if (!t.ally2Unit && unit != t.allyUnit)
+                            t.ally2Unit = unit;
+                    }
+                }
+            }
+            t.haveAlly = t.haveAlly2 = t.haveEnemy = false;
+            for (int k = 0; k < n; ++k)
+            {
+                if (discs[k].unit == t.allyUnit)
+                    std::memcpy(t.ally, discs[k].p, sizeof(t.ally)), t.haveAlly = true;
+                if (discs[k].unit == t.ally2Unit)
+                    std::memcpy(t.ally2, discs[k].p, sizeof(t.ally2)), t.haveAlly2 = true;
+                if (discs[k].unit == t.enemyUnit)
+                    std::memcpy(t.enemy, discs[k].p, sizeof(t.enemy)), t.haveEnemy = true;
+            }
+            static int64_t lastLog = 0;
+            static uint32_t lastSub = 99, lastSel = 1, lastOrders = 0, lastPresses = 0;
+            if (sub != lastSub || selected != lastSel || st.orders != lastOrders || st.pressCount != lastPresses || now - lastLog > 1'000'000'000)
+            {
+                lastLog = now;
+                lastSub = sub, lastSel = selected, lastOrders = st.orders, lastPresses = st.pressCount;
+                std::fprintf(stderr, "[table test] sub-state %u selected %06x hovered %06x/%06x presses %u orders %u game presses %u drag %d kind %d centre %.0f,%.0f scale %.0f\n",
+                             sub, selected, hovered[0], hovered[1], st.presses, st.orders, st.pressCount, int(st.drag), int(st.dragKind),
+                             st.cx, st.cz, st.s);
+            }
+        }
+        // The HUD's pieces (ga2_hud.h), for the panels around the table.
+        ga2_hud::captureAreas(true);
+        {
+            ga2_hud::Area areas[ga2_battletable::State::kMaxHud];
+            st.hudCount = ga2_hud::areas(areas, ga2_battletable::State::kMaxHud);
+            for (int k = 0; k < st.hudCount; ++k)
+                st.hud[k] = {areas[k].x0, areas[k].y0, areas[k].x1, areas[k].y1, areas[k].side};
+        }
         g_pick = Pick{Source::Table, ground, X, Z, gx, gy, best};
         g_table.state = st;
         ga2_battletable::publish(st);
@@ -779,6 +1072,7 @@ namespace
         best = 0;
         if (tableWanted())
             return tablePick<I>(ram, mapview, mgr, last, best);
+        ga2_hud::captureAreas(false);
         WorldRay ray;
         float gx = 0.0f, gy = 0.0f;
         if (handRay(ray))
@@ -1263,25 +1557,62 @@ namespace
                     bool grab = false, zoom = false;
                     int hand = 0;
                     float u0 = 0, v0 = 0, camX0 = 0, camZ0 = 0, d0 = 0, camY0 = 0, vx = 0, vz = 0;
+                    float tickU = 0, tickV = 0;
+                    int64_t tickAt = 0;
                 } grab;
-                const ga2_battletable::Pose pose = ga2_battletable::pose();
-                const ga2_battletable::State &st = g_table.state;
+                const ga2_battletable::Pose pose = tablePose();
+                ga2_battletable::State &st = g_table.state;
                 const float dt = std::clamp(ctx->f[12], 0.001f, 0.1f);
+                const int64_t tnow = nowNanos();
                 const bool g0 = pose.hands[0].valid && pose.hands[0].grip > 0.6f, g1 = pose.hands[1].valid && pose.hands[1].grip > 0.6f;
+                // A light tick now and then while the map moves under a hand (BattleGroupVR's grab ticks).
+                auto tick = [&](int h, float u, float v) {
+                    if (tnow - grab.tickAt > 75'000'000 && std::hypot(u - grab.tickU, v - grab.tickV) > 0.01f)
+                    {
+                        ++st.hapticMicro[h];
+                        grab.tickAt = tnow;
+                        grab.tickU = u, grab.tickV = v;
+                    }
+                };
                 if (g0 && g1)
                 {
-                    const float dx = pose.hands[1].palm[0] - pose.hands[0].palm[0], dy = pose.hands[1].palm[1] - pose.hands[0].palm[1],
-                                dz = pose.hands[1].palm[2] - pose.hands[0].palm[2];
+                    // Both grips: the distance between the hands zooms about their midpoint (the map point under
+                    // it stays under it), and the midpoint pans as one grip does.
+                    const float *a = pose.hands[0].palm, *b = pose.hands[1].palm;
+                    const float dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
                     const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    const float mid[3] = {(a[0] + b[0]) * 0.5f, (a[1] + b[1]) * 0.5f, (a[2] + b[2]) * 0.5f};
+                    float mu, mv, mh;
+                    ga2_battletable::toTable(pose, mid, mu, mv, mh);
                     if (!grab.zoom)
                     {
                         grab.zoom = true;
                         grab.grab = false;
                         grab.d0 = d;
                         grab.camY0 = camY;
+                        grab.u0 = mu, grab.v0 = mv;
+                        grab.camX0 = camX, grab.camZ0 = camZ;
                     }
                     else if (d > 0.05f && grab.d0 > 0.05f && gateOpen<I>(ram, mgr, 0x11) && gateOpen<I>(ram, mgr, 0x13))
-                        camY = grab.camY0 * grab.d0 / d; // apart: closer to the ground
+                    {
+                        // The table's centre and scale follow the camera's height (centre = camera + height * w, scale
+                        // proportional to the height): the map point under the starting midpoint stays under the
+                        // midpoint now.
+                        const float ratio = grab.d0 / d; // apart: closer to the ground
+                        const float yNow = std::max(1e-3f, flt(ram, cam + 4));
+                        camY = grab.camY0 * ratio;
+                        if (panOk)
+                        {
+                            const float wx = (st.cx - flt(ram, cam)) / yNow, wz = (st.cz - flt(ram, cam + 8)) / yNow;
+                            const float s0 = st.s * (grab.camY0 / yNow), s1 = s0 * ratio;
+                            camX = grab.camX0 + (grab.camY0 - camY) * wx + s0 * (grab.u0 * st.rx + grab.v0 * st.fx) -
+                                   s1 * (mu * st.rx + mv * st.fx);
+                            camZ = grab.camZ0 + (grab.camY0 - camY) * wz + s0 * (grab.u0 * st.rz + grab.v0 * st.fz) -
+                                   s1 * (mu * st.rz + mv * st.fz);
+                            moved = true;
+                        }
+                        tick(1, d, 0.0f);
+                    }
                     grab.vx = grab.vz = 0.0f;
                 }
                 else if (g0 || g1)
@@ -1309,11 +1640,15 @@ namespace
                         camX = nx;
                         camZ = nz;
                         moved = true;
+                        tick(h, u, v);
                     }
                 }
                 else
                 {
                     grab.grab = grab.zoom = false;
+                    // A trigger stops the drift (so a unit can be picked as it slides by).
+                    if ((pose.hands[0].valid && pose.hands[0].trigger > 0.6f) || (pose.hands[1].valid && pose.hands[1].trigger > 0.6f))
+                        grab.vx = grab.vz = 0.0f;
                     if (panOk && std::hypot(grab.vx, grab.vz) > 0.02f * st.s)
                     {
                         camX += grab.vx * dt;

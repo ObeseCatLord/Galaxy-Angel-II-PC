@@ -1,22 +1,50 @@
 # Changelog
 
-## 0.12.0
+## 0.11.0
+
+- Starts like a PC game: borderless fullscreen at the display's own
+  resolution and shape (ultrawide included), with the internal resolution
+  picked from the display (new default "Automatic": 4x from 1440p up, 2x on
+  1080p; 2x in VR and on ARM).
+  Window mode and fixed resolutions stay in Settings and as `--windowed`,
+  `--resolution 2x`.
+- Widescreen and ultrawide without stretching: the wider 3D view (hor+) is
+  drawn with twice the columns where the screen has more than the internal
+  resolution (16:9 at 1080p or 4K, 21:9 and 3440x1440), by a second renderer
+  sampling half a pixel beside the first, so it is as sharp across as down.
 
 - VR battle table (after BattleGroupVR's tactical map): in VR the battle's
   tactical map hovers flat in front of you as a holographic table (the game's
-  own map reprojected onto it, unit icons standing over it on stalks, the full
-  picture with the HUD on a screen beyond). Hover a unit by holding your
-  fingertip over it (or touching it), select it with the trigger, drag to a
-  spot or an enemy and let go to move or attack (a beam shows the target);
-  one grip drags the map (with drift), both grips zoom and turn it. Haptic
-  pulses on hover, select and order; translucent glove hands. Setting "VR
-  battle map": Battle table or Surround (the stereo map with the laser).
+  own map reprojected onto it, units standing over it on stalks in team
+  colours, the selected angel in gold). The HUD stands around the table in
+  pieces, each its own panel leaning toward you: the radar and talk window on
+  the left, the clock and unit panel on the right, pop-ups and menus above the
+  far edge. Hover a unit by holding your fingertip over it (or touching it),
+  select it with the trigger, drag to a spot or an enemy and let go to move,
+  attack or support (the beam's colour shows which; a ring flashes at the
+  target). One grip drags the map (with drift), both grips zoom about your
+  hands and turn it, both held still recentre it. Haptic pulses on hover,
+  select, order and while dragging the map. Setting "VR battle map": Battle
+  table or Surround (the stereo map with the laser).
 - VR guide: an interactive guide to the VR controls (basics at the screen,
   the battle part at the first battle table), replayable from Settings > VR
   guide or the table's ?; during the game's Tutorial a card shows the VR
   gesture for what it asks.
-
-## 0.11.0
+- VR hands: smooth holographic hands (an original model) in place of the
+  blocky gloves, posed by the trigger (point) and grip (fist). With finger
+  tracking (Valve Index controllers, Steam Frame, or bare-hand tracking) they
+  follow your real fingers; with bare hands a pinch is the trigger and a fist
+  the grip. Finger tracking is not yet tried on a headset; Settings > VR
+  finger tracking turns it off.
+- HD battle graphics (new setting, on by default; at 2x and 4x): the battle
+  HUD is drawn sharp whatever the 2D filter. Flat-coloured pieces (the units'
+  HP rings, stars, arrows, the clock's digits, enemy icons) are redrawn as
+  clean shapes, rings and discs as true circles; panels and portraits are
+  upscaled with Anime4K. Off brings back the original pictures.
+- Fixed: with Anime4K, per-picture upscaling stopped after pictures of a few
+  different sizes (the rest stayed at the original resolution), and every movie frame was
+  upscaled and written to the cache (gigabytes per movie). Pictures that keep
+  changing now stay at their original resolution.
 
 - Portable: saves, settings, imported discs, mods, logs and caches live in the
   `data` folder next to `ga2`, so deleting the game's folder removes it

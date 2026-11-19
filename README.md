@@ -5,15 +5,19 @@
 [![CI](https://github.com/ObeseCatLord/galaxy-angel-2-pc/actions/workflows/ci.yml/badge.svg)](https://github.com/ObeseCatLord/galaxy-angel-2-pc/actions/workflows/ci.yml)
 
 <p align="center">
+  <img src="docs/images/battle-ultrawide-en.png" width="100%" alt="A battle in Eigou Kaiki no Toki on a 3440x1440 ultrawide display, in English">
+</p>
+<p align="center"><sub>A battle on a 3440x1440 ultrawide display: borderless fullscreen at the display's own shape, the wider 3D view drawn with its own detail (not stretched), and the HD battle graphics.</sub></p>
+<p align="center">
   <img src="docs/images/battle-en.png" width="56%" alt="A battle in Eigou Kaiki no Toki in 16:9 widescreen, in English">
   <img src="docs/images/story-en.png" width="42%" alt="A story scene in Eigou Kaiki no Toki, in English">
 </p>
 <p align="center"><sub>Eigou Kaiki no Toki in English at 4x internal resolution with Anime4K and debanding: a battle in 16:9 widescreen, and a story scene.</sub></p>
 <p align="center">
   <img src="docs/images/vr-story-en.png" width="40%" alt="VR: a story scene on the big screen, floating in the game's space skybox">
-  <img src="docs/images/vr-battle-en.png" width="58%" alt="VR: the battle map around the player in stereo (left and right eye)">
+  <img src="docs/images/vr-table-en.png" width="58%" alt="VR: the battle table in front of the player, with holographic hands, team-coloured units, an order beam and the HUD as panels">
 </p>
-<p align="center"><sub>In VR: story scenes play on a big screen in the game's own space skybox; battles surround you in stereo (left and right eye) and are played with motion controls.</sub></p>
+<p align="center"><sub>In VR: story scenes play on a big screen in the game's own space skybox; battles are a holographic table in front of you, played with your hands (the HUD stands around it as panels).</sub></p>
 
 A native PC port of the Galaxy Angel II trilogy for the PlayStation 2:
 *Zettai Ryouiki no Tobira*, *Mugen Kairou no Kagi* and *Eigou Kaiki no Toki*.
@@ -62,15 +66,20 @@ guide are in [docs/PLAYING.md](docs/PLAYING.md).
   ([docs/LANGUAGE_PACKS.md](docs/LANGUAGE_PACKS.md)).
 - Mods: replacement files and HD textures ([docs/MODDING.md](docs/MODDING.md)).
 - Filters for the 2D art (Smooth, Anime4K, sharp pixels), debanding, and the
-  PS2 dither turned off.
+  PS2 dither turned off. HD battle graphics at 2x and 4x: the battle HUD's
+  rings, arrows, stars and digits redrawn as sharp shapes, its panels and
+  portraits upscaled (Settings > HD battle graphics; Off for the originals).
 - Cheats menu (F1) and an in-game settings menu (F2).
 - VR through OpenXR (SteamVR, Monado). The game is shown on a big screen,
   and the 3D scenes are drawn in stereo around you. Battles are played
   on a holographic battle table in front of you with motion controls: hold
   your hand over a unit and pull the trigger to select it, drag to a spot or
   an enemy and let go to move or attack, grab the map to move it, both hands
-  to zoom and turn it. A built-in VR guide teaches the controls (replay it in
-  Settings), and the game's own tutorial shows the VR gestures.
+  to zoom and turn it. The battle HUD stands around the table as separate
+  panels. Holographic hands follow your real fingers where the headset tracks
+  them (Index controllers, Steam Frame, bare hands; not yet tried on a
+  headset). A built-in VR guide teaches the controls (replay it in Settings),
+  and the game's own tutorial shows the VR gestures.
 - Native ARM64 build for the Steam Frame, flat or in VR
   ([docs/STEAM_FRAME.md](docs/STEAM_FRAME.md)).
 
