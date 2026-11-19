@@ -7,6 +7,9 @@
 # by the tag input (which must exist, as a draft or published). Then the
 # installer workflow (installer.yml) adds the installer and updater to each
 # archive and attaches it, ga2-manifest.json and the final SHA256SUMS.txt.
+# Speed: each build keeps a ccache (actions/cache, per platform; the generated
+# code rarely changes, so a later release recompiles only what changed) and the
+# Linux builds keep their static FFmpeg.
 name: Release builds
 
 on:
@@ -47,13 +50,33 @@ jobs:
           GA2_PRIVATE_REPO: ${{ secrets.GA2_PRIVATE_REPO }}
           GA2_PRIVATE_DEPLOY_KEY: ${{ secrets.GA2_PRIVATE_DEPLOY_KEY }}
         run: tools/ci/fetch-private.sh "$GA2_PRIVATE_ROOT"
+      - name: Restore FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-static
+          key: ffmpeg-linux-${{ matrix.arch }}-${{ hashFiles('tools/ci/ffmpeg-static.sh') }}
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-linux-${{ matrix.arch }}-${{ github.run_id }}
+          restore-keys: ccache-linux-${{ matrix.arch }}-
       - name: Build
         run: |
           git config --global user.name ci && git config --global user.email ci@localhost
           git config --global --add safe.directory '*'
           export GA2_PACKAGE_MODS="$(find "$GA2_PRIVATE_ROOT/release-mods" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | paste -sd:)"
+          export GA2_FFMPEG_PREFIX="$GITHUB_WORKSPACE/ffmpeg-static"
+          . tools/ci/ccache-env.sh
           tools/ci/build-linux-release.sh "dist/$NAME"
+          ccache -s
           tar -C dist -cJf "$NAME.tar.xz" "$NAME"
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-linux-${{ matrix.arch }}-${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
@@ -74,6 +97,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo tools/ci/deps-ubuntu.sh ci
+          sudo apt-get install -y -q ccache
           # llvm-mingw: clang, libc++ and current mingw-w64 headers (Ubuntu's are too old).
           curl -sSfL https://github.com/mstorsjo/llvm-mingw/releases/download/20250114/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64.tar.xz | tar -xJ -C "$RUNNER_TEMP"
           echo "GA2_LLVM_MINGW=$RUNNER_TEMP/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64" >> "$GITHUB_ENV"
@@ -82,12 +106,26 @@ jobs:
           GA2_PRIVATE_REPO: ${{ secrets.GA2_PRIVATE_REPO }}
           GA2_PRIVATE_DEPLOY_KEY: ${{ secrets.GA2_PRIVATE_DEPLOY_KEY }}
         run: tools/ci/fetch-private.sh "$GA2_PRIVATE_ROOT"
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-windows-x86_64-${{ github.run_id }}
+          restore-keys: ccache-windows-x86_64-
       - name: Build
         run: |
           git config --global user.name ci && git config --global user.email ci@localhost
           export GA2_PACKAGE_MODS="$(find "$GA2_PRIVATE_ROOT/release-mods" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | paste -sd:)"
+          . tools/ci/ccache-env.sh
           tools/ci/build-windows-release.sh "dist/$NAME"
+          ccache -s
           (cd dist && zip -qr "../$NAME.zip" "$NAME")
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-windows-x86_64-${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64

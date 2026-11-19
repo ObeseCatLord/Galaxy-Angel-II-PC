@@ -5,7 +5,7 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-COMMON="git curl ca-certificates xz-utils zstd pkg-config python3 python3-pip make openssh-client
+COMMON="git curl ca-certificates xz-utils zstd pkg-config python3 python3-pip make openssh-client ccache
   libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev libgl-dev libglu1-mesa-dev"
 if [ "${1:-ci}" = release ]; then
     apt-get install -y -q software-properties-common

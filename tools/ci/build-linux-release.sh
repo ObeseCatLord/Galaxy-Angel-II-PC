@@ -26,8 +26,8 @@ STATIC="-static-libstdc++ -static-libgcc -Wl,--as-needed"
     "-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG" -DPS2X_BUILD_TEST=OFF -DPS2X_IOP_BUILD_TESTS=OFF \
     -DPKG_CONFIG_ARGN=--static -DPS2X_LINK_DEPENDS_SHARED=ON \
     "-DCMAKE_EXE_LINKER_FLAGS=$STATIC" "-DCMAKE_SHARED_LINKER_FLAGS=$STATIC"
-# The generated VU1 programs are a few huge files: fewer at once, or GCC runs out of memory.
-cmake --build "$GA2_RUNTIME_BUILD" --target ga2_vu1_programs --parallel "${GA2_BIG_JOBS:-2}"
+# All at once on every core: with clang a generated VU1 file needs at most ~300 MB (GCC needed several GB, which
+# is why they used to build two at a time, with the engines waiting for them).
 cmake --build "$GA2_RUNTIME_BUILD" --target ga2 ga2_zettai ga2_mugen_1 ga2_mugen_2 ga2_eigou_1 ga2_eigou_2 \
     --parallel "${GA2_JOBS:-$(nproc)}"
 python3 "$SOURCE/tools/package.py" "$GA2_RUNTIME_BUILD" "$OUT"
