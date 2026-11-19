@@ -39,7 +39,12 @@ jobs:
       NAME: galaxy-angel-2-pc-${{ inputs.tag }}-linux-${{ matrix.arch }}
     steps:
       - name: Git
-        run: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q git
+        # Ubuntu's main archive often refuses connections from the runners: the Azure mirror the runners use
+        # themselves, and retries.
+        run: |
+          sed -i 's#http://archive.ubuntu.com#http://azure.archive.ubuntu.com#g; s#http://security.ubuntu.com#http://azure.archive.ubuntu.com#g' /etc/apt/sources.list
+          printf 'Acquire::Retries "10";\nAcquire::http::Timeout "60";\n' > /etc/apt/apt.conf.d/80-retries
+          apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q git
       - uses: actions/checkout@v4
         with:
           submodules: recursive
