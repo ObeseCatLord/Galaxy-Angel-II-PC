@@ -76,11 +76,50 @@ namespace
         ga2::Mods(library.dataDir()).applyToEnvironment(language);
     }
 
+    // The display's height in pixels: the monitor the launcher's window was on, else (started from the command
+    // line, no window yet) read through a hidden window; 0 when there is no display.
+    int g_displayHeight = 0;
+    int displayHeight()
+    {
+        if (g_displayHeight > 0)
+            return g_displayHeight;
+        if (IsWindowReady())
+            return g_displayHeight = GetMonitorHeight(GetCurrentMonitor());
+        SetTraceLogLevel(LOG_WARNING);
+        SetConfigFlags(FLAG_WINDOW_HIDDEN);
+        InitWindow(1, 1, "ga2");
+        if (IsWindowReady())
+        {
+            g_displayHeight = GetMonitorHeight(GetCurrentMonitor());
+            CloseWindow();
+        }
+        SetConfigFlags(0);
+        return g_displayHeight;
+    }
+
+    // Internal resolution "Automatic": decided here, where the display is known, as a PC game picks its detail
+    // (the engine's renderer starts before its window and could only guess): 4x (16 samples) from 1200 display
+    // lines up, 2x (4) below, native under 700; 2x in VR; native on ARM (the Steam Frame).
+    void resolveAutomaticResolution(const Settings &settings)
+    {
+        const char *value = std::getenv("GA2_PGS_SSAA");
+        if (!value || std::string(value) != "auto")
+            return;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        const char *pick = "1";
+#else
+        const int height = settings.value("vr") == "1" ? 0 : displayHeight();
+        const char *pick = settings.value("vr") == "1" ? "4" : height >= 1200 ? "16" : height >= 700 ? "4" : height > 0 ? "1" : "auto";
+#endif
+        ga2::setEnvironment("GA2_PGS_SSAA", pick);
+    }
+
     // The options as the file has them now (the engines save changes made in game there), handed to the next engine.
     void refreshEnvironment(const ga2::Library &library)
     {
         const Settings settings = Settings::load(settingsFile(library));
         settings.applyToEnvironment(library.dataDir());
+        resolveAutomaticResolution(settings);
         prepareMods(library, settings.value("language"));
     }
 
@@ -170,6 +209,7 @@ namespace
                 const int monitor = GetCurrentMonitor();
                 m_settings.windowScale = std::max(1, std::min(GetMonitorWidth(monitor) * 9 / 10 / 640,
                                                               GetMonitorHeight(monitor) * 9 / 10 / 448));
+                g_displayHeight = GetMonitorHeight(monitor);
                 m_settings.save(settingsFile(m_library));
                 ui::shutdown(); // the atlases are textures of this window
                 CloseWindow();
@@ -177,6 +217,7 @@ namespace
                 try
                 {
                     m_settings.applyToEnvironment(m_library.dataDir());
+                    resolveAutomaticResolution(m_settings);
                     prepareMods(m_library, m_settings.value("language"));
                     const int code = runEngine(m_library.engineCommand(*start, m_engineDir), logFor(m_library, *start),
                                                [this] { refreshEnvironment(m_library); });
@@ -1094,6 +1135,7 @@ int main(int argc, char **rawArgv)
             settings.lastGame = entry->id;
             settings.save(settingsFile(library));
             settings.applyToEnvironment(library.dataDir());
+            resolveAutomaticResolution(settings);
             prepareMods(library, settings.value("language"));
             return runEngine(library.engineCommand(*entry, engineDir), logFor(library, *entry),
                              [&library] { refreshEnvironment(library); });
