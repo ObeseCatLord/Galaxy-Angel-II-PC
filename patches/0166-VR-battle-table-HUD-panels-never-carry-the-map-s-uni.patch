@@ -1,0 +1,100 @@
+From ed521a59e7701111ac87c988ea910b2744f02ccc Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:37:27 -0600
+Subject: [PATCH 166/171] VR battle table: HUD panels never carry the map's
+ unit icons along
+
+---
+ ps2xRuntime/src/lib/ga2_vr.cpp | 43 +++++++++++++++++++++++-----------
+ 1 file changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 1cc1361..74baba3 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -664,7 +664,16 @@ uniform vec2 extent;
+ uniform vec4 src; // picture uv: centre x, y, half size x, y
+ uniform sampler2D ui;
+ uniform int hasUi;
++uniform vec4 icons[64]; // the units' icons (as on the plate): a HUD piece never carries map icons along
++uniform int iconCount;
+ out vec4 o;
++float uiAlpha(vec2 q)
++{
++    float keep = 1.0;
++    for (int i = 0; i < iconCount; ++i)
++        keep *= smoothstep(0.85, 1.0, length((q - icons[i].xy) / icons[i].zw));
++    return clamp(texture(ui, q).a * (255.0 / 128.0), 0.0, 1.0) * keep;
++}
+ void main()
+ {
+     vec2 p = clamp(src.xy + (v_uv - 0.5) * 2.0 * src.zw, vec2(0.0), vec2(1.0));
+@@ -675,12 +684,14 @@ void main()
+         // The HUD piece alone, floating: its pixels with their own alpha, a little brighter, and a faint glow
+         // around them so it reads as light in the air.
+         vec4 u = texture(ui, p);
+-        float a = clamp(u.a * (255.0 / 128.0), 0.0, 1.0);
++        float raw = clamp(u.a * (255.0 / 128.0), 0.0, 1.0);
++        float a = uiAlpha(p);
++        u.rgb *= raw > 0.0 ? a / raw : 0.0;
+         float halo = 0.0;
+         for (int i = 0; i < 8; ++i)
+         {
+             vec2 off = vec2(cos(float(i) * 0.785), sin(float(i) * 0.785)) * src.zw * 0.025;
+-            halo += clamp(texture(ui, p + off).a * (255.0 / 128.0), 0.0, 1.0);
++            halo += uiAlpha(p + off);
+         }
+         halo = clamp(halo / 8.0 - a, 0.0, 1.0) * 0.35;
+         float fade = 1.0 - smoothstep(0.97, 1.0, edge);
+@@ -967,6 +978,20 @@ void main()
+             }
+         }
+ 
++        // The units' icons in the UI layer (picture uv centre, radius) for the plate and panel programs.
++        void setUnitIcons(GLuint program, const ga2_battletable::State &st)
++        {
++            float icons[64 * 4];
++            int count = 0;
++            for (int n = 0; n < st.unitCount && count < 64; ++n, ++count)
++            {
++                icons[4 * count + 0] = st.units[n].sx / 640.0f, icons[4 * count + 1] = st.units[n].sy / 480.0f;
++                icons[4 * count + 2] = 30.0f / 640.0f, icons[4 * count + 3] = 30.0f / 480.0f;
++            }
++            glUniform4fv(glGetUniformLocation(program, "icons"), count, icons);
++            glUniform1i(glGetUniformLocation(program, "iconCount"), count);
++        }
++
+         // The HUD's pieces as panels around the table (instead of the whole picture on a flat screen): standing in a
+         // row above its far edge as they sit on the screen (left ones on the left, higher ones higher), each leaning
+         // back a little and turned to face the player.
+@@ -980,6 +1005,7 @@ void main()
+             glUniform1i(glGetUniformLocation(g_tableGl.panel, "tex"), 0);
+             glUniform2f(glGetUniformLocation(g_tableGl.panel, "extent"), extentX, extentY);
+             bindTableUi(g_tableGl.panel);
++            setUnitIcons(g_tableGl.panel, st);
+             glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+             for (int i = 0; i < st.hudCount; ++i)
+             {
+@@ -1297,18 +1323,7 @@ void main()
+             float masks[32];
+             tableMasks(st, masks);
+             glUniform4fv(glGetUniformLocation(g_tableGl.table, "masks"), 8, masks);
+-            {
+-                // The game's flat unit icons are left off the plate (the units stand over it as ships and discs).
+-                float icons[64 * 4];
+-                int count = 0;
+-                for (int n = 0; n < st.unitCount && count < 64; ++n, ++count)
+-                {
+-                    icons[4 * count + 0] = st.units[n].sx / 640.0f, icons[4 * count + 1] = st.units[n].sy / 480.0f;
+-                    icons[4 * count + 2] = 30.0f / 640.0f, icons[4 * count + 3] = 30.0f / 480.0f;
+-                }
+-                glUniform4fv(glGetUniformLocation(g_tableGl.table, "icons"), count, icons);
+-                glUniform1i(glGetUniformLocation(g_tableGl.table, "iconCount"), count);
+-            }
++            setUnitIcons(g_tableGl.table, st); // the game's flat unit icons are left off the plate
+             drawArrays(g_tableGl.vao7, g_tableGl.vbo7, mesh, 7);
+             drawHudPanels(viewProj, eye, picture, extentX, extentY, st, pose);
+ 
+-- 
+2.56.0
+

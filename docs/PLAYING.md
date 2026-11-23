@@ -182,11 +182,15 @@ game when it starts it; the same options can also be changed while playing
 | 3D widescreen (hor+) | On: 3D scenes show more to the sides at 16:10, 16:9, 21:9 or the window's own shape (Fill), same height as on the PS2; HUD, menus and text keep their proportions, and the battle HUD sits at the screen edges (radar top left, communications bottom left, unit panel and pilot portrait bottom right). The wider view is drawn with its own detail, not stretched: where the screen gives the picture more columns than the internal resolution has (16:9 at 1080p or 4K, ultrawide such as 3440x1440), a second renderer samples half a pixel beside the first and the two are interleaved, doubling the columns (about twice the GPU work; the log says `[display] widescreen detail: ...`; `GA2_PGS_WIDE_DETAIL=0` turns it off) |
 | Sides of 4:3 scenes | Black, blurred picture, or the game's own space skybox (rendered from your disc after import; needs Python 3 with Pillow) |
 | 2D scene size | Fill, or whole multiples (2x, 3x) for crisp pixels; 3D scenes always fill |
-| 2D picture filter | Bilinear, Smooth (removes the art's dither grain), Anime4K, Anime4K HQ, Sharp pixels, Nearest; 2D scenes only. At 2x and 4x, Anime4K works per layer: every CG, background, character sprite and UI picture is upscaled on its own (to the internal resolution) and the game composes the upscaled layers. A picture is upscaled the first time it is shown (it appears sharp a moment later) and kept in the cache folder (`data/cache/anime4k`) for later sessions. The text and the button prompts are drawn at the window's own resolution |
-| Frame rate | 60 (PS2, default), 75, 90, 100, 120, 144, 165, 170, 175, 180, 200 or 240 frames per second; **Monitor refresh rate** follows the monitor the window is on (read at the start and again when you move the window to another monitor or its rate changes; a monitor at 60 Hz or below means the PS2 rate, above 240 is capped at 240); **Custom** is any whole number from 61 to 240 (launcher: type it into the box, or use the mouse wheel over it; in game: Left / Right change it by 1, Shift by 10, or type the digits and press Enter; Enter or PageDown goes on to the next choice). The whole game (story, menus, ship map, battles) is drawn that often while it keeps its own speed. The rate drops automatically when the PC can't keep up (the processor or the graphics card, for example at 4x), so the game never runs slower than at 60; can also be changed while playing (F2). The battle's 30 fps camera views keep 30 fps. In VR the rate follows the headset. Stored in `settings.ini` as `fps=120`, `fps=173` (custom) or `fps=monitor` |
-| PS2 dithering | Off (default) or the original checkerboard |
+| 2D picture filter | Bilinear, Smooth (removes the art's dither grain), Anime4K, Anime4K HQ, Sharp pixels, Nearest; 2D scenes only. At 2x and 4x, Anime4K works per layer: every CG, background and character sprite (with its blinking eyes and moving mouth) is upscaled on its own (to the internal resolution) and the game composes the upscaled layers; the menus and windows follow "Menus and HUD". A picture is upscaled the first time it is shown (it appears sharp a moment later) and kept in the cache folder (`data/cache/anime4k`) for later sessions. The text and the button prompts are drawn at the window's own resolution |
+| Frame rate | 60 (PS2, default), 75, 90, 100, 120, 144, 165, 170, 175, 180, 200, 240, 300, 360 or 480 frames per second; **Monitor refresh rate** follows the monitor the window is on (read at the start and again when you move the window to another monitor or its rate changes; a monitor at 60 Hz or below means the PS2 rate, above 500 is capped at 500); **Custom** is any whole number from 61 to 500 (launcher: type it into the box, or use the mouse wheel over it; in game: Left / Right change it by 1, Shift by 10, or type the digits and press Enter; Enter or PageDown goes on to the next choice). The whole game (story, menus, ship map, battles) is drawn that often while it keeps its own speed. The rate drops automatically when the PC can't keep up (the processor or the graphics card, for example at 4x), so the game never runs slower than at 60; can also be changed while playing (F2). The battle's camera views (30 fps on the PS2) are drawn at the full rate too. In VR the rate follows the headset. Stored in `settings.ini` as `fps=120`, `fps=173` (custom) or `fps=monitor` |
+| PS2 dithering | Off (default): the games' full-colour picture, gradients without colour steps. On: the PS2's 16-bit picture with its original checkerboard |
 | Debanding | Low (default), High or Off: smooths the colour steps of the PS2's 16-bit gradients (backgrounds, CGs, nebula skies, fades) in 2D and 3D scenes; edges and text stay sharp |
-| HD battle graphics | On (default) or Off (original): at 2x and 4x the battle HUD is drawn sharp, whatever the 2D filter. Its flat-coloured pieces (the units' HP rings, stars, arrows, the clock's digits, enemy icons) are redrawn as clean shapes (rings and discs as true circles), the rest (panels, portraits) upscaled with Anime4K, each the first time it is shown |
+| HD battle graphics | On (default) or Off (original): at 2x and 4x the battle HUD is drawn sharp, whatever the 2D filter. Its flat-coloured pieces (the units' HP rings, stars, arrows, the clock's digits, enemy icons) are redrawn as clean shapes (rings and discs as true circles), the rest follows "Menus and HUD" (portraits with Anime4K), each the first time it is shown |
+| Battle map drawing | Original (default): the game draws the battle map's 3D as on the PS2. Fast: the PC draws the map's grid, play area, obstacles and sky itself (read from your disc) under the game's own 2D, about half the processor time, so the map holds high frame rates; close to the original but not identical. The VR battle table always draws its own map |
+| Movies | Native (default): the PC decodes and shows the movies (smooth at full speed, subtitles possible). Original: the emulated PS2 movie player |
+| Movie subtitles | On (default) or Off: subtitles for the movies' spoken lines, from the language pack (the English pack has them; native movies only) |
+| Menus and HUD | Sharp pixels (default) or Anime4K: at 2x and 4x, how the menus, windows, place names, ornaments and the battle HUD's panels are enlarged. Sharp pixels keeps the original pixels, crisp and unsmoothed; Anime4K smooths them like the characters. Characters, portraits, backgrounds and event pictures are always upscaled with Anime4K (in 2D scenes with that filter) |
 | Button prompts | Automatic (follows the controller or keyboard you use), PlayStation, Xbox, Keyboard |
 | VR mode | Off / On (see below) |
 | VR battle map, VR guide, VR finger tracking | the VR options (see below) |
@@ -212,11 +216,11 @@ launcher.
 
 - **Take effect at once:** Display, Screen shape (the window takes the new shape
   too), 3D widescreen (hor+; the 3D cameras follow within a frame), Sides of 4:3
-  scenes, 2D scene size, 2D picture filter, PS2 dithering, Debanding, HD battle graphics, Button prompts,
-  On-screen pad, and the Frame rate (any choice, up to 240). Dump textures applies to
+  scenes, 2D scene size, 2D picture filter, PS2 dithering, Debanding, HD battle graphics, Menus and HUD, Button prompts,
+  On-screen pad, and the Frame rate (any choice, up to 500). Dump textures applies to
   the textures the game loads from then on.
 - **Marked "restart" and applied the next time a game starts:** Language, Internal
-  resolution and VR mode. The menu shows such a value in orange
+  resolution, Battle map drawing and VR mode. The menu shows such a value in orange
   with "after restart" until the game is restarted. After a disc change inside a
   game (the next disc's engine) the options as saved are used.
 - In VR the menu is drawn like the cheat menu (on the screen, or on a panel in 3D
@@ -258,10 +262,10 @@ bring the screen back in front of you.
 
 The 3D scenes (space flights, the ship map, battles) surround you instead:
 the game draws them from your head's position and direction in true stereo,
-and you can look and lean around (6DoF). Optional (test setting, environment
-variable `GA2_VR_HUD_PANEL=1`): the game's 2D overlay (dialogue box, battle
-HUD) is shown on a flat panel 1.6 m in front of you instead of at the depth
-of the background. Your hands stay visible there as
+and you can look and lean around (6DoF). The game's 2D overlay (dialogue box,
+battle HUD) is shown on a flat panel 1.6 m in front of you, in its own 4:3
+shape (environment variable `GA2_VR_HUD_PANEL=0` draws it into the 3D view
+instead, stretched to the headset's view). Your hands stay visible there as
 their reticles with a short guide beam. The 2D story scenes, menus and
 movies stay on the screen. If the world feels too big or too small, set
 `GA2_VR_SCALE` (game units per metre, default 50) before starting; set
@@ -269,13 +273,50 @@ movies stay on the screen. If the world feels too big or too small, set
 
 **The battle table** (Settings > **VR battle map** > *Battle table*, the
 default; modelled on BattleGroupVR's tactical map). The battle's tactical map
-hovers flat in front of you as a holographic table at about chest height
-(standing; desk height seated): the game's own map, with each unit standing
-over it as a disc on a stalk, blue for friends, red for enemies, gold with a
-second ring for the angel you have selected. The HUD is not a flat screen:
-each piece stands around the table as its own panel, leaning toward you (the
-radar and the talk window on the left, the clock and the unit panel on the
-right, pop-up boxes, the tutorial's boxes and menus above the far edge).
+hovers in front of you as a round holographic table at about chest height
+(standing; desk height seated), clear like glass and fading out at its edge,
+inside the battle's own sky: the sky the stage's map shows is drawn all
+around you from your disc. On it stand the game's own ship models (the
+angels' Emblem Frames, the mothership and every enemy ship, read from your
+disc for the stage being played), lit, banking into their turns and turned
+the way they fly, larger ships larger, growing as you zoom in. Over each
+stands its marker: the game's own icon for that unit (the angel's face, the
+ship's silhouette), upscaled, on a disc in its team colour (gold angels, blue
+mothership, red enemies) with its shield as a ring, a heading arrow on the
+ring under the ship, and a gold edge on the angel you have selected. Each
+marker is a solid layer: a nearer one covers a farther one, and crowded ones
+lift a little apart. The HUD is not a flat screen: each piece floats on its
+own as a hologram, only its own pixels (the radar on the left, the clock and
+the unit panel on the right, pop-up boxes, the tutorial's boxes and menus
+above the far edge). What the characters say during the battle (the talk
+window) has its own larger panel over the far rim.
+
+**Moving panels.** Put a hand on any floating panel (a HUD piece, the talk
+panel, the guide) and squeeze the grip: it follows your hand until you let
+go. Panels keep their places for the next battle; *Reset layout* on the right
+palm puts them back.
+
+**Palm menus** (after BattleGroupVR's hand menus). Turn a palm toward your
+face and a menu shows over it; poke its keys with the other hand's index
+finger (a key fires when pushed in, with a buzz).
+
+| Palm | Shows | Keys |
+| --- | --- | --- |
+| Left: *Squadron* | your angels with their shield bars, the selected one in gold | poke an angel to select it; *All angels* (Square); *Pause* (Start) |
+| Right: *Command* | | *Stay* (the selected angel stays), *H-Weapon* (Triangle), *Cancel* (Cross), *Pilot view* (L3), *Camera* (R3), *Menu* (Select), *Recentre*, *Guide*, *Reset layout* |
+
+Each key does what the pad's button does; the game decides (its tutorial can
+still hold a button back).
+
+**The other views inside the table.** The chase and cockpit views appear as
+a hologram where the table was: the game's 3D in stereo, seen inside a
+glowing column standing on the table's plate, with the stage's sky around
+you. Pull both grips apart or together to make it larger or smaller (one grip
+is still L1 / R1). In the cockpit the HUD and
+the reticle float on a panel ahead of you. The unit camera view shows on a screen standing in the
+table, the ships on the plate below it. In these views the right palm's first
+key is *Back to table*. The H-Weapon's own
+sequence still fills the view as before.
 Your hands are translucent holograms; the hand that selected an angel turns
 orange until the order is given.
 
@@ -290,7 +331,9 @@ orange until the order is given.
 | Both grips held still for a second | brings the table back in front of you, facing ahead |
 | X / Y / B | all angels / H-Weapon / cancel, as on the pad |
 | Left / right stick click | cockpit (the triggers fire) / the camera of the unit (the triggers zoom) |
-| Touch the ? at the table's front right corner and pull the trigger | replays the battle part of the VR guide |
+| Touch the ? at the table's near right and pull the trigger | replays the battle part of the VR guide |
+| Grip with your hand on a panel | carries the panel (see *Moving panels*) |
+| Palm toward your face | its palm menu (see *Palm menus*) |
 
 Losing tracking for a moment does not drop a drag; after a quarter of a second
 the drag is cancelled without an order. With the cheat menu open the hands

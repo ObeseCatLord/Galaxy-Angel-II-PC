@@ -1,0 +1,189 @@
+From 985bbaca22e4a6a545f59d3146b270bf9b03d0eb Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:49:50 -0600
+Subject: [PATCH 161/171] VR battle renderer assets: stage tables, ship parts
+ (enemies assembled from their part tables), textures by TEXDIR
+
+---
+ ps2xRuntime/src/lib/battlevr/bvr_assets.cpp | 89 +++++++++++++++++++++
+ ps2xRuntime/src/lib/battlevr/bvr_assets.h   | 33 ++++++++
+ ps2xTest/src/bvr_assets_tests.cpp           | 19 +++++
+ 3 files changed, 141 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+index e28fe52..6ee8a83 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+@@ -406,6 +406,95 @@ namespace bvr_assets
+         return out;
+     }
+ 
++    // ---- stages and ships ---------------------------------------------------------------------------------------
++
++    const StageUnit *Stage::unit(int id) const
++    {
++        for (const StageUnit &u : units)
++            if (u.id == id)
++                return &u;
++        return nullptr;
++    }
++
++    bool loadStage(const Archive &archive, const std::string &path, Stage &stage)
++    {
++        std::vector<uint8_t> text;
++        if (!archive.read(path, text))
++            return false;
++        Table table;
++        parseTable(text.data(), text.size(), table);
++        stage = Stage{};
++        stage.path = path;
++        stage.size[0] = table.number("STAGE", "SIZE_X", 0.0f);
++        stage.size[1] = table.number("STAGE", "SIZE_Y", 0.0f);
++        stage.size[2] = table.number("STAGE", "SIZE_Z", 0.0f);
++        for (const Table::Section &s : table.sections)
++        {
++            const std::string *id = table.get(s.name, "ID"), *model = table.get(s.name, "MODEL_FILENAME");
++            if (!id || !model)
++                continue;
++            StageUnit u;
++            u.id = std::atoi(id->c_str());
++            u.section = s.name;
++            if (const std::string *v = table.get(s.name, "NAME"))
++                u.name = *v;
++            u.modelTable = *model;
++            if (const std::string *v = table.get(s.name, "UNITE_MODEL_FILENAME"))
++                u.uniteTable = *v;
++            u.start[0] = table.number(s.name, "START_POS_X", 0.0f);
++            u.start[1] = table.number(s.name, "START_POS_Y", 0.0f);
++            u.start[2] = table.number(s.name, "START_POS_Z", 0.0f);
++            u.startRot = table.number(s.name, "START_ROT", 0.0f);
++            stage.units.push_back(u);
++        }
++        return !stage.units.empty();
++    }
++
++    std::vector<std::string> stagePaths(const Archive &archive)
++    {
++        std::vector<std::string> out;
++        for (const std::string &p : archive.paths())
++            if (p.rfind("slg/stage/", 0) == 0 && p.size() > 10 && p.compare(p.size() - 10, 10, "/stage.tbl") == 0)
++                out.push_back(p);
++        std::sort(out.begin(), out.end());
++        return out;
++    }
++
++    bool shipParts(const Archive &archive, const std::string &modelTable, std::vector<ShipPart> &parts)
++    {
++        parts.clear();
++        std::function<void(const std::string &, int)> visit = [&](const std::string &tablePath, int depth) {
++            std::vector<uint8_t> text;
++            if (depth > 2 || !archive.read(tablePath, text))
++                return;
++            Table table;
++            parseTable(text.data(), text.size(), table);
++            const std::string *texDir = table.get("HEADER", "TEXDIR");
++            bool model = false;
++            for (const std::string &entry : table.list("MODELFILE"))
++            {
++                const std::string file = entry.substr(0, entry.find_first_of(" \t"));
++                // A part's table names the part, then its "b" variant (the broken part): the first is the ship's.
++                if (file.size() > 4 && file.compare(file.size() - 4, 4, ".axo") == 0 && !model)
++                {
++                    parts.push_back(ShipPart{file, texDir ? *texDir : std::string()});
++                    model = true;
++                }
++                else if (file.size() > 4 && file.compare(file.size() - 4, 4, ".tbl") == 0)
++                    visit(file, depth + 1);
++            }
++        };
++        visit(modelTable, 0);
++        return !parts.empty();
++    }
++
++    bool loadTexture(const Archive &archive, const std::string &texDir, const std::string &name, Texture &texture)
++    {
++        std::vector<uint8_t> data;
++        const bool found = (!texDir.empty() && archive.read(texDir + "/" + name + ".agi", data)) || archive.read(name + ".agi", data);
++        return found && decodeAgi(data.data(), data.size(), texture);
++    }
++
+     // ---- AGI textures -------------------------------------------------------------------------------------------
+ 
+     bool decodeAgi(const uint8_t *d, size_t n, Texture &t)
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.h b/ps2xRuntime/src/lib/battlevr/bvr_assets.h
+index 5094966..54eddbf 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_assets.h
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.h
+@@ -113,6 +113,39 @@ namespace bvr_assets
+     };
+     bool decodeAxo(const uint8_t *data, size_t size, Model &model, std::string *error = nullptr);
+ 
++    // A battle stage (slg/stage/<id>/stage.tbl): its size and its units.
++    struct StageUnit
++    {
++        int id = -1;              // the section's ID: 0 the mothership, 1.. the angels, 20.. the enemies
++        std::string section;      // MOTHERSHIP01, CREST01, ENEMY01 ...
++        std::string name;         // Shift-JIS
++        std::string modelTable;   // MODEL_FILENAME
++        std::string uniteTable;   // UNITE_MODEL_FILENAME (an angel's combined form), may be empty
++        float start[3] = {0, 0, 0}, startRot = 0.0f; // START_POS_X/Y/Z, START_ROT (degrees)
++    };
++    struct Stage
++    {
++        std::string path;
++        float size[3] = {0, 0, 0}; // SIZE_X/Y/Z
++        std::vector<StageUnit> units;
++        const StageUnit *unit(int id) const;
++    };
++    bool loadStage(const Archive &archive, const std::string &path, Stage &stage);
++    // Every slg/stage/<id>/stage.tbl on the disc.
++    std::vector<std::string> stagePaths(const Archive &archive);
++
++    // A ship: the model files of a model table, with the directory its textures live in. An angel's or the
++    // mothership's table names one .axo; an enemy's info table names one table per part (all modelled in place; each part
++    // table names the part, then its broken "b" variant, which is left out).
++    struct ShipPart
++    {
++        std::string model;   // .axo path
++        std::string texDir;  // TEXDIR of the part's table
++    };
++    bool shipParts(const Archive &archive, const std::string &modelTable, std::vector<ShipPart> &parts);
++    // A model's texture by name, from its table's TEXDIR first (names repeat across enemy directories).
++    bool loadTexture(const Archive &archive, const std::string &texDir, const std::string &name, Texture &texture);
++
+     // A frame's model-space transform (its parents applied): row-major 3x3 in m[0..8], translation in m[9..11];
+     // p' = M p + t.
+     void frameTransform(const Model &model, int frameId, float m[12]);
+diff --git a/ps2xTest/src/bvr_assets_tests.cpp b/ps2xTest/src/bvr_assets_tests.cpp
+index 5b5c0eb..b9c653f 100644
+--- a/ps2xTest/src/bvr_assets_tests.cpp
++++ b/ps2xTest/src/bvr_assets_tests.cpp
+@@ -106,6 +106,25 @@ void register_bvr_assets_tests()
+                 t.IsTrue(table.number("ANIME01", "PLAYSPEED", -1.0f) == 1.0f, "ANIME01 PLAYSPEED");
+                 t.IsTrue(table.number("ANIME02", "BEGINFRAME", 0.0f) == -1.0f, "ANIME02 BEGINFRAME");
+             }
++            {
++                // The first battle's stage: units by ID, their model tables and start positions; an enemy's parts.
++                t.Equals(bvr_assets::stagePaths(archive).size(), size_t(25), "Eigou 1 has 25 stage tables");
++                bvr_assets::Stage stage;
++                t.IsTrue(bvr_assets::loadStage(archive, "slg/stage/000200/stage.tbl", stage), "stage 000200");
++                const bvr_assets::StageUnit *crest = stage.unit(1), *enemy = stage.unit(20);
++                t.IsTrue(crest && crest->modelTable == "slg/machines/si_mon_0000.tbl" && crest->start[0] == 1000.0f &&
++                             crest->start[2] == -3000.0f,
++                         "CREST01: Cross Caliber at (1000, 0, -3000)");
++                t.IsTrue(stage.size[0] == 32.0f, "SIZE_X");
++                std::vector<bvr_assets::ShipPart> parts;
++                t.IsTrue(enemy && bvr_assets::shipParts(archive, enemy->modelTable, parts), "ENEMY01's parts");
++                t.Equals(parts.size(), size_t(48), "the cruiser has 48 parts");
++                t.IsTrue(!parts.empty() && parts[0].model == "slg/machines/mes_0500/si_mes_0501.axo" &&
++                             parts[0].texDir == "slg/machines/mes_0500",
++                         "the first part and its texture directory");
++                bvr_assets::Texture tex;
++                t.IsTrue(bvr_assets::loadTexture(archive, "slg/machines", "si_mon_000", tex) && tex.width == 256, "a texture from TEXDIR");
++            }
+             for (const Ref &r : refs)
+             {
+                 std::vector<uint8_t> data;
+-- 
+2.56.0
+

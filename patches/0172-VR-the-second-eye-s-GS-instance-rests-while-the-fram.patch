@@ -1,0 +1,46 @@
+From d9c0e54e2e56e405a53d2f3adb242ac69669e638 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 20:58:57 -0600
+Subject: [PATCH 172/174] VR: the second eye's GS instance rests while the
+ frames are mono (theater screen, battle table): state kept, no draws, no
+ readback (GA2_PGS_DROP_MONO=0 draws as before)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index bdf05e2..a57c86a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -1311,18 +1311,24 @@ namespace ga2_pgs
+                     readbackLocked(s, eye, result, shown, false);
+             });
+         }
++        // The second eye draws only for stereo frames: while the frames are mono (the VR theater screen, the battle
++        // table, the battle's views shown in the table) it keeps its state but draws nothing (GA2_PGS_DROP_MONO=0: it
++        // draws the same picture as eye 0, as before).
++        static const bool dropMono = envInt("GA2_PGS_DROP_MONO", 1) != 0;
+         for (uint32_t e = 0; e < s.eyeCount; ++e)
+         {
+             Eye &eye = s.eyes[e];
++            const bool drop = dropMono && e == 1 && s.eyeCount == 2 && !next.active && !s.hudDebug;
+             const ScanoutResult result = eye.gs.vsync(info);
+-            if (result.image)
++            if (result.image && !(eye.hacks.drop_draws && !shown.active))
+                 readbackLocked(s, eye, result, shown, s.uiLayer && eye.gs.displayed_frame_ui_split(),
+                                e == 0 ? frameText : nullptr);
+             const float shift = ga2_stereo::shiftPerQ(next, int(e));
+-            if (shift != eye.hacks.stereo_shift_q || split != eye.hacks.ui_layer_active)
++            if (shift != eye.hacks.stereo_shift_q || split != eye.hacks.ui_layer_active || drop != eye.hacks.drop_draws)
+             {
+                 eye.hacks.stereo_shift_q = shift;
+                 eye.hacks.ui_layer_active = split;
++                eye.hacks.drop_draws = drop;
+                 eye.gs.set_hacks(eye.hacks);
+             }
+         }
+-- 
+2.56.0
+

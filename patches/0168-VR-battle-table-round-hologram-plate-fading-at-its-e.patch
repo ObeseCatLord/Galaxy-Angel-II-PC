@@ -1,0 +1,366 @@
+From 2cccc32bfafc177c7d29d2b1b919b8ae7b551efb Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:53:33 -0600
+Subject: [PATCH 168/171] VR battle table: round hologram plate fading at its
+ edge over the battle's own sky (the stage's sky models from the disc)
+
+---
+ ps2xRuntime/src/lib/battlevr/bvr_assets.cpp |  19 +++
+ ps2xRuntime/src/lib/battlevr/bvr_assets.h   |   3 +
+ ps2xRuntime/src/lib/battlevr/bvr_ships.cpp  |  35 ++++-
+ ps2xRuntime/src/lib/battlevr/bvr_ships.h    |   2 +
+ ps2xRuntime/src/lib/ga2_vr.cpp              | 139 ++++++++++++++++----
+ 5 files changed, 172 insertions(+), 26 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+index 6ee8a83..b3ebc48 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+@@ -428,6 +428,8 @@ namespace bvr_assets
+         stage.size[0] = table.number("STAGE", "SIZE_X", 0.0f);
+         stage.size[1] = table.number("STAGE", "SIZE_Y", 0.0f);
+         stage.size[2] = table.number("STAGE", "SIZE_Z", 0.0f);
++        for (const std::string &entry : table.list("BG"))
++            stage.sky.push_back(entry.substr(0, entry.find_first_of(" \t")));
+         for (const Table::Section &s : table.sections)
+         {
+             const std::string *id = table.get(s.name, "ID"), *model = table.get(s.name, "MODEL_FILENAME");
+@@ -488,6 +490,23 @@ namespace bvr_assets
+         return !parts.empty();
+     }
+ 
++    bool skyParts(const Archive &archive, const std::string &skyTable, std::vector<ShipPart> &parts)
++    {
++        std::vector<uint8_t> text;
++        if (!archive.read(skyTable, text))
++            return false;
++        Table table;
++        parseTable(text.data(), text.size(), table);
++        const std::string *texDir = table.get("HEADER", "TEXDIR");
++        for (const std::string &entry : table.list("MODELFILE"))
++        {
++            const std::string file = entry.substr(0, entry.find_first_of(" \t"));
++            if (file.size() > 4 && file.compare(file.size() - 4, 4, ".axo") == 0)
++                parts.push_back(ShipPart{file, texDir ? *texDir : std::string()});
++        }
++        return !parts.empty();
++    }
++
+     bool loadTexture(const Archive &archive, const std::string &texDir, const std::string &name, Texture &texture)
+     {
+         std::vector<uint8_t> data;
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.h b/ps2xRuntime/src/lib/battlevr/bvr_assets.h
+index 54eddbf..48c6445 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_assets.h
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.h
+@@ -128,6 +128,7 @@ namespace bvr_assets
+         std::string path;
+         float size[3] = {0, 0, 0}; // SIZE_X/Y/Z
+         std::vector<StageUnit> units;
++        std::vector<std::string> sky; // [BG]: the sky model tables (drawn additively around the battle)
+         const StageUnit *unit(int id) const;
+     };
+     bool loadStage(const Archive &archive, const std::string &path, Stage &stage);
+@@ -143,6 +144,8 @@ namespace bvr_assets
+         std::string texDir;  // TEXDIR of the part's table
+     };
+     bool shipParts(const Archive &archive, const std::string &modelTable, std::vector<ShipPart> &parts);
++    // Every model of a sky table ([BG] of a stage), with its TEXDIR.
++    bool skyParts(const Archive &archive, const std::string &skyTable, std::vector<ShipPart> &parts);
+     // A model's texture by name, from its table's TEXDIR first (names repeat across enemy directories).
+     bool loadTexture(const Archive &archive, const std::string &texDir, const std::string &name, Texture &texture);
+ 
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+index 5335703..b8f045d 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+@@ -146,6 +146,7 @@ namespace bvr_ships
+ 
+     namespace
+     {
++        constexpr int kSkyJob = -1000; // the loader's queue entry for the stage's sky
+         struct Loader
+         {
+             std::mutex mutex;
+@@ -156,6 +157,8 @@ namespace bvr_ships
+             int stage = -1;
+             std::map<int, std::shared_ptr<const Mesh>> ships; // by unit ID, for the identified stage
+             std::map<int, bool> requested;
++            std::shared_ptr<const Mesh> sky;
++            bool skyRequested = false;
+             std::deque<int> queue;
+             uint64_t generation = 0; // reset() bumps it: work for an old battle is dropped
+         };
+@@ -198,9 +201,22 @@ namespace bvr_ships
+                     l.queue.pop_front();
+                     if (l.stage < 0)
+                         continue;
++                    generation = l.generation;
++                    if (unitId == kSkyJob)
++                    {
++                        std::vector<bvr_assets::ShipPart> parts;
++                        for (const std::string &t : l.stages[size_t(l.stage)].sky)
++                            bvr_assets::skyParts(l.archive, t, parts);
++                        lock.unlock();
++                        std::shared_ptr<const Mesh> sky = parts.empty() ? nullptr : buildMesh(l.archive, parts);
++                        std::fprintf(stderr, "[bvr] stage sky: %zu models, %zu triangles\n", parts.size(), sky ? sky->triangles() : size_t(0));
++                        lock.lock();
++                        if (generation == l.generation)
++                            l.sky = sky;
++                        continue;
++                    }
+                     if (const bvr_assets::StageUnit *su = l.stages[size_t(l.stage)].unit(unitId))
+                         table = su->modelTable;
+-                    generation = l.generation;
+                 }
+                 std::shared_ptr<const Mesh> mesh;
+                 std::vector<bvr_assets::ShipPart> parts;
+@@ -248,6 +264,8 @@ namespace bvr_ships
+         l.stage = -1;
+         l.ships.clear();
+         l.requested.clear();
++        l.sky.reset();
++        l.skyRequested = false;
+         l.queue.clear();
+         ++l.generation;
+     }
+@@ -259,6 +277,21 @@ namespace bvr_ships
+         return l.stage >= 0 ? l.stages[size_t(l.stage)].path : std::string();
+     }
+ 
++    std::shared_ptr<const Mesh> stageSky()
++    {
++        Loader &l = loader();
++        std::lock_guard<std::mutex> lock(l.mutex);
++        if (l.stage < 0)
++            return nullptr;
++        if (!l.skyRequested)
++        {
++            l.skyRequested = true;
++            l.queue.push_front(kSkyJob);
++            l.wake.notify_one();
++        }
++        return l.sky;
++    }
++
+     float startRotation(int unitId)
+     {
+         Loader &l = loader();
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.h b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+index 1cd27ae..e95cd5d 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_ships.h
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+@@ -51,6 +51,8 @@ namespace bvr_ships
+     // The ship of a unit ID of the identified stage: null while it loads (it is queued on the first call) or when
+     // the unit has no model.
+     std::shared_ptr<const Mesh> ship(int unitId);
++    // The identified stage's sky ([BG] models, drawn additively around the viewer), null while it loads.
++    std::shared_ptr<const Mesh> stageSky();
+     // A unit's START_ROT in the identified stage (degrees), 0 when unknown.
+     float startRotation(int unitId);
+ }
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index b0f64c9..0217b44 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -588,8 +588,9 @@ float box(vec2 p, vec4 r, float soft) {
+ }
+ void main()
+ {
+-    vec2 e = abs(v_aux);
+-    float edge = max(e.x, e.y);
++    // Round: aux spans the plate's square (-1..1 = its radius both ways).
++    float edge = length(v_aux);
++    if (edge > 1.0) discard;
+     // Inside the picture (soft border) and outside the HUD.
+     vec2 inPic = smoothstep(vec2(0.0), vec2(0.03), v_uv) * (1.0 - smoothstep(vec2(0.97), vec2(1.0), v_uv));
+     float pic = inPic.x * inPic.y;
+@@ -609,15 +610,17 @@ void main()
+     else
+         pic *= hud;
+     map *= 1.15;
+-    // The plate: a dark blue glass with a glowing rim and a faint scan line drifting across.
+-    float rim = smoothstep(0.93, 0.985, edge) * (1.0 - smoothstep(0.985, 1.0, edge));
++    // A hologram, not a screen: the map is light added over the battle's own sky (its dim background drops out, the
++    // grid, zones and objects glow), a faint glass tint, a faint scan line drifting across, all fading out toward
++    // the rim (BattleGroupVR's table).
++    float fade = 1.0 - smoothstep(0.70, 1.0, edge);
+     float scan = 0.5 + 0.5 * sin((v_aux.y * 0.5 + 0.5 - fract(time * 0.12)) * 60.0);
+-    float scanLine = smoothstep(0.985, 1.0, scan) * 0.08;
+-    vec3 plate = vec3(0.02, 0.06, 0.14);
+-    float fade = 1.0 - smoothstep(0.90, 0.97, edge);
+-    vec3 col = mix(plate, map, pic * fade) + vec3(0.25, 0.6, 1.0) * (rim * 1.4 + scanLine);
+-    float a = clamp(0.55 + 0.4 * pic * fade + rim, 0.0, 1.0);
+-    o = vec4(col * a, a);
++    float scanLine = smoothstep(0.985, 1.0, scan) * 0.05;
++    vec3 holo = max(map - vec3(0.07), vec3(0.0)) * 1.3;
++    float ring = smoothstep(0.80, 0.86, edge) * (1.0 - smoothstep(0.86, 0.95, edge)) * 0.25;
++    vec3 col = (holo * pic + vec3(0.05, 0.12, 0.22) * 0.35 + vec3(0.25, 0.6, 1.0) * (scanLine + ring)) * fade;
++    float a = 0.18 * fade; // the glass dims what is behind it a little
++    o = vec4(col, a);
+ })";
+ 
+         // A unit's icon from the picture, as a round holographic disc (uv 0..1 over the disc).
+@@ -1017,7 +1020,7 @@ void main()
+                 // window lower), in front of the guide's card height.
+                 const float cx = 0.5f * (a.x0 + a.x1) / 640.0f; // 0 left .. 1 right
+                 const float u = (cx - 0.5f) * 2.0f * (pose.halfWidth + 0.05f);
+-                const V3 c = playPoint(pose, u, pose.halfDepth + 0.08f, 0.08f + h + (1.0f - cy) * 0.30f);
++                const V3 c = playPoint(pose, u, pose.halfWidth + 0.08f, 0.08f + h + (1.0f - cy) * 0.30f);
+                 const V3 toEye = eye - c;
+                 const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
+                 const V3 right = normalize(cross(V3{0, 1, 0}, flat));
+@@ -1296,7 +1299,7 @@ void main()
+             mesh.reserve(size_t(kU) * kV * 6 * 7);
+             auto vertex = [&](int i, int j) {
+                 const float a = -1.0f + 2.0f * float(i) / kU, b = -1.0f + 2.0f * float(j) / kV;
+-                const float u = a * pose.halfWidth, v = b * pose.halfDepth;
++                const float u = a * pose.halfWidth, v = b * pose.halfWidth; // the round plate's square (radius halfWidth)
+                 const V3 p = playPoint(pose, u, v, 0.0f);
+                 float x = 0, z = 0, pu = -1, pv = -1;
+                 ga2_battletable::tableToMap(st, u, v, x, z);
+@@ -1346,7 +1349,7 @@ void main()
+                 const ga2_battletable::Unit &unit = st.units[n];
+                 float u = 0, v = 0;
+                 ga2_battletable::mapToTable(st, unit.x, unit.z, u, v);
+-                if (std::fabs(u) > pose.halfWidth * 0.97f || std::fabs(v) > pose.halfDepth * 0.97f)
++                if (u * u + v * v > pose.halfWidth * pose.halfWidth * 0.9f * 0.9f)
+                     continue;
+                 Marker &m = markers[markerCount++];
+                 m.n = n, m.u = u, m.v = v;
+@@ -1517,7 +1520,7 @@ void main()
+                 drawLine(viewProj, eye, q - upv * 1.05f, q - upv * 1.3f, 0.003f, c, 1.0f);
+             }
+             {
+-                const V3 c = playPoint(pose, 0.0f, pose.halfDepth + 0.12f, 0.68f); // above the HUD panels' row
++                const V3 c = playPoint(pose, 0.0f, pose.halfWidth + 0.12f, 0.68f); // above the HUD panels' row
+                 const V3 toEye = eye - c;
+                 const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
+                 const V3 right = normalize(cross(V3{0, 1, 0}, flat));
+@@ -1736,7 +1739,90 @@ void main()
+         // The table's "?" (replays the battle part of the guide): a ring at the front right corner.
+         V3 tableHelpPoint(const ga2_battletable::Pose &pose)
+         {
+-            return playPoint(pose, pose.halfWidth - 0.06f, -pose.halfDepth + 0.06f, 0.02f);
++            return playPoint(pose, pose.halfWidth * 0.62f, -pose.halfWidth * 0.62f, 0.02f); // inside the round plate's near right
++        }
++
++        // ---- the battle's own sky (the stage's [BG] models from the disc, bvr_ships::stageSky) ----
++        // Drawn as the game draws it: additive, texel x its alpha x the vertex colour x its alpha (0x80 = 1.0), around
++        // the viewer at infinity, turned with the map on the table so the sky around you is the map's own.
++        const char *kSkyMeshFs = R"(#version 330
++in vec2 v_uv;
++in vec4 v_col;
++in vec3 v_n;
++in vec3 v_w;
++uniform sampler2D tex;
++uniform int textured;
++out vec4 o;
++void main()
++{
++    vec4 t = textured != 0 ? texture(tex, v_uv) : vec4(1.0);
++    vec3 k = v_col.rgb * (255.0 / 128.0) * (v_col.a * (255.0 / 128.0));
++    o = vec4(t.rgb * t.a * k, 0.0);
++})";
++        GLuint g_skyMeshProgram = 0;
++
++        // The map's axes on the table (world directions of map +x, map +z, and the table's up).
++        bool mapAxes(const ga2_battletable::State &st, const ga2_battletable::Pose &pose, V3 &rx, V3 &fz, V3 &up)
++        {
++            float u0, v0, u1, v1, u2, v2;
++            ga2_battletable::mapToTable(st, st.cx, st.cz, u0, v0);
++            ga2_battletable::mapToTable(st, st.cx + 1.0f, st.cz, u1, v1);
++            ga2_battletable::mapToTable(st, st.cx, st.cz + 1.0f, u2, v2);
++            const V3 o = playPoint(pose, u0, v0, 0.0f);
++            up = normalize(playPoint(pose, u0, v0, 0.01f) - o);
++            rx = playPoint(pose, u1, v1, 0.0f) - o;
++            fz = playPoint(pose, u2, v2, 0.0f) - o;
++            if (dot(rx, rx) < 1e-12f || dot(fz, fz) < 1e-12f)
++                return false;
++            rx = normalize(rx - up * dot(rx, up));
++            fz = normalize(fz - up * dot(fz, up));
++            return true;
++        }
++
++        // True when the stage's sky was drawn (the generic skybox is then left out).
++        bool drawStageSky(const M4 &rotationView, const M4 &proj)
++        {
++            if (!g_tableView.active)
++                return false;
++            const std::shared_ptr<const bvr_ships::Mesh> mesh = bvr_ships::stageSky();
++            V3 rx, fz, up;
++            if (!mesh || !mapAxes(g_tableView.state, g_tableView.pose, rx, fz, up))
++                return false;
++            GlShip &sky = glShip(mesh);
++            if (!g_skyMeshProgram)
++                g_skyMeshProgram = compile(kShipVs, kSkyMeshFs, "stage sky");
++            float radius = 1.0f;
++            for (int k = 0; k < 3; ++k)
++                radius = std::max({radius, std::fabs(mesh->lo[k]), std::fabs(mesh->hi[k])});
++            const float k = 50.0f / radius; // inside the far plane (100 m), drawn without depth
++            // Game axes X right, Y down, Z forward -> map x, -up, map z.
++            M4 model;
++            model.m[0] = rx.x * k, model.m[1] = rx.y * k, model.m[2] = rx.z * k;
++            model.m[4] = -up.x * k, model.m[5] = -up.y * k, model.m[6] = -up.z * k;
++            model.m[8] = fz.x * k, model.m[9] = fz.y * k, model.m[10] = fz.z * k;
++            glUseProgram(g_skyMeshProgram);
++            setMatrix(g_skyMeshProgram, "model", model);
++            setMatrix(g_skyMeshProgram, "mvp", mul(proj, mul(rotationView, model)));
++            glUniform1i(glGetUniformLocation(g_skyMeshProgram, "tex"), 0);
++            const GLint locTextured = glGetUniformLocation(g_skyMeshProgram, "textured");
++            glDisable(GL_DEPTH_TEST);
++            glDepthMask(GL_FALSE);
++            glEnable(GL_BLEND);
++            glBlendFunc(GL_ONE, GL_ONE);
++            glActiveTexture(GL_TEXTURE0);
++            for (const GlShip::Part &part : sky.parts)
++            {
++                const bool textured = part.texture >= 0 && size_t(part.texture) < sky.textures.size();
++                glUniform1i(locTextured, textured ? 1 : 0);
++                glBindTexture(GL_TEXTURE_2D, textured ? sky.textures[size_t(part.texture)] : 0);
++                glBindVertexArray(part.vao);
++                glDrawElements(GL_TRIANGLES, part.count, GL_UNSIGNED_INT, nullptr);
++            }
++            glBindVertexArray(0);
++            glDisable(GL_BLEND);
++            glEnable(GL_DEPTH_TEST);
++            glDepthMask(GL_TRUE);
++            return true;
+         }
+ 
+         void drawScene(const M4 &view, const M4 &proj, V3 eye, GLuint picture, float extentX, float extentY, bool wide,
+@@ -1753,18 +1839,21 @@ void main()
+             // Sky (rotation only, at infinity).
+             M4 rotationOnly = view;
+             rotationOnly.m[12] = rotationOnly.m[13] = rotationOnly.m[14] = 0.0f;
+-            glDepthMask(GL_FALSE);
+-            glUseProgram(g_gl.sky);
+-            setMatrix(g_gl.sky, "invViewProj", inverse(mul(proj, rotationOnly)));
+-            glUniform1i(glGetUniformLocation(g_gl.sky, "hasSky"), g_gl.skyTexture ? 1 : 0);
+-            glActiveTexture(GL_TEXTURE0);
+-            glBindTexture(GL_TEXTURE_2D, g_gl.skyTexture);
+-            glUniform1i(glGetUniformLocation(g_gl.sky, "sky"), 0);
++            if (!drawStageSky(rotationOnly, proj))
+             {
+-                const float tri[15] = {-1, -1, 0, 0, 0, 3, -1, 0, 0, 0, -1, 3, 0, 0, 0};
+-                drawMesh(tri, 3);
++                glDepthMask(GL_FALSE);
++                glUseProgram(g_gl.sky);
++                setMatrix(g_gl.sky, "invViewProj", inverse(mul(proj, rotationOnly)));
++                glUniform1i(glGetUniformLocation(g_gl.sky, "hasSky"), g_gl.skyTexture ? 1 : 0);
++                glActiveTexture(GL_TEXTURE0);
++                glBindTexture(GL_TEXTURE_2D, g_gl.skyTexture);
++                glUniform1i(glGetUniformLocation(g_gl.sky, "sky"), 0);
++                {
++                    const float tri[15] = {-1, -1, 0, 0, 0, 3, -1, 0, 0, 0, -1, 3, 0, 0, 0};
++                    drawMesh(tri, 3);
++                }
++                glDepthMask(GL_TRUE);
+             }
+-            glDepthMask(GL_TRUE);
+ 
+             const M4 viewProj = mul(proj, view);
+             if (g_tableView.active)
+-- 
+2.56.0
+

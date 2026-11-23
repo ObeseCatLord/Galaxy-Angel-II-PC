@@ -79,3 +79,19 @@ text, fonts and pictures:
   that turns it into a pack.
 - [modding/text.md](modding/text.md) and [modding/scripts.md](modding/scripts.md):
   how the games lay out text, and the script format.
+
+### Movie subtitles
+
+A pack can subtitle the movies' spoken lines (with the "Movies" setting on
+Native). Put one SubRip file per movie in the pack:
+
+    <pack>/subtitles/<program>/<movie>.srt
+
+`<program>` is the disc's program name (`SLPM_551.18` Eigou Kaiki no Toki
+disc 1, `SLPM_551.19` disc 2, `SLPM_667.79` Mugen Kairou no Kagi disc 1,
+`SLPM_667.80` disc 2, `SLPM_662.43` Zettai Ryouiki no Tobira) and `<movie>`
+the movie's file name on the disc without `.pss` (for example
+`subtitles/SLPM_662.43/9019.srt`). The file is UTF-8 SRT: a number, a
+`00:00:05,300 --> 00:00:09,000` time line (from the start of the movie), one
+or two lines of text, a blank line. The text is drawn with the port's font
+(Japanese included), centred at the bottom of the picture.

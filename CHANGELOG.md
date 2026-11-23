@@ -1,5 +1,94 @@
 # Changelog
 
+## 0.12.0
+
+- Native movies (new setting "Movies", default Native): the PC decodes and
+  shows the games' movies itself instead of emulating the PS2's video decoder,
+  so they play smoothly at full speed on any PC (they were slow on the Steam
+  Deck) and the game runs at full rate around them. The game's own movie
+  handling (skipping, the gallery, the music) is unchanged; "Original" keeps
+  the emulated player.
+- Movie subtitles (setting "Movie subtitles", on by default): the English pack
+  subtitles the spoken lines in the movies (story movies and chapter
+  previews). They are a first pass made from transcripts; lines that could not
+  be made out are left out.
+- Faster, especially on the Steam Deck: the emulated I/O processor and the
+  PS2's timers do much less bookkeeping (about a quarter less work for the
+  game in story scenes), and the full-colour picture no longer makes the
+  game wait for the graphics card (battles at 2x hold full speed on the Deck).
+- Windows: folders, user names and disc image names in any language
+  (Japanese, accented letters) work; the programs now use UTF-8 for file
+  names.
+- Full colour: the games draw in full colour and then copy each frame into a
+  16-bit picture for the TV; that copy put visible colour steps (bands) into
+  every gradient: nebula skies, glows, fades. The full-colour frame is now
+  shown instead, with nothing smoothed or filtered (PS2 dithering On keeps the
+  original 16-bit picture).
+- VR: in the 3D views (space flights, the battle's chase and cockpit views)
+  the HUD and dialogue box float on their own panel in their own shape; they
+  were stretched over the headset's view.
+- VR: the guide's Japanese text was garbled on some lines; fixed (and lines
+  no longer start with closing punctuation).
+- VR battle table, first steps of a new table modelled on BattleGroupVR:
+  - the game's own ship models stand on the table (the angels' Emblem Frames,
+    the mothership and every enemy ship, read from your disc for the stage
+    being played), lit, in team colours, turned the way they fly;
+  - a round hologram table whose edge fades out, clear like glass, inside the
+    battle's own sky (the stage's sky rendered around you from your disc);
+  - the HUD's pieces (radar, clock, unit panel) float on their own as
+    holograms, drawn from the game's 2D layer alone, with no map behind them,
+    and the table is never cut;
+  - each unit's marker is its own icon from the game (the angel's face, the
+    ship's silhouette), upscaled, on a disc drawn at any resolution with its
+    shield as a ring and a heading arrow under the ship; markers are solid
+    layers (a nearer one covers a farther one, never blended or cut into);
+  - ships sized by their models (larger ships larger, smaller than before,
+    growing as you zoom in), with a slow hover and banking into turns;
+  - palm menus: turn a palm to your face for the squadron (left: select an
+    angel, all angels, pause) or the commands (right: stay, H-Weapon, cancel,
+    views, menu, recentre, guide, reset layout), poked with the other hand;
+  - every floating panel can be moved with a grip and keeps its place; the
+    characters' talk window has its own larger panel;
+  - the chase and cockpit views are a stereo hologram standing where the
+    table was (both grips scale it); the unit camera view shows on a screen
+    standing in the table;
+  - the second eye's renderer rests while the picture is not stereo (theater
+    screen, table).
+  - the table draws the battle map itself (the stage's own grid, play area and
+    obstacles, read from your disc) while the game skips drawing its 3D map:
+    battles in table mode use about half the processor time they did.
+- Faster: the I/O processor (sound, disc) no longer rescans its threads and
+  timers while it is idle, and the 3D chip's programs are recognised without
+  re-hashing them; on the Steam Frame the game runs on its fastest core
+  (battles about a quarter faster there). Busy battles on a PC hold full speed
+  longer.
+- Windows: Mugen disc images are accepted again ("SYSTEM.CNF has no BOOT2
+  line"): files stored past the first 2 GB of a disc image are read correctly
+  (this also affected parts of the English pack on Windows).
+- A crash now writes its cause to the log (to help with reports).
+- New setting "Battle map drawing" (desktop): Original (default) keeps the
+  game's own battle map; Fast has the PC draw the map's 3D itself (the stage's
+  grid, play area, obstacles and sky, read from your disc) under the game's own
+  2D: about half the processor time, so the map holds high frame rates (144 on
+  a fast PC). It looks close to the original but not identical.
+- Frame rates up to 500: new choices 300, 360 and 480, Custom up to 500, and
+  Monitor follows displays up to 500 Hz.
+- VR follows the headset's refresh rate as set in SteamVR or on the headset,
+  and follows it when it changes.
+- Higher frame rates: the battle's camera views (30 fps on the PS2) are drawn
+  at the chosen rate too when the PC can keep up; movies play closer to full
+  speed.
+- Menus and HUD as sharp pixels (new setting "Menus and HUD", default Sharp
+  pixels): at 2x and 4x the menus, windows, place names and the battle HUD keep
+  their original pixels instead of being smoothed by Anime4K; characters,
+  portraits, backgrounds and event pictures still go through Anime4K.
+- Story scenes: the characters' blinking eyes and moving mouths are upscaled
+  with their faces (they were enlarged without Anime4K and looked soft on the
+  sharp faces).
+- Battle map: the zones and the order lines have smooth edges at 2x and 4x
+  (they were drawn at the PS2's resolution).
+- Anime4K and Anime4K HQ keep separate cached pictures.
+
 ## 0.11.0
 
 - Starts like a PC game: borderless fullscreen at the display's own

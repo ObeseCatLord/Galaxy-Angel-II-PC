@@ -12,12 +12,12 @@
   <img src="docs/images/battle-en.png" width="56%" alt="A battle in Eigou Kaiki no Toki in 16:9 widescreen, in English">
   <img src="docs/images/story-en.png" width="42%" alt="A story scene in Eigou Kaiki no Toki, in English">
 </p>
-<p align="center"><sub>Eigou Kaiki no Toki in English at 4x internal resolution with Anime4K and debanding: a battle in 16:9 widescreen, and a story scene.</sub></p>
+<p align="center"><sub>Eigou Kaiki no Toki in English at 4x internal resolution with Anime4K and debanding, menus and HUD in sharp pixels: a battle in 16:9 widescreen, and a story scene.</sub></p>
 <p align="center">
   <img src="docs/images/vr-story-en.png" width="40%" alt="VR: a story scene on the big screen, floating in the game's space skybox">
-  <img src="docs/images/vr-table-en.png" width="58%" alt="VR: the battle table in front of the player, with holographic hands, team-coloured units, an order beam and the HUD as panels">
+  <img src="docs/images/vr-table-en.png" width="58%" alt="VR: the round holographic battle table inside the battle's own sky, with the game's ship models, unit discs, holographic hands and the HUD floating as holograms">
 </p>
-<p align="center"><sub>In VR: story scenes play on a big screen in the game's own space skybox; battles are a holographic table in front of you, played with your hands (the HUD stands around it as panels).</sub></p>
+<p align="center"><sub>In VR: story scenes play on a big screen in the game's own space skybox; battles are a round holographic table in the battle's own sky, with the game's ship models on it, played with your hands (the HUD floats around it as holograms).</sub></p>
 
 A native PC port of the Galaxy Angel II trilogy for the PlayStation 2:
 *Zettai Ryouiki no Tobira*, *Mugen Kairou no Kagi* and *Eigou Kaiki no Toki*.
@@ -69,14 +69,17 @@ guide are in [docs/PLAYING.md](docs/PLAYING.md).
   PS2 dither turned off. HD battle graphics at 2x and 4x: the battle HUD's
   rings, arrows, stars and digits redrawn as sharp shapes, its panels and
   portraits upscaled (Settings > HD battle graphics; Off for the originals).
+  Menus, windows and the HUD keep their original pixels, crisp (Settings >
+  Menus and HUD: Sharp pixels, or Anime4K).
 - Cheats menu (F1) and an in-game settings menu (F2).
 - VR through OpenXR (SteamVR, Monado). The game is shown on a big screen,
   and the 3D scenes are drawn in stereo around you. Battles are played
-  on a holographic battle table in front of you with motion controls: hold
+  on a round holographic battle table in front of you, inside the battle's
+  own sky, with the game's own ship models standing on it, and motion controls: hold
   your hand over a unit and pull the trigger to select it, drag to a spot or
   an enemy and let go to move or attack, grab the map to move it, both hands
-  to zoom and turn it. The battle HUD stands around the table as separate
-  panels. Holographic hands follow your real fingers where the headset tracks
+  to zoom and turn it. The battle HUD floats around the table as separate
+  holograms. Holographic hands follow your real fingers where the headset tracks
   them (Index controllers, Steam Frame, bare hands; not yet tried on a
   headset). A built-in VR guide teaches the controls (replay it in Settings),
   and the game's own tutorial shows the VR gestures.

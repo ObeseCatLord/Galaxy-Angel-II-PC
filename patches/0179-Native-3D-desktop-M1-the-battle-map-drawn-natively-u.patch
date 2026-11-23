@@ -1,0 +1,974 @@
+From 5b8cab3e0a89515066e8c11ca2460d1661992382 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:17:59 -0600
+Subject: [PATCH 179/180] Native 3D, desktop M1: the battle map drawn natively
+ under the game's 2D
+
+- ga2_native3d: the per-frame capture (the game camera as VU1 applies it, the battle's units), published by the game
+  thread with the guest flip that shows it; the GS frames now carry that flip to the presenter (slot -> eye ->
+  SharedFrame / takeEyeFrame / ga2_zerocopy::take), so each picture pairs with its own camera.
+- ga2_nativemap (GL, the presenter): identifies the stage from the units (battlevr), draws the stage's sky (view
+  rotation, brightness 0.55 as measured against the game's picture) and map model (identity world matrix, map units)
+  with the game's projection (x = cx + scrz*ax*X/Z on the 640-wide window; the frame's 448 rows show 480 game rows),
+  lays the game's remaining 3D (effects) over it keyed by brightness, and the 2D from the UI layer instance with its
+  alpha. Split frames outside the map get the UI layer over the scene. GA2_NATIVE_MAP=0 off; GA2_NATIVE_MAP_DEBUG=1
+  draws the native lines in magenta over the game's own map (registration check: they coincide).
+- gs_pgs: the UI layer instance also runs on the desktop when the native map is on (its work is on the GS worker:
+  no game-thread cost measured), split while the native map is ready.
+
+The game skips its map meshes meanwhile (native/compat/ga2_battledraw.cpp). Eigou 1 battle on the RTX 4090 path at a
+144 cap: 144 iterations/s at full speed, governor load ~0.8 (the game drew it: 60-75).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt                 |   2 +
+ ps2xRuntime/include/runtime/ga2_native3d.h |  50 +++
+ ps2xRuntime/include/runtime/gs/gs_pgs.h    |   4 +-
+ ps2xRuntime/src/lib/ga2_native3d.cpp       |  69 +++
+ ps2xRuntime/src/lib/ga2_nativemap.cpp      | 486 +++++++++++++++++++++
+ ps2xRuntime/src/lib/ga2_nativemap.h        |  17 +
+ ps2xRuntime/src/lib/ga2_zerocopy.cpp       |   7 +-
+ ps2xRuntime/src/lib/ga2_zerocopy.h         |   4 +-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp          |  22 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp        |  39 +-
+ 10 files changed, 689 insertions(+), 11 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_native3d.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_native3d.cpp
+ create mode 100644 ps2xRuntime/src/lib/ga2_nativemap.cpp
+ create mode 100644 ps2xRuntime/src/lib/ga2_nativemap.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index e044af8..e92f456 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -403,6 +403,8 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ga2_zerocopy.cpp
+     src/lib/ga2_vuthread.cpp
+     src/lib/ga2_battletable.cpp
++    src/lib/ga2_native3d.cpp
++    src/lib/ga2_nativemap.cpp
+     src/lib/ga2_mpv_shader.cpp
+     src/lib/ga2_vr.cpp
+     src/lib/battlevr/bvr_assets.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_native3d.h b/ps2xRuntime/include/runtime/ga2_native3d.h
+new file mode 100644
+index 0000000..94a35c5
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_native3d.h
+@@ -0,0 +1,50 @@
++// The native 3D renderer's per-frame capture (research/native3d/design.md): what the game would draw in 3D in a frame,
++// published by the game thread (native/compat) and read by the renderer for the GS frame of the same guest flip.
++#pragma once
++
++#include <cstdint>
++
++namespace ga2_native3d
++{
++    enum class Scene : uint32_t
++    {
++        None = 0,
++        BattleMap = 1, // the battle's tactical map: the stage's map model and sky (battlevr's decoded disc assets)
++    };
++
++    // The game camera as VU1 applies it. V: world -> camera, row vectors (v' = v V, translation in row 3), camera axes
++    // x right, y down, z forward. Projection to GS coordinates: x = cx + scrz*ax*X/Z, y = cy + scrz*ay*Y/Z (the 640-wide
++    // window starts at 2048 - 320).
++    struct Camera
++    {
++        float V[16] = {};
++        float cx = 2048.0f, cy = 2048.0f, scrz = 1.0f, ax = 1.0f, ay = 1.0f;
++    };
++
++    struct Frame
++    {
++        uint64_t flip = 0;       // the guest flip (ga2_framepace::flips()) that shows this frame
++        Scene scene = Scene::None;
++        Camera camera;
++        // The battle's live units (stage section ID, position in game units): the renderer identifies the stage with
++        // them (battlevr), as the VR table does.
++        static constexpr int kMaxUnits = 64;
++        int unitIds[kMaxUnits] = {};
++        float unitX[kMaxUnits] = {}, unitZ[kMaxUnits] = {};
++        int unitCount = 0;
++        uint64_t serial = 0;
++    };
++
++    // Game thread: the frame being built (shown by the next flip).
++    void publish(const Frame &frame);
++    // Renderer: the capture for the GS frame of guest flip `flip` (the newest one at or before it, at most a few
++    // flips old); false when none (the renderer leaves the frame as the GS drew it).
++    bool frameFor(uint64_t flip, Frame &out);
++    // Newest capture regardless of flip.
++    bool latest(Frame &out);
++
++    // Whether the desktop renderer draws the battle map natively (GA2_NATIVE_MAP, default on; native/compat skips the
++    // game's map meshes then). Set by the renderer once it can draw (its pipeline and the stage's assets ready).
++    void setReady(Scene scene, bool ready);
++    bool ready(Scene scene);
++}
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index a7fe4a8..78917ce 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -66,7 +66,8 @@ namespace ga2_pgs
+     // uiSplit (optional): the frame was drawn without its UI layer (see takeUiFrame).
+     // gameTime (optional): the game time of the iteration that drew it (GA2_PRESENT_SHOTS).
+     bool takeEyeFrame(int eye, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+-                      ga2_stereo::Setup &setup, bool *uiSplit = nullptr, double *gameTime = nullptr);
++                      ga2_stereo::Setup &setup, bool *uiSplit = nullptr, double *gameTime = nullptr,
++                      uint64_t *flip = nullptr);
+     // HUD panel (GA2_VR_HUD_PANEL=1 with the stereo instances): a third GS instance draws the 2D overlay (HUD,
+     // dialogue, menus) alone into an RGBA image, alpha as the game wrote it (0x80 = opaque), transparent black
+     // elsewhere; while a frame is split (3D stereo scene) the eye frames leave the overlay out.
+@@ -100,6 +101,7 @@ namespace ga2_pgs
+         bool shared = false;      // false: a frame made before zero copy started; `small` holds all of it
+         SharedImage image;
+         double gameTime = 0.0;    // of the iteration that drew it
++        uint64_t flip = 0;        // the guest flip that showed it (ga2_framepace::flips(); ga2_native3d pairs on it)
+         // Finished images replaced before they were taken: wait on their semaphore once, then release them.
+         std::vector<SharedImage> skipped;
+     };
+diff --git a/ps2xRuntime/src/lib/ga2_native3d.cpp b/ps2xRuntime/src/lib/ga2_native3d.cpp
+new file mode 100644
+index 0000000..16e6c98
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_native3d.cpp
+@@ -0,0 +1,69 @@
++#include "runtime/ga2_native3d.h"
++
++#include <array>
++#include <atomic>
++#include <mutex>
++
++namespace ga2_native3d
++{
++    namespace
++    {
++        std::mutex g_mutex;
++        constexpr size_t kRing = 16;
++        std::array<Frame, kRing> g_ring{};
++        size_t g_next = 0;
++        uint64_t g_serial = 0;
++        std::atomic<bool> g_ready[2] = {false, false};
++    }
++
++    void publish(const Frame &frame)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        // One entry per flip: a second publish for the same flip replaces the first (the last camera of the frame wins).
++        const size_t last = (g_next + kRing - 1) % kRing;
++        Frame &slot = (g_serial && g_ring[last].flip == frame.flip) ? g_ring[last] : g_ring[g_next++ % kRing];
++        g_next %= kRing;
++        slot = frame;
++        slot.serial = ++g_serial;
++    }
++
++    bool frameFor(uint64_t flip, Frame &out)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        const Frame *best = nullptr;
++        for (const Frame &f : g_ring)
++            if (f.serial && f.flip <= flip && flip - f.flip <= 4 && (!best || f.flip > best->flip ||
++                                                                    (f.flip == best->flip && f.serial > best->serial)))
++                best = &f;
++        if (!best)
++            return false;
++        out = *best;
++        return true;
++    }
++
++    bool latest(Frame &out)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        const Frame *best = nullptr;
++        for (const Frame &f : g_ring)
++            if (f.serial && (!best || f.serial > best->serial))
++                best = &f;
++        if (!best)
++            return false;
++        out = *best;
++        return true;
++    }
++
++    void setReady(Scene scene, bool ready)
++    {
++        const size_t i = static_cast<size_t>(scene);
++        if (i < 2)
++            g_ready[i].store(ready, std::memory_order_relaxed);
++    }
++
++    bool ready(Scene scene)
++    {
++        const size_t i = static_cast<size_t>(scene);
++        return i < 2 && g_ready[i].load(std::memory_order_relaxed);
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_nativemap.cpp b/ps2xRuntime/src/lib/ga2_nativemap.cpp
+new file mode 100644
+index 0000000..fe87905
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_nativemap.cpp
+@@ -0,0 +1,486 @@
++#include "ga2_nativemap.h"
++
++#include "battlevr/bvr_ships.h"
++#include "runtime/ga2_native3d.h"
++
++#include "external/glad.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace ga2_nativemap
++{
++    namespace
++    {
++        bool envOn(const char *name, bool fallback)
++        {
++            const char *v = std::getenv(name);
++            return v && *v ? *v != '0' : fallback;
++        }
++
++        // Game camera -> clip space for the GS frame's texture (rows top first: no flip). x_gs = cx + scrz*ax*X/Z,
++        // y_gs = cy + scrz*ay*Y/Z; the 640 x 448 window starts at (2048 - 320, 2048 - 224).
++        const char *kVs = R"(#version 330
++layout(location = 0) in vec3 pos;
++layout(location = 1) in vec2 uv;
++layout(location = 2) in vec4 col;
++uniform mat4 model;     // model -> world (game units)
++uniform mat4 view;      // world -> camera (the game's V, as column-major: its row-vector form)
++uniform vec4 proj;      // (A, B, C, D): clip.x = A X + B Z, clip.y = C Y + D Z
++uniform vec2 radial;    // the map model: (centre distance limit, 0) unused here
++out vec2 v_uv;
++out vec4 v_col;
++void main()
++{
++    vec4 c = view * (model * vec4(pos, 1.0));
++    v_uv = uv;
++    v_col = col;
++    gl_Position = vec4(proj.x * c.x + proj.y * c.z, proj.z * c.y + proj.w * c.z, 0.5 * c.z, c.z);
++})";
++        const char *kFs = R"(#version 330
++in vec2 v_uv;
++in vec4 v_col;
++uniform sampler2D tex;
++uniform int textured;
++uniform vec4 tint;      // rgb, alpha: strength
++uniform int vertexColour;
++out vec4 o;
++void main()
++{
++    vec4 c = vertexColour != 0 ? vec4(v_col.rgb * 2.0, 1.0) : vec4(1.0);
++    if (textured != 0)
++        c *= texture(tex, v_uv);
++    o = vec4(c.rgb * tint.rgb * tint.a, 0.0); // additive
++})";
++        // The GS frame over the native layer: its black background (the game's map meshes skipped) shows the native
++        // picture; anything the game drew keeps its pixels (soft edges by brightness).
++        const char *kQuadVs = R"(#version 330
++out vec2 v_uv;
++void main()
++{
++    vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
++    v_uv = p * 0.5 + 0.5;
++    gl_Position = vec4(p, 0.0, 1.0);
++})";
++        const char *kCompFs = R"(#version 330
++in vec2 v_uv;
++uniform sampler2D scene;
++uniform sampler2D native3d;
++uniform sampler2D ui;
++uniform int hasNative, hasUi, debug;
++out vec4 o;
++void main()
++{
++    vec3 s = texture(scene, v_uv).rgb;
++    vec3 c = s;
++    if (hasNative != 0)
++    {
++        vec3 n = texture(native3d, v_uv).rgb;
++        // The game's remaining 3D (effects) over the native picture: bright pixels cover it, dim ones (the soft dark
++        // edges of smoke and glows) are added instead of drawn as dark halos.
++        float a = debug != 0 ? 0.0 : smoothstep(0.12, 0.45, max(s.r, max(s.g, s.b)));
++        c = debug != 0 ? s + n : mix(n + s, s, a);
++    }
++    if (hasUi != 0)
++    {
++        // The 2D layer with its own alpha (0x80 = opaque), premultiplied.
++        vec4 u = texture(ui, v_uv);
++        float ua = clamp(u.a * (255.0 / 128.0), 0.0, 1.0);
++        c = c * (1.0 - ua) + u.rgb;
++    }
++    o = vec4(c, 1.0);
++})";
++
++        GLuint compile(const char *vs, const char *fs, const char *name)
++        {
++            auto stage = [&](GLenum type, const char *src) -> GLuint {
++                const GLuint sh = glCreateShader(type);
++                glShaderSource(sh, 1, &src, nullptr);
++                glCompileShader(sh);
++                GLint ok = 0;
++                glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
++                if (!ok)
++                {
++                    char log[1024];
++                    glGetShaderInfoLog(sh, sizeof(log), nullptr, log);
++                    std::fprintf(stderr, "[native map] %s shader: %s\n", name, log);
++                }
++                return sh;
++            };
++            const GLuint p = glCreateProgram(), v = stage(GL_VERTEX_SHADER, vs), f = stage(GL_FRAGMENT_SHADER, fs);
++            glAttachShader(p, v);
++            glAttachShader(p, f);
++            glLinkProgram(p);
++            glDeleteShader(v);
++            glDeleteShader(f);
++            GLint ok = 0;
++            glGetProgramiv(p, GL_LINK_STATUS, &ok);
++            if (!ok)
++            {
++                std::fprintf(stderr, "[native map] %s program failed to link\n", name);
++                glDeleteProgram(p);
++                return 0;
++            }
++            return p;
++        }
++
++        // A mesh uploaded once (12 floats a vertex: pos, uv, colour, normal), its triangles and lines per part.
++        struct GlMesh
++        {
++            const void *source = nullptr;
++            GLuint vao = 0, vbo = 0;
++            struct Part
++            {
++                GLuint triEbo = 0, lineEbo = 0;
++                GLsizei tris = 0, lines = 0;
++                int texture = -1;
++            };
++            std::vector<Part> parts;
++            std::vector<GLuint> textures;
++            float radius = 1.0f;
++
++            void release()
++            {
++                for (Part &p : parts)
++                {
++                    glDeleteBuffers(1, &p.triEbo);
++                    glDeleteBuffers(1, &p.lineEbo);
++                }
++                parts.clear();
++                if (!textures.empty())
++                    glDeleteTextures(GLsizei(textures.size()), textures.data());
++                textures.clear();
++                glDeleteBuffers(1, &vbo);
++                glDeleteVertexArrays(1, &vao);
++                vao = vbo = 0;
++                source = nullptr;
++            }
++        };
++
++        void upload(GlMesh &g, const bvr_ships::Mesh &mesh)
++        {
++            g.release();
++            g.source = &mesh;
++            std::vector<float> verts;
++            glGenVertexArrays(1, &g.vao);
++            glGenBuffers(1, &g.vbo);
++            for (const bvr_ships::Mesh::Part &p : mesh.parts)
++            {
++                const uint32_t base = uint32_t(verts.size() / 12);
++                verts.insert(verts.end(), p.vertices.begin(), p.vertices.end());
++                GlMesh::Part gp;
++                gp.texture = p.texture;
++                std::vector<uint32_t> tri(p.indices), line(p.lines);
++                for (uint32_t &i : tri)
++                    i += base;
++                for (uint32_t &i : line)
++                    i += base;
++                glGenBuffers(1, &gp.triEbo);
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gp.triEbo);
++                glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(tri.size() * 4), tri.data(), GL_STATIC_DRAW);
++                glGenBuffers(1, &gp.lineEbo);
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gp.lineEbo);
++                glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(line.size() * 4), line.data(), GL_STATIC_DRAW);
++                gp.tris = GLsizei(tri.size()), gp.lines = GLsizei(line.size());
++                g.parts.push_back(gp);
++            }
++            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
++            glBindVertexArray(g.vao);
++            glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
++            glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(verts.size() * 4), verts.data(), GL_STATIC_DRAW);
++            glEnableVertexAttribArray(0);
++            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 48, nullptr);
++            glEnableVertexAttribArray(1);
++            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 48, reinterpret_cast<void *>(12));
++            glEnableVertexAttribArray(2);
++            glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 48, reinterpret_cast<void *>(20));
++            glBindVertexArray(0);
++            for (const auto &t : mesh.textures)
++            {
++                GLuint id = 0;
++                glGenTextures(1, &id);
++                glBindTexture(GL_TEXTURE_2D, id);
++                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, t.width, t.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, t.rgba.data());
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
++                g.textures.push_back(id);
++            }
++            glBindTexture(GL_TEXTURE_2D, 0);
++            g.radius = 1.0f;
++            for (int k = 0; k < 3; ++k)
++                g.radius = std::max({g.radius, std::fabs(mesh.lo[k]), std::fabs(mesh.hi[k])});
++        }
++
++        struct Gl
++        {
++            bool tried = false;
++            GLuint program = 0, comp = 0, quadVao = 0;
++            GLuint fbo[2] = {0, 0}, tex[2] = {0, 0};
++            int w = 0, h = 0;
++            GlMesh map, sky;
++            std::shared_ptr<const bvr_ships::Mesh> mapHeld, skyHeld; // kept alive while uploaded
++        } g;
++
++        bool init()
++        {
++            if (g.tried)
++                return g.program && g.comp;
++            g.tried = true;
++            g.program = compile(kVs, kFs, "mesh");
++            g.comp = compile(kQuadVs, kCompFs, "compose");
++            glGenVertexArrays(1, &g.quadVao);
++            return g.program && g.comp;
++        }
++
++        void target(int w, int h)
++        {
++            if (g.w == w && g.h == h && g.fbo[0])
++                return;
++            for (int i = 0; i < 2; ++i)
++            {
++                if (g.fbo[i])
++                {
++                    glDeleteFramebuffers(1, &g.fbo[i]);
++                    glDeleteTextures(1, &g.tex[i]);
++                }
++                glGenTextures(1, &g.tex[i]);
++                glBindTexture(GL_TEXTURE_2D, g.tex[i]);
++                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++                glGenFramebuffers(1, &g.fbo[i]);
++                glBindFramebuffer(GL_FRAMEBUFFER, g.fbo[i]);
++                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g.tex[i], 0);
++            }
++            glBindFramebuffer(GL_FRAMEBUFFER, 0);
++            glBindTexture(GL_TEXTURE_2D, 0);
++            g.w = w, g.h = h;
++        }
++
++        void setMat(GLuint p, const char *name, const float *m) { glUniformMatrix4fv(glGetUniformLocation(p, name), 1, GL_FALSE, m); }
++
++        void drawMesh(const GlMesh &mesh, bool lines, bool tris, const float tint[4], bool textured, bool vertexColour)
++        {
++            const GLuint p = g.program;
++            glUniform4fv(glGetUniformLocation(p, "tint"), 1, tint);
++            glUniform1i(glGetUniformLocation(p, "vertexColour"), vertexColour ? 1 : 0);
++            glBindVertexArray(mesh.vao);
++            for (const GlMesh::Part &part : mesh.parts)
++            {
++                const bool tex = textured && part.texture >= 0 && size_t(part.texture) < mesh.textures.size();
++                glUniform1i(glGetUniformLocation(p, "textured"), tex ? 1 : 0);
++                glBindTexture(GL_TEXTURE_2D, tex ? mesh.textures[size_t(part.texture)] : 0);
++                if (tris && part.tris)
++                {
++                    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, part.triEbo);
++                    glDrawElements(GL_TRIANGLES, part.tris, GL_UNSIGNED_INT, nullptr);
++                }
++                if (lines && part.lines)
++                {
++                    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, part.lineEbo);
++                    glDrawElements(GL_LINES, part.lines, GL_UNSIGNED_INT, nullptr);
++                }
++            }
++            glBindVertexArray(0);
++        }
++
++        uint64_t g_lastLog = 0;
++    }
++
++    // A split frame that is not the native map: the scene with the UI layer over it (nothing native).
++    unsigned overlay(unsigned scene, int w, int h, unsigned ui)
++    {
++        if (!init())
++            return scene;
++        target(w, h);
++        GLint prevFbo = 0, prevViewport[4];
++        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
++        glGetIntegerv(GL_VIEWPORT, prevViewport);
++        const GLboolean blend = glIsEnabled(GL_BLEND), depth = glIsEnabled(GL_DEPTH_TEST);
++        glDisable(GL_BLEND);
++        glDisable(GL_DEPTH_TEST);
++        glBindFramebuffer(GL_FRAMEBUFFER, g.fbo[1]);
++        glViewport(0, 0, w, h);
++        glUseProgram(g.comp);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, scene);
++        glActiveTexture(GL_TEXTURE2);
++        glBindTexture(GL_TEXTURE_2D, ui);
++        glUniform1i(glGetUniformLocation(g.comp, "scene"), 0);
++        glUniform1i(glGetUniformLocation(g.comp, "ui"), 2);
++        glUniform1i(glGetUniformLocation(g.comp, "hasNative"), 0);
++        glUniform1i(glGetUniformLocation(g.comp, "hasUi"), 1);
++        glUniform1i(glGetUniformLocation(g.comp, "debug"), 0);
++        glBindVertexArray(g.quadVao);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        glBindVertexArray(0);
++        glBindTexture(GL_TEXTURE_2D, 0);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, 0);
++        glUseProgram(0);
++        glBindFramebuffer(GL_FRAMEBUFFER, GLuint(prevFbo));
++        glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
++        if (blend)
++            glEnable(GL_BLEND);
++        if (depth)
++            glEnable(GL_DEPTH_TEST);
++        return g.tex[1];
++    }
++
++    unsigned compose(unsigned scene, int w, int h, uint64_t flip, unsigned ui, bool split)
++    {
++        static const bool on = envOn("GA2_NATIVE_MAP", true);
++        static const bool debug = envOn("GA2_NATIVE_MAP_DEBUG", false);
++        if (!on || !scene || w <= 0 || h <= 0)
++            return scene;
++        ga2_native3d::Frame f;
++        const bool mapFrame = ga2_native3d::frameFor(flip, f) && f.scene == ga2_native3d::Scene::BattleMap;
++        if (!mapFrame)
++            return split && ui ? overlay(scene, w, h, ui) : scene;
++        // The stage: identified from the units as the VR table does (and dropped when a unit does not belong to it).
++        bvr_ships::start();
++        {
++            std::vector<int> ids(f.unitIds, f.unitIds + f.unitCount);
++            if (!bvr_ships::stage().empty() && !bvr_ships::stageFits(ids))
++            {
++                bvr_ships::reset();
++                ga2_native3d::setReady(ga2_native3d::Scene::BattleMap, false);
++            }
++            if (bvr_ships::stage().empty())
++            {
++                std::vector<bvr_ships::SeenUnit> seen;
++                for (int n = 0; n < f.unitCount; ++n)
++                    seen.push_back({f.unitIds[n], f.unitX[n], f.unitZ[n]});
++                bvr_ships::identify(seen);
++            }
++        }
++        const std::shared_ptr<const bvr_ships::Mesh> map = bvr_ships::mapModel(), sky = bvr_ships::stageSky();
++        if (!map || !init())
++            return split && ui ? overlay(scene, w, h, ui) : scene;
++        if (g.map.source != map.get())
++        {
++            upload(g.map, *map);
++            g.mapHeld = map;
++            std::fprintf(stderr, "[native map] stage %s: map model on the desktop picture\n", bvr_ships::stage().c_str());
++        }
++        if (sky && g.sky.source != sky.get())
++        {
++            upload(g.sky, *sky);
++            g.skyHeld = sky;
++        }
++        // From the next frames the game leaves the map's 3D to this pass (the debug check keeps the game's own).
++        if (!debug)
++            ga2_native3d::setReady(ga2_native3d::Scene::BattleMap, true);
++
++        target(w, h);
++        GLint prevFbo = 0, prevViewport[4];
++        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
++        glGetIntegerv(GL_VIEWPORT, prevViewport);
++        const GLboolean blend = glIsEnabled(GL_BLEND), depth = glIsEnabled(GL_DEPTH_TEST), cull = glIsEnabled(GL_CULL_FACE);
++        glDisable(GL_DEPTH_TEST);
++        glDisable(GL_CULL_FACE);
++        glEnable(GL_BLEND);
++        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++
++        // (1) The native layer.
++        glBindFramebuffer(GL_FRAMEBUFFER, g.fbo[0]);
++        glViewport(0, 0, w, h);
++        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++        glClear(GL_COLOR_BUFFER_BIT);
++        glUseProgram(g.program);
++        glUniform1i(glGetUniformLocation(g.program, "tex"), 0);
++        glActiveTexture(GL_TEXTURE0);
++        const ga2_native3d::Camera &c = f.camera;
++        // The frame's 448 rows show 480 rows of the game's coordinates (the 640 x 480 2D space; measured on the
++        // registration check: 448 gave the grid's rows 480/448 apart).
++        const float x0 = 2048.0f - 320.0f, y0 = 2048.0f - 240.0f;
++        const float proj[4] = {c.scrz * c.ax / 320.0f, (c.cx - x0) / 320.0f - 1.0f, c.scrz * c.ay / 240.0f, (c.cy - y0) / 240.0f - 1.0f};
++        glUniform4fv(glGetUniformLocation(g.program, "proj"), 1, proj);
++        // The sky: the view's rotation only, the model at a radius far inside the camera's reach (no depth).
++        if (sky && g.sky.vao && !debug)
++        {
++            float rot[16];
++            std::copy(c.V, c.V + 16, rot);
++            rot[12] = rot[13] = rot[14] = 0.0f;
++            const float k = 1000.0f / g.sky.radius;
++            const float model[16] = {k, 0, 0, 0, 0, k, 0, 0, 0, 0, k, 0, 0, 0, 0, 1};
++            setMat(g.program, "view", rot);
++            setMat(g.program, "model", model);
++            // 0.55: the game's backdrop as bright as the game drew it (measured against its own picture, the same spot
++            // of the same frame: additive layers at 1.0 were 1.8x brighter).
++            const float tint[4] = {1, 1, 1, 0.55f};
++            glBlendFunc(GL_ONE, GL_ONE);
++            drawMesh(g.sky, false, true, tint, true, true);
++        }
++        // The map model: drawn by the game with an identity world matrix (the camera works in map units; the units'
++        // positions are game units / 1000), measured with GA2_MESH_TALLY.
++        {
++            static const float s = 1.0f;
++            const float model[16] = {s, 0, 0, 0, 0, s, 0, 0, 0, 0, s, 0, 0, 0, 0, 1};
++            setMat(g.program, "view", c.V);
++            setMat(g.program, "model", model);
++            glBlendFunc(GL_ONE, GL_ONE);
++            const float solid[4] = {0.35f, 0.75f, 1.0f, 0.10f};
++            drawMesh(g.map, false, true, solid, false, false);
++            // The lines in the model's own colours (the game's grey-white grid).
++            const float line[4] = {1.0f, debug ? 0.2f : 1.0f, 1.0f, debug ? 1.0f : 0.8f};
++            drawMesh(g.map, true, false, line, false, !debug);
++        }
++
++        // (2) The GS frame over it.
++        glBindFramebuffer(GL_FRAMEBUFFER, g.fbo[1]);
++        glDisable(GL_BLEND);
++        glUseProgram(g.comp);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, scene);
++        glActiveTexture(GL_TEXTURE1);
++        glBindTexture(GL_TEXTURE_2D, g.tex[0]);
++        glUniform1i(glGetUniformLocation(g.comp, "scene"), 0);
++        glUniform1i(glGetUniformLocation(g.comp, "native3d"), 1);
++        glUniform1i(glGetUniformLocation(g.comp, "debug"), debug ? 1 : 0);
++        glUniform1i(glGetUniformLocation(g.comp, "hasNative"), 1);
++        glActiveTexture(GL_TEXTURE2);
++        glBindTexture(GL_TEXTURE_2D, split && ui ? ui : 0);
++        glUniform1i(glGetUniformLocation(g.comp, "ui"), 2);
++        glUniform1i(glGetUniformLocation(g.comp, "hasUi"), split && ui ? 1 : 0);
++        glBindVertexArray(g.quadVao);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        glBindVertexArray(0);
++        glActiveTexture(GL_TEXTURE2);
++        glBindTexture(GL_TEXTURE_2D, 0);
++        glActiveTexture(GL_TEXTURE1);
++        glBindTexture(GL_TEXTURE_2D, 0);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, 0);
++        glUseProgram(0);
++
++        glBindFramebuffer(GL_FRAMEBUFFER, GLuint(prevFbo));
++        glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
++        if (blend)
++            glEnable(GL_BLEND);
++        else
++            glDisable(GL_BLEND);
++        if (depth)
++            glEnable(GL_DEPTH_TEST);
++        if (cull)
++            glEnable(GL_CULL_FACE);
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++        if (flip - g_lastLog > 600)
++        {
++            g_lastLog = flip;
++            std::fprintf(stderr, "[native map] flip %llu: camera cx %.1f cy %.1f scrz*ax %.1f scrz*ay %.1f, %d units\n",
++                         static_cast<unsigned long long>(flip), double(c.cx), double(c.cy), double(c.scrz * c.ax),
++                         double(c.scrz * c.ay), f.unitCount);
++        }
++        return g.tex[1];
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_nativemap.h b/ps2xRuntime/src/lib/ga2_nativemap.h
+new file mode 100644
+index 0000000..568a169
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_nativemap.h
+@@ -0,0 +1,17 @@
++// The desktop native renderer, milestone M1 (research/native3d/design.md): the battle's tactical map drawn natively
++// under the GS picture. While it is ready the game skips its map meshes (native/compat/ga2_battledraw.cpp), so the GS
++// frame holds only the 2D layer and the remaining effects over black; this pass draws the stage's sky and map model
++// with the game's own camera (captured per frame, ga2_native3d) and lays the GS frame over them, keyed by brightness.
++// GA2_NATIVE_MAP=0: off (the game draws the map as before). GA2_NATIVE_MAP_DEBUG=1: the game keeps drawing the map and
++// the native lines are drawn over it in magenta (registration check).
++#pragma once
++
++#include <cstdint>
++
++namespace ga2_nativemap
++{
++    // Present thread (GL current). `scene`: the GS frame's texture (w x h, rows top first), shown by guest flip `flip`;
++    // `ui`: the UI layer instance's newest picture (RGBA, alpha 0x80 = opaque, premultiplied), `split`: the scene was
++    // drawn without its 2D (it then always gets the UI layer over it, map or not). Returns the texture to show.
++    unsigned compose(unsigned scene, int w, int h, uint64_t flip, unsigned ui, bool split);
++}
+diff --git a/ps2xRuntime/src/lib/ga2_zerocopy.cpp b/ps2xRuntime/src/lib/ga2_zerocopy.cpp
+index ae32c90..c7f5dac 100644
+--- a/ps2xRuntime/src/lib/ga2_zerocopy.cpp
++++ b/ps2xRuntime/src/lib/ga2_zerocopy.cpp
+@@ -14,7 +14,7 @@ namespace ga2_zerocopy
+     bool init() { return false; }
+     bool active() { return false; }
+     bool take(int, unsigned &, uint32_t &, uint32_t &, bool &, std::vector<uint8_t> &, uint32_t &, uint32_t &,
+-              ga2_stereo::Setup &, bool *, double *)
++              ga2_stereo::Setup &, bool *, double *, uint64_t *)
+     {
+         return false;
+     }
+@@ -297,7 +297,8 @@ namespace ga2_zerocopy
+     bool active() { return g_active; }
+ 
+     bool take(int eye, unsigned &texture, uint32_t &width, uint32_t &height, bool &shared, std::vector<uint8_t> &small,
+-              uint32_t &smallWidth, uint32_t &smallHeight, ga2_stereo::Setup &setup, bool *uiSplit, double *gameTime)
++              uint32_t &smallWidth, uint32_t &smallHeight, ga2_stereo::Setup &setup, bool *uiSplit, double *gameTime,
++              uint64_t *flip)
+     {
+         if (eye < 0 || eye > 1)
+             return false;
+@@ -315,6 +316,8 @@ namespace ga2_zerocopy
+         shared = frame.shared;
+         if (gameTime)
+             *gameTime = frame.gameTime;
++        if (flip)
++            *flip = frame.flip;
+         if (!frame.shared)
+         {
+             // A read-back frame (zero copy just started or stopped): the shared image shown so far goes back to
+diff --git a/ps2xRuntime/src/lib/ga2_zerocopy.h b/ps2xRuntime/src/lib/ga2_zerocopy.h
+index 5024cbe..7141a3d 100644
+--- a/ps2xRuntime/src/lib/ga2_zerocopy.h
++++ b/ps2xRuntime/src/lib/ga2_zerocopy.h
+@@ -22,10 +22,10 @@ namespace ga2_zerocopy
+     // OpenGL texture (width x height, RGBA8 with alpha read as 1), valid until a later take() of the same eye;
+     // `small` holds the native-size copy for the CPU (mouse menus). Not shared: `small` is the whole picture
+     // (a frame read back before zero copy started) and the caller uploads it.
+-    // gameTime (optional): the game time of the iteration that drew it.
++    // gameTime (optional): the game time of the iteration that drew it; flip (optional): the guest flip that showed it.
+     bool take(int eye, unsigned &texture, uint32_t &width, uint32_t &height, bool &shared, std::vector<uint8_t> &small,
+               uint32_t &smallWidth, uint32_t &smallHeight, ga2_stereo::Setup &setup, bool *uiSplit = nullptr,
+-              double *gameTime = nullptr);
++              double *gameTime = nullptr, uint64_t *flip = nullptr);
+ 
+     // After the frame's drawing: images whose last use has finished go back to the GS.
+     void endFrame();
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 0d4b1dd..33bf34b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -2,6 +2,7 @@
+ // ps2_gs_pgs.cpp (GPL-3.0) without its game-specific seams.
+ #include "runtime/ga2_display.h"
+ #include "runtime/gs/gs_pgs.h"
++#include "runtime/ga2_native3d.h"
+ 
+ #if defined(PS2X_HAVE_PGS)
+ 
+@@ -190,6 +191,7 @@ namespace
+         bool frameShared = false;
+         std::vector<uint32_t> skippedShared;
+         double frameGameTime = 0.0; // game time of the iteration that drew the fresh frame
++        uint64_t frameFlip = 0;     // the guest flip that showed it (ga2_framepace::flips())
+     };
+ 
+     // A thread that runs one GS instance's work in order: the jitter instances' vsync (flush, scan-out, readback),
+@@ -262,6 +264,7 @@ namespace
+         bool wideDetail = false;
+         InstanceWorker jitterWorkers[3];
+         bool uiLayer = false;
++        bool desktopNative = false; // the UI layer instance serves the desktop's native battle map
+         bool uiPanelStereo = false; // GA2_VR_HUD_PANEL=1: the overlay as one panel over the stereo views
+         uint32_t instanceCount() const { return eyeCount + jitterCount + (uiLayer ? 1u : 0u); }
+         // The worker of instance i, or null when the calling thread runs it.
+@@ -665,7 +668,10 @@ namespace
+         s.hudDebug = envInt("GA2_VR_HUD_DEBUG", 0) == 1;
+         s.uiPanelStereo = envInt("GA2_VR_HUD_PANEL", -1) == 1;
+         // (Only for a headset's two eyes: widescreen detail also runs two instances, and needs no UI layer.)
+-        if ((s.eyeCount == 2 && !s.wideDetail && envInt("GA2_VR_HUD_PANEL", -1) != 0) || s.hudDebug)
++        // The desktop's native battle map (ga2_nativemap) lays the 3D under the game's 2D: the UI layer gives the 2D
++        // with its real alpha (one picture per game frame, on this worker: no game-thread cost measured).
++        s.desktopNative = s.eyeCount == 1 && s.jitterCount == 0 && envInt("GA2_NATIVE_MAP", 1) != 0;
++        if ((s.eyeCount == 2 && !s.wideDetail && envInt("GA2_VR_HUD_PANEL", -1) != 0) || s.hudDebug || s.desktopNative)
+         {
+             GSOptions uiOptions = eyeOptions;
+             const int u = envInt("GA2_VR_HUD_SSAA", 1);
+@@ -788,6 +794,7 @@ namespace
+             eye.freshSlot = &slot;
+             eye.frameShared = slot.sharedFrame;
+             eye.frameGameTime = slot.flipTime;
++            eye.frameFlip = slot.flip;
+             eye.frameSrc = src;
+             eye.frameBgra = slot.format == VK_FORMAT_B8G8R8A8_UNORM || slot.format == VK_FORMAT_B8G8R8A8_SRGB;
+             eye.frameWidth = slot.width;
+@@ -1296,7 +1303,8 @@ namespace ga2_pgs
+         const ga2_stereo::Setup next = t.next;
+         // HUD panel: the frames the instances are about to draw are split into scene and UI layer while the game
+         // renders them in stereo.
+-        const bool split = s.uiLayer && ((s.uiPanelStereo && next.active) || s.hudDebug || g_tableSplit.load());
++        const bool split = s.uiLayer && ((s.uiPanelStereo && next.active) || s.hudDebug || g_tableSplit.load() ||
++                                         (s.desktopNative && ga2_native3d::ready(ga2_native3d::Scene::BattleMap)));
+         // The port's text and prompts of the frame being scanned out (the game flipped to a new one since the last
+         // vsync, or it is still the last one), kept with its picture.
+         const auto frameText = ga2_hitext::sealFrame(t.newFrame, std::move(t.pieces));
+@@ -1504,6 +1512,7 @@ namespace ga2_pgs
+             ga2_stereo::Setup setup;
+             std::shared_ptr<const ga2_hitext::FrameText> text;
+             double gameTime = 0.0;
++            uint64_t flip = 0;
+         };
+ 
+         bool acquireFrame(State &s, Eye &eye, TakenFrame &out)
+@@ -1520,6 +1529,7 @@ namespace ga2_pgs
+             out.setup = eye.frameSetup;
+             out.text = eye.frameText;
+             out.gameTime = eye.frameGameTime;
++            out.flip = eye.frameFlip;
+             eye.freshSlot = nullptr; // now owned by the caller; a newer frame will not release it
+             eye.frameSrc = nullptr;
+             eye.frameFresh = false;
+@@ -1708,6 +1718,7 @@ namespace ga2_pgs
+             taken.setup = eye.frameSetup;
+             taken.text = eye.frameText;
+             taken.gameTime = eye.frameGameTime;
++            taken.flip = eye.frameFlip;
+             eye.freshSlot = nullptr;
+             eye.frameSrc = nullptr;
+             eye.frameFresh = false;
+@@ -1717,6 +1728,7 @@ namespace ga2_pgs
+         }
+         frame.shared = shared;
+         frame.gameTime = taken.gameTime;
++        frame.flip = taken.flip;
+         smallWidth = taken.width;
+         smallHeight = taken.height;
+         setup = taken.setup;
+@@ -1754,7 +1766,7 @@ namespace ga2_pgs
+     }
+ 
+     bool takeEyeFrame(int eyeIndex, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+-                      ga2_stereo::Setup &setup, bool *uiSplit, double *gameTime)
++                      ga2_stereo::Setup &setup, bool *uiSplit, double *gameTime, uint64_t *flip)
+     {
+         State &s = state();
+         if (eyeIndex < 0 || uint32_t(eyeIndex) >= s.eyeCount)
+@@ -1769,6 +1781,8 @@ namespace ga2_pgs
+             *uiSplit = frame.uiSplit;
+         if (gameTime)
+             *gameTime = frame.gameTime;
++        if (flip)
++            *flip = frame.flip;
+         if (eyeIndex == 0)
+             ga2_hitext::setPresented(frame.text);
+         // Convert to opaque RGBA here, on the present thread, straight from the mapped readback buffer.
+@@ -1818,7 +1832,7 @@ namespace ga2_pgs
+     bool stereo() { return false; }
+     bool wideDetail() { return false; }
+     bool waitFreshFrame(int) { return false; }
+-    bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *, double *) { return false; }
++    bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *, double *, uint64_t *) { return false; }
+     bool uiLayer() { return false; }
+     void setTableSplit(bool) {}
+     bool takeUiFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &, bool &) { return false; }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 0763e65..cbfb731 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2_mouse_menus.h"
+ #include "ga2_present.h"
+ #include "ga2_zerocopy.h"
++#include "ga2_nativemap.h"
+ #include "runtime/ga2_vuthread.h"
+ #include "runtime/ga2_framepace.h"
+ #include "runtime/ga2_settings.h"
+@@ -602,6 +603,29 @@ static bool JoinWide(unsigned left, unsigned right, int w, int h, Texture2D &joi
+     return true;
+ }
+ 
++// The desktop's UI layer (ga2_nativemap): the UI layer instance's newest picture, uploaded; 0 when there is none.
++static unsigned DesktopUiTexture()
++{
++    static std::vector<uint8_t> s_ui;
++    static Texture2D s_tex{};
++    uint32_t uw = 0u, uh = 0u;
++    bool uiSplit = false;
++    if (ga2_pgs::uiLayer() && ga2_pgs::takeUiFrame(s_ui, uw, uh, uiSplit) && uw && uh && s_ui.size() >= size_t(uw) * uh * 4u)
++    {
++        if (s_tex.width != int(uw) || s_tex.height != int(uh))
++        {
++            if (s_tex.id)
++                UnloadTexture(s_tex);
++            Image image = GenImageColor(int(uw), int(uh), BLANK);
++            s_tex = LoadTextureFromImage(image);
++            UnloadImage(image);
++            SetTextureFilter(s_tex, TEXTURE_FILTER_BILINEAR);
++        }
++        UpdateTexture(s_tex, s_ui.data());
++    }
++    return s_tex.id;
++}
++
+ // shown: the texture to draw this loop. With zero copy (ga2_zerocopy) it is the GS's shared image, else `tex`.
+ static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+@@ -693,7 +717,8 @@ static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32
+         ga2_stereo::Setup setup;
+         const auto takeStart = std::chrono::steady_clock::now();
+         double gameTime = 0.0;
+-        const bool took = ga2_zerocopy::take(0, id, fw, fh, shared, s_small, sw, sh, setup, &split, &gameTime);
++        uint64_t flip = 0;
++        const bool took = ga2_zerocopy::take(0, id, fw, fh, shared, s_small, sw, sh, setup, &split, &gameTime, &flip);
+         g_presentStats.takeMs += msSince(takeStart);
+         if (took)
+         {
+@@ -727,6 +752,10 @@ static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32
+             s_height = fh;
+             if (ga2_pgs::stereo())
+                 ga2_vr::setEyeFrame(0, shown.id, shown.width, shown.height, float(fw), float(fh), setup, split);
++            else if (const unsigned composed = ga2_nativemap::compose(shown.id, shown.width, shown.height, flip,
++                                                                     DesktopUiTexture(), split);
++                     composed != shown.id)
++                shown = Texture2D{composed, shown.width, shown.height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+             ps2_mouse::setFrame(s_small.data(), sw, sh);
+             // A wide (hor+) picture: eye 0 and the instance beside it, columns interleaved.
+             Texture2D joined{};
+@@ -816,7 +845,8 @@ static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32
+         bool eye0Split = false;
+         const auto takeStart = std::chrono::steady_clock::now();
+         double gameTime = 0.0;
+-        const bool took = ga2_pgs::takeEyeFrame(0, s_pgsFrame, w, h, setup, &eye0Split, &gameTime);
++        uint64_t flip = 0;
++        const bool took = ga2_pgs::takeEyeFrame(0, s_pgsFrame, w, h, setup, &eye0Split, &gameTime, &flip);
+         g_presentStats.takeMs += msSince(takeStart);
+         if (took && w && h && s_pgsFrame.size() >= size_t(w) * h * 4u)
+         {
+@@ -867,6 +897,11 @@ static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32
+                     s_pgsWidth = 2u * w;
+                 }
+             }
++            if (!ga2_pgs::stereo() && !s_joinedShown.id)
++                if (const unsigned composed = ga2_nativemap::compose(tex.id, tex.width, tex.height, flip, DesktopUiTexture(),
++                                                                     eye0Split);
++                    composed != tex.id)
++                    s_joinedShown = Texture2D{composed, tex.width, tex.height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+             ga2_zerocopy::presentShot(s_joinedShown.id ? s_joinedShown.id : tex.id, s_joinedShown.id ? s_joinedShown.width : tex.width,
+                                       s_joinedShown.id ? s_joinedShown.height : tex.height, gameTime);
+         }
+-- 
+2.56.0
+

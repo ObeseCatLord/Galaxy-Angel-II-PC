@@ -31,6 +31,7 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "ga2_hud.h"
+#include "ga2_tablemode.h"
 #include "ga2_vrview.h"
 #include "runtime/ga2_activity.h"
 #include "runtime/ga2_battletable.h"
@@ -345,6 +346,7 @@ namespace
         return unit && word(ram, unit + kDiscs[I].alive) != 0 && int32_t(word(ram, unit + kDiscs[I].hp)) > 0;
     }
 
+
     // GA2_BATTLEPTR_SELFTEST=1: the desktop and hand paths on synthetic
     // cameras. A map point under a pixel (unprojected through the view-
     // projection the icon projector uses) must be what a hand ray aimed at the
@@ -476,6 +478,7 @@ namespace
         float holdX = 0, holdZ = 0;
         uint32_t lastHover[2] = {0, 0};
         int ownerHand = -1;       // the hand that selected the angel now selected
+        uint32_t palmSerial = 0;  // the last palm choice seen (Pose::selectSerial; both start at 0)
         ga2_battletable::State state;
     } g_table;
 
@@ -633,7 +636,7 @@ namespace
         const float q[3] = {o[0] + d[0] * t, pose.center[1], o[2] + d[2] * t};
         float h;
         ga2_battletable::toTable(pose, q, u, v, h);
-        return std::fabs(u) <= pose.halfWidth && std::fabs(v) <= pose.halfDepth;
+        return u * u + v * v <= pose.halfWidth * pose.halfWidth; // the round plate (radius halfWidth)
     }
 
     template <size_t I>
@@ -655,6 +658,7 @@ namespace
         if (!tableFrame<I>(ram, mgr, pose, st))
             return false;
         st.active = true;
+        ga2_tablemode::note();
         ga2_vrpointer::wantTrigger(true);
         const int64_t now = nowNanos();
 
@@ -674,14 +678,19 @@ namespace
                 continue;
             ga2_battletable::Unit &u = st.units[n];
             u.x = flt(ram, unit + D.pos) * 0.001f;
+            u.y = flt(ram, unit + D.pos + 4) * 0.001f;
             u.z = flt(ram, unit + D.pos + 8) * 0.001f;
+            u.id = int(word(ram, unit + kUnitType));
+            u.hp = int(int32_t(word(ram, unit + D.hp)));
             u.sx = ga2_hud::markerX(flt(ram, unit + D.sx), kIconHalfWidth);
             u.sy = flt(ram, unit + D.sx + 4);
             u.focused = unit == word(ram, mapview + 0x28);
             Disc3 &d = discs[n];
             d.unit = unit;
             ga2_battletable::mapToTable(st, u.x, u.z, d.u, d.v);
-            ga2_battletable::toPlay(pose, d.u, d.v, 0.06f, d.p);
+            // Where the table draws the unit's disc (its laid-out height), else the old 6 cm.
+            const float h = ga2_battletable::discHeight(int(word(ram, unit + kUnitType)));
+            ga2_battletable::toPlay(pose, d.u, d.v, h > 0.0f ? h : 0.06f, d.p);
             ++n;
         }
         st.unitCount = n;
@@ -698,7 +707,7 @@ namespace
             ga2_battletable::Unit &u = st.units[k];
             u.enemy = enemyAt(discs[k].unit);
             u.selected = discs[k].unit == selected && selected != 0;
-            u.onPlate = std::fabs(discs[k].u) <= pose.halfWidth * 0.97f && std::fabs(discs[k].v) <= pose.halfDepth * 0.97f;
+            u.onPlate = discs[k].u * discs[k].u + discs[k].v * discs[k].v <= pose.halfWidth * pose.halfWidth * 0.9f * 0.9f;
         }
         static const bool logTypes = std::getenv("GA2_BATTLEPTR_LOG") != nullptr;
         if (logTypes)
@@ -863,6 +872,33 @@ namespace
                 return enemyAt(unit) ? ga2_battletable::DragKind::Attack : ga2_battletable::DragKind::Support;
             return onGround ? ga2_battletable::DragKind::Move : ga2_battletable::DragKind::Invalid;
         };
+
+        // A palm menu's choice (the roster on the left palm, "Stay" on the right): the angel by its section ID, selected
+        // as a press on its disc would; the selected one again is Circle on itself (the game's stay order).
+        if (pose.selectSerial != g_table.palmSerial)
+        {
+            g_table.palmSerial = pose.selectSerial;
+            uint32_t chosen = 0;
+            for (int k = 0; k < n; ++k)
+                if (st.units[k].id == pose.selectUnit && !st.units[k].enemy)
+                    chosen = discs[k].unit;
+            if (chosen && !g_table.pressed && (sub == 0 || sub == 1))
+            {
+                if (sub == 1 && chosen != selected)
+                    press(ga2_battletable::Press::Cross);
+                press(ga2_battletable::Press::Circle);
+                hold(chosen, false, 0, 0, sub == 1 && chosen != selected ? 2 : 1);
+                if (sub == 1 && chosen == selected)
+                {
+                    flash(chosen, 0, 0, ga2_battletable::DragKind::Support);
+                    ++st.orders;
+                }
+                else
+                    ++st.presses;
+                std::fprintf(stderr, "[battleptr] t=%.1f palm: unit id %d (%06x)%s\n", sinceStart(), pose.selectUnit, chosen,
+                             sub == 1 && chosen == selected ? " stays" : " selected");
+            }
+        }
 
         // Press: on an angel select it (BattleGroupVR: the trigger on a unit selects it; on another angel while one is
         // selected, Cross then Circle re-selects); with an angel selected, on an enemy or the ground the press is the
@@ -1050,6 +1086,10 @@ namespace
             st.hudCount = ga2_hud::areas(areas, ga2_battletable::State::kMaxHud);
             for (int k = 0; k < st.hudCount; ++k)
                 st.hud[k] = {areas[k].x0, areas[k].y0, areas[k].x1, areas[k].y1, areas[k].side};
+            ga2_hud::Area items[ga2_battletable::State::kMaxHudItems];
+            st.hudItemCount = ga2_hud::items(items, ga2_battletable::State::kMaxHudItems);
+            for (int k = 0; k < st.hudItemCount; ++k)
+                st.hudItems[k] = {items[k].x0, items[k].y0, items[k].x1, items[k].y1, items[k].side};
         }
         g_pick = Pick{Source::Table, ground, X, Z, gx, gy, best};
         g_table.state = st;
@@ -1792,6 +1832,7 @@ namespace
                     std::fprintf(stderr, "[battleptr] t=%.1f rear view\n", sinceStart());
                 }
             }
+            ga2_vrpointer::setScene(ga2_vrpointer::Scene::Rear); // VR shows the view inside the battle table
             ps2_mouse::BattleState st;
             st.view = ps2_mouse::BattleView::Rear;
             st.buttons = battleButtons<I>(ram);
@@ -1956,10 +1997,36 @@ namespace
         g_original<I, MgrUpdate>(ram, ctx, runtime);
     }
 
+    // ga2_tablemode::collectUnits for this disc.
+    template <size_t I>
+    int collectUnits(const uint8_t *ram, int *ids, float *x, float *z, int max)
+    {
+        const Disc &D = kDiscs[I];
+        const uint32_t mgr = word(ram, D.mgrGlobal);
+        if (!mgr || mgr >= 0x2000000u)
+            return 0;
+        const uint32_t last = D.countField ? word(ram, mgr + D.countField) : 0x4fu;
+        if (D.countField && int32_t(last) < 0)
+            return 0;
+        int n = 0;
+        for (uint32_t i = 0; i <= last && i < 0x100u && n < max; ++i)
+        {
+            const uint32_t unit = unitAt<I>(ram, mgr, i);
+            if (!usable<I>(ram, unit))
+                continue;
+            ids[n] = int(word(ram, unit + kUnitType));
+            x[n] = flt(ram, unit + D.pos);
+            z[n] = flt(ram, unit + D.pos + 8);
+            ++n;
+        }
+        return n;
+    }
+
     template <size_t I>
     void bind(PS2Runtime &runtime)
     {
         const Disc &d = kDiscs[I];
+        ga2_tablemode::collectUnits = collectUnits<I>;
         if (const char *t = std::getenv("GA2_BATTLEPTR_SELFTEST"); t && *t == '1')
             selfTest();
         for (uint32_t address : {d.hover, d.targetHover, d.ground, d.moveAll, d.moveOne, d.mgrUpdate, d.setPosition, d.mapUpdate,

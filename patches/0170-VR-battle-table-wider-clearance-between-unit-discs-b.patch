@@ -1,0 +1,27 @@
+From 2a4c04ab285413db682709adbc152f8ac00f48d7 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:41:22 -0600
+Subject: [PATCH] VR battle table: wider clearance between unit discs (both
+ eyes, hover growth)
+
+---
+ ps2xRuntime/src/lib/ga2_vr.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 65e3193..6942d3b 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1386,7 +1386,8 @@ void main()
+                                 const V3 cj = centre(markers[j]);
+                                 const float dj = length(cj - eye);
+                                 const float cosA = std::clamp(dot(ni, (cj - eye) * (1.0f / dj)), -1.0f, 1.0f);
+-                                const float need = (markers[i].size / di + markers[j].size / dj) * 1.08f;
++                                // A margin for the other eye (laid out from one) and the hovered discs' growth.
++                                const float need = (markers[i].size / di + markers[j].size / dj) * 1.3f;
+                                 worst = std::max(worst, need - std::acos(cosA));
+                             }
+                             if (worst <= 0.0f || markers[i].lift > 0.45f)
+-- 
+2.56.0
+

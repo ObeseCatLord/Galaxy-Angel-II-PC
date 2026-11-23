@@ -118,9 +118,18 @@ namespace
     void bind(PS2Runtime &runtime)
     {
         const char *vr = std::getenv("GA2_VR");
-        if (!vr || std::string(vr) != "1")
-            return;
         const Disc &d = kDiscs[I];
+        if (!vr || std::string(vr) != "1")
+        {
+            // Outside VR only the test aid (view requests) applies.
+            if (!requests().empty() && runtime.hasFunction(d.mgrUpdate))
+            {
+                g_original<I, MgrUpdate> = runtime.lookupFunction(d.mgrUpdate);
+                runtime.replaceFunction(d.mgrUpdate, mgrUpdate<I>);
+                std::cerr << "[ga2 vrscene] " << d.disc << ": view requests bound (GA2_VRSCENE_REQUEST)\n";
+            }
+            return;
+        }
         for (uint32_t address : {d.cockpitUpdate, d.cameraUpdate})
             if (!runtime.hasFunction(address))
             {

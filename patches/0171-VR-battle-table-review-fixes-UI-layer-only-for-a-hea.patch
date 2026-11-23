@@ -1,0 +1,259 @@
+From c94d99a715df9abf0b7ea3164f6182711a969d06 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:51:28 -0600
+Subject: [PATCH] VR battle table review fixes: UI layer only for a headset,
+ discs laid out once from the head and layered without depth writes, scene
+ keyed before the UI layer, stage kept through the other views, discs picked
+ where drawn
+
+---
+ ps2xRuntime/include/runtime/ga2_battletable.h |  4 ++
+ ps2xRuntime/src/lib/battlevr/bvr_ships.cpp    | 12 ++++
+ ps2xRuntime/src/lib/battlevr/bvr_ships.h      |  3 +
+ ps2xRuntime/src/lib/ga2_battletable.cpp       | 19 ++++++
+ ps2xRuntime/src/lib/ga2_vr.cpp                | 62 ++++++++++++++-----
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp             |  3 +-
+ 6 files changed, 88 insertions(+), 15 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_battletable.h b/ps2xRuntime/include/runtime/ga2_battletable.h
+index 09af54c..2416dd9 100644
+--- a/ps2xRuntime/include/runtime/ga2_battletable.h
++++ b/ps2xRuntime/include/runtime/ga2_battletable.h
+@@ -130,4 +130,8 @@ namespace ga2_battletable
+     // ga2_vr.
+     State latest(); // inactive when the game has not published for a while
+     void publishPose(const Pose &pose);
++    // ga2_vr: where each unit's disc centre is drawn (height over the table, metres; the discs are laid out so none
++    // overlaps another), by unit ID; the game thread picks the discs there. -1 when unknown.
++    void publishDiscHeights(const int *unitIds, const float *heights, int count);
++    float discHeight(int unitId);
+ }
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+index b8f045d..4d22d23 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+@@ -270,6 +270,18 @@ namespace bvr_ships
+         ++l.generation;
+     }
+ 
++    bool stageFits(const std::vector<int> &unitIds)
++    {
++        Loader &l = loader();
++        std::lock_guard<std::mutex> lock(l.mutex);
++        if (l.stage < 0)
++            return true;
++        for (int id : unitIds)
++            if (!l.stages[size_t(l.stage)].unit(id))
++                return false;
++        return true;
++    }
++
+     std::string stage()
+     {
+         Loader &l = loader();
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.h b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+index e95cd5d..70b7756 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_ships.h
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+@@ -47,6 +47,9 @@ namespace bvr_ships
+     // Identifies the stage from the units (sticks until reset()); true when known.
+     bool identify(const std::vector<SeenUnit> &units);
+     void reset();       // a new battle
++    // Whether every unit ID exists in the identified stage (true when none is identified): a unit the stage does not
++    // have means another battle.
++    bool stageFits(const std::vector<int> &unitIds);
+     std::string stage(); // the identified stage's path, or empty
+     // The ship of a unit ID of the identified stage: null while it loads (it is queued on the first call) or when
+     // the unit has no model.
+diff --git a/ps2xRuntime/src/lib/ga2_battletable.cpp b/ps2xRuntime/src/lib/ga2_battletable.cpp
+index 3f28288..3bf8db0 100644
+--- a/ps2xRuntime/src/lib/ga2_battletable.cpp
++++ b/ps2xRuntime/src/lib/ga2_battletable.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <chrono>
+ #include <cmath>
++#include <map>
+ #include <mutex>
+ 
+ namespace ga2_battletable
+@@ -90,4 +91,22 @@ namespace ga2_battletable
+         std::lock_guard<std::mutex> lock(g_mutex);
+         g_pose = pose;
+     }
++
++    namespace
++    {
++        std::map<int, float> g_discHeights;
++    }
++    void publishDiscHeights(const int *unitIds, const float *heights, int count)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_discHeights.clear();
++        for (int i = 0; i < count; ++i)
++            g_discHeights[unitIds[i]] = heights[i];
++    }
++    float discHeight(int unitId)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        const auto it = g_discHeights.find(unitId);
++        return it == g_discHeights.end() ? -1.0f : it->second;
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 6942d3b..ce09ffc 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -597,7 +597,10 @@ void main()
+     float hud = 1.0;
+     for (int i = 0; i < 8; ++i)
+         hud *= 1.0 - box(v_uv, masks[i], 0.01);
+-    vec3 map = texture(tex, clamp(v_uv, 0.0, 1.0) * extent).rgb;
++    // The scene keyed by brightness: the game's dim nebula background goes (the real sky is around the table), its
++    // grid and objects stay. Then the UI layer (zones, order lines) over it with its own alpha, not keyed.
++    vec3 scene = texture(tex, clamp(v_uv, 0.0, 1.0) * extent).rgb * 1.15;
++    vec3 map = scene * smoothstep(0.22, 0.45, dot(scene, vec3(0.299, 0.587, 0.114)));
+     if (hasUi != 0)
+     {
+         vec4 u = texture(ui, clamp(v_uv, 0.0, 1.0));
+@@ -605,21 +608,17 @@ void main()
+         for (int i = 0; i < iconCount; ++i)
+             keep *= smoothstep(0.85, 1.0, length((v_uv - icons[i].xy) / icons[i].zw));
+         float ua = clamp(u.a * (255.0 / 128.0), 0.0, 1.0) * keep;
+-        map = map * (1.0 - ua) + u.rgb * keep;
++        map = map * (1.0 - ua) + u.rgb * keep * 1.15;
+     }
+     else
+         pic *= hud;
+-    map *= 1.15;
+     // A hologram, not a screen: the map is light added over the battle's own sky (its dim background drops out, the
+     // grid, zones and objects glow), a faint glass tint, a faint scan line drifting across, all fading out toward
+     // the rim (BattleGroupVR's table).
+     float fade = 1.0 - smoothstep(0.70, 1.0, edge);
+     float scan = 0.5 + 0.5 * sin((v_aux.y * 0.5 + 0.5 - fract(time * 0.12)) * 60.0);
+     float scanLine = smoothstep(0.985, 1.0, scan) * 0.05;
+-    // Keyed by brightness: the game's dim nebula background goes (the real sky is around the table), the grid,
+-    // zones, order lines and objects stay.
+-    float luma = dot(map, vec3(0.299, 0.587, 0.114));
+-    vec3 holo = map * smoothstep(0.22, 0.45, luma) * 1.2;
++    vec3 holo = map * 1.2;
+     float ring = smoothstep(0.80, 0.86, edge) * (1.0 - smoothstep(0.86, 0.95, edge)) * 0.25;
+     vec3 col = (holo * pic + vec3(0.05, 0.12, 0.22) * 0.2 + vec3(0.25, 0.6, 1.0) * (scanLine + ring)) * fade;
+     float a = 0.12 * fade; // the glass dims what is behind it a little
+@@ -931,6 +930,10 @@ void main()
+             drawHandMesh(viewProj, eye, aimPose, nullptr, left, point, fist, grabbing, strength);
+         }
+ 
++        // The head between the eyes this frame and the frame's count (the unit discs' layout is shared by both eyes).
++        V3 g_layoutHead{0, 0, 0};
++        uint64_t g_layoutFrame = 0;
++
+         // The UI layer's image while the frames are split (defined with the HUD panel below).
+         GLuint tableUiTexture();
+ 
+@@ -1181,10 +1184,17 @@ void main()
+             if (!on)
+                 return;
+             bvr_ships::start();
+-            if (g_shipGl.lastActive >= 0.0 && time - g_shipGl.lastActive > 1.0)
++            // A new battle: a unit the identified stage does not have, or the table away for minutes (the other views,
++            // pauses and cut-ins of one battle keep the stage, which could not be identified again mid-battle).
+             {
+-                bvr_ships::reset(); // the table was away: a new battle
+-                g_shipGl.headings.clear();
++                std::vector<int> ids;
++                for (int n = 0; n < st.unitCount; ++n)
++                    ids.push_back(st.units[n].id);
++                if ((g_shipGl.lastActive >= 0.0 && time - g_shipGl.lastActive > 300.0) || !bvr_ships::stageFits(ids))
++                {
++                    bvr_ships::reset();
++                    g_shipGl.headings.clear();
++                }
+             }
+             g_shipGl.lastActive = time;
+             if (bvr_ships::stage().empty())
+@@ -1361,16 +1371,18 @@ void main()
+                 m.tint = unit.selected ? V3{1.0f, 0.78f, 0.25f} : unit.enemy ? V3{1.0f, 0.35f, 0.2f} : V3{0.3f, 0.7f, 1.0f};
+                 m.dist = length(playPoint(pose, u, v, m.lift) - eye);
+             }
++            const V3 eyeIn = eye;
+             // Layout as the player sees it: nearest first keep their height; a disc whose circle would overlap one
+             // already placed (their angular radii as seen from the eye) rises until it is clear, so every disc is its
+             // own layer. Laid out once per frame (the first eye) and reused for the other, so both eyes agree.
+             std::sort(markers, markers + markerCount, [](const Marker &a, const Marker &b) { return a.dist < b.dist; });
+             {
+-                static double layoutTime = -1.0;
++                static uint64_t layoutFrame = ~0ull;
+                 static std::map<int, float> layoutLift; // unit index -> lift
+-                if (time != layoutTime)
++                const V3 eye = g_layoutFrame ? g_layoutHead : eyeIn; // laid out from the head, not from one eye
++                if (g_layoutFrame != layoutFrame || !g_layoutFrame)
+                 {
+-                    layoutTime = time;
++                    layoutFrame = g_layoutFrame;
+                     layoutLift.clear();
+                     auto centre = [&](const Marker &m) { return playPoint(pose, m.u, m.v, m.lift) + V3{0, m.size, 0}; };
+                     for (int i = 0; i < markerCount; ++i)
+@@ -1401,6 +1413,12 @@ void main()
+                     for (int i = 0; i < markerCount; ++i)
+                         if (const auto it = layoutLift.find(markers[i].n); it != layoutLift.end())
+                             markers[i].lift = it->second;
++                // The game thread picks the discs where they are drawn (their centres).
++                int ids[ga2_battletable::kMaxUnits];
++                float heights[ga2_battletable::kMaxUnits];
++                for (int i = 0; i < markerCount; ++i)
++                    ids[i] = st.units[markers[i].n].id, heights[i] = markers[i].lift + markers[i].size;
++                ga2_battletable::publishDiscHeights(ids, heights, markerCount);
+             }
+             glBlendFunc(GL_ONE, GL_ONE);
+             for (int i = 0; i < markerCount; ++i)
+@@ -1421,8 +1439,10 @@ void main()
+             setMatrix(g_tableGl.icon, "mvp", viewProj);
+             glUniform2f(glGetUniformLocation(g_tableGl.icon, "extent"), extentX, extentY);
+             bindTableUi(g_tableGl.icon);
++            // Depth-tested against the ships, but not written: the discs are layered far to near, each whole over the
++            // ones behind it, never cutting through one another.
+             glEnable(GL_DEPTH_TEST);
+-            glDepthMask(GL_TRUE);
++            glDepthMask(GL_FALSE);
+             const GLint locSrc = glGetUniformLocation(g_tableGl.icon, "src"), locTint = glGetUniformLocation(g_tableGl.icon, "tint");
+             const GLint locGlow = glGetUniformLocation(g_tableGl.icon, "glow");
+             for (int i = markerCount - 1; i >= 0; --i)
+@@ -3474,6 +3494,20 @@ void main()
+                 else
+                     ga2_stereo::clear();
+                 projected.resize(viewCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
++                // This frame's head (between the eyes): the table lays its unit discs out once from here, for both eyes.
++                {
++                    V3 sum{0, 0, 0};
++                    for (uint32_t v = 0; v < viewCount; ++v)
++                    {
++                        const XrPosef &p = views[v].pose;
++                        const M4 e = mul(world, pose(Q{p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w},
++                                                     V3{p.position.x, p.position.y, p.position.z}));
++                        sum = sum + V3{e.m[12], e.m[13], e.m[14]};
++                    }
++                    if (viewCount)
++                        g_layoutHead = sum * (1.0f / float(viewCount));
++                    ++g_layoutFrame;
++                }
+                 for (uint32_t v = 0; v < viewCount && v < g_xr.eyes.size(); ++v)
+                 {
+                     auto &eye = g_xr.eyes[v];
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 40d4518..bdf05e2 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -664,7 +664,8 @@ namespace
+         // EE-thread time per vsync. GA2_VR_HUD_PANEL=0: no UI layer (the table cuts the HUD out of the picture).
+         s.hudDebug = envInt("GA2_VR_HUD_DEBUG", 0) == 1;
+         s.uiPanelStereo = envInt("GA2_VR_HUD_PANEL", -1) == 1;
+-        if ((s.eyeCount == 2 && envInt("GA2_VR_HUD_PANEL", -1) != 0) || s.hudDebug)
++        // (Only for a headset's two eyes: widescreen detail also runs two instances, and needs no UI layer.)
++        if ((s.eyeCount == 2 && !s.wideDetail && envInt("GA2_VR_HUD_PANEL", -1) != 0) || s.hudDebug)
+         {
+             GSOptions uiOptions = eyeOptions;
+             const int u = envInt("GA2_VR_HUD_SSAA", 1);
+-- 
+2.56.0
+

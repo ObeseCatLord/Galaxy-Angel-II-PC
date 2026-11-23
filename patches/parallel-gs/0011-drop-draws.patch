@@ -1,0 +1,43 @@
+From 5cbe76c3e1dc5150744f256e35688701122e6efc Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 20:58:34 -0600
+Subject: [PATCH] Hacks: drop_draws (an instance keeps its state but draws
+ nothing, for an eye nobody looks at)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gs/gs_interface.cpp | 2 +-
+ gs/gs_interface.hpp | 4 ++++
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 8ab9270..f05b686 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -2971,7 +2971,7 @@ void GSInterface::drawing_kick_primitive(bool adc)
+ 
+ 	if (!adc)
+ 	{
+-		if (!draw_is_degenerate() && !kick_is_filtered() && !ui_layer_filtered(num_vertices))
++		if (!hacks.drop_draws && !draw_is_degenerate() && !kick_is_filtered() && !ui_layer_filtered(num_vertices))
+ 			drawing_kick_append<list_primitive, fan_primitive, quad, num_vertices>();
+ 		else
+ 			TRACE("Degenerate Draw", DummyBits{});
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index 21abd08..42d2e10 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -243,6 +243,10 @@ struct Hacks
+ 	uint32_t ui_layer = 0;
+ 	bool ui_layer_active = false;
+ 
++	// [vrhud] An instance whose picture nobody looks at for now (the second eye while a VR host shows one picture):
++	// it keeps every register, upload and transfer, but draws no primitives, so it can take over at the next frame.
++	bool drop_draws = false;
++
+ 	// Replacement images cover exactly the cached region (TextureDescriptor::rect) instead of the whole PS2 texture.
+ 	// Textures are often declared larger than their art, so the region is what a host can identify stably.
+ 	bool replacements_cover_rect = false;
+-- 
+2.56.0
+

@@ -1,0 +1,308 @@
+From b4e32bebd184b96bc9a7784ca50d5631c7e4661c Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:02:24 -0600
+Subject: [PATCH 189/191] IOP interpreter: one instruction read, RAM accesses
+ inline, no calls for work that is not there
+
+Per interpreted instruction the emulator read the instruction twice through an out-of-line IopMemory::read32 that
+tests three device ranges before RAM (once for the import-stub check, once to execute), called takeDmaStart (an
+optional copied and reset), synchronizeSpu and the PC sampler. Same results, less work:
+
+- IopMemory::read8/16/32 and write8/16/32 answer RAM inline; the general functions (now *Slow) take the rest. No
+  device range lies inside RAM, so asking for RAM first cannot change an answer.
+- step() reads the instruction once and passes it to IopCpuCore::executeInstruction(cpu, instruction); the import
+  registry is asked only for `jr ra`, the first word of every import stub.
+- schedulePendingDma returns at once unless a register write started a DMA (IopMemory::hasDmaStart).
+- synchronizeSpu's between-samples test is inline, the rest out of line; the PC sampler's switch is read once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/core/iop_cpu.cpp    |  6 +-
+ ps2xIOP/src/emulator/core/iop_cpu.h      |  3 +
+ ps2xIOP/src/emulator/core/iop_memory.cpp | 12 ++--
+ ps2xIOP/src/emulator/core/iop_memory.h   | 78 ++++++++++++++++++++++--
+ ps2xIOP/src/emulator/iop_emulator.cpp    | 41 +++++++++----
+ 5 files changed, 115 insertions(+), 25 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/core/iop_cpu.cpp b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+index e09642e..4b7670d 100644
+--- a/ps2xIOP/src/emulator/core/iop_cpu.cpp
++++ b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+@@ -53,9 +53,13 @@ namespace ps2x::iop::detail
+     }
+ 
+     bool IopCpuCore::executeInstruction(IopCpuState &cpu)
++    {
++        return executeInstruction(cpu, m_memory.read32(cpu.pc));
++    }
++
++    bool IopCpuCore::executeInstruction(IopCpuState &cpu, const uint32_t instruction)
+     {
+         const uint32_t pc = cpu.pc;
+-        const uint32_t instruction = m_memory.read32(pc);
+         const bool wasDelaySlot = cpu.branchPending;
+         const uint32_t priorBranchTarget = cpu.branchTarget;
+ 
+diff --git a/ps2xIOP/src/emulator/core/iop_cpu.h b/ps2xIOP/src/emulator/core/iop_cpu.h
+index af37e39..e08dfd0 100644
+--- a/ps2xIOP/src/emulator/core/iop_cpu.h
++++ b/ps2xIOP/src/emulator/core/iop_cpu.h
+@@ -33,6 +33,9 @@ namespace ps2x::iop::detail
+         explicit IopCpuCore(IopMemory &memory) noexcept;
+ 
+         [[nodiscard]] bool executeInstruction(IopCpuState &cpu);
++        // The same with the instruction word already read from cpu.pc (the emulator's step reads it once for the
++        // import check and for this).
++        [[nodiscard]] bool executeInstruction(IopCpuState &cpu, uint32_t instruction);
+         void raiseException(IopCpuState &cpu, uint32_t code, uint32_t faultPc, bool delaySlot, std::optional<uint32_t> badAddress = std::nullopt) const;
+ 
+     private:
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 2119d8c..b3a9492 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -114,7 +114,7 @@ namespace ps2x::iop::detail
+         m_cdvdSubcommandWriter = std::move(writer);
+     }
+ 
+-    uint8_t IopMemory::read8(uint32_t address) const
++    uint8_t IopMemory::read8Slow(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
+@@ -129,7 +129,7 @@ namespace ps2x::iop::detail
+         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
+     }
+ 
+-    uint16_t IopMemory::read16(uint32_t address) const
++    uint16_t IopMemory::read16Slow(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
+@@ -150,7 +150,7 @@ namespace ps2x::iop::detail
+         return static_cast<uint16_t>(low | (uint16_t(high) << 8u));
+     }
+ 
+-    uint32_t IopMemory::read32(uint32_t address) const
++    uint32_t IopMemory::read32Slow(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
+@@ -191,7 +191,7 @@ namespace ps2x::iop::detail
+                (static_cast<uint32_t>(read8(address + 3u)) << 24u);
+     }
+ 
+-    void IopMemory::write8(uint32_t address, uint8_t value)
++    void IopMemory::write8Slow(uint32_t address, uint8_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
+@@ -219,7 +219,7 @@ namespace ps2x::iop::detail
+         writeHardware32(aligned, current);
+     }
+ 
+-    void IopMemory::write16(uint32_t address, uint16_t value)
++    void IopMemory::write16Slow(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
+@@ -247,7 +247,7 @@ namespace ps2x::iop::detail
+         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
+     }
+ 
+-    void IopMemory::write32(uint32_t address, uint32_t value)
++    void IopMemory::write32Slow(uint32_t address, uint32_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index ed54040..cb93861 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -6,6 +6,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <functional>
+ #include <optional>
+ #include <span>
+@@ -61,12 +62,75 @@ namespace ps2x::iop::detail
+ 
+         void reset();
+ 
+-        [[nodiscard]] uint8_t read8(uint32_t address) const;
+-        [[nodiscard]] uint16_t read16(uint32_t address) const;
+-        [[nodiscard]] uint32_t read32(uint32_t address) const;
+-        void write8(uint32_t address, uint8_t value);
+-        void write16(uint32_t address, uint16_t value);
+-        void write32(uint32_t address, uint32_t value);
++        // RAM (any KSEG alias) is answered here; everything else, and unaligned words, by the general *Slow functions.
++        // No device range lies inside RAM, so asking for RAM first gives the same answers; the interpreter makes
++        // one or two of these calls per instruction.
++        [[nodiscard]] uint8_t read8(uint32_t address) const
++        {
++            const uint32_t phys = address & 0x1FFFFFFFu;
++            return phys < RamSize ? m_ram[phys] : read8Slow(address);
++        }
++        [[nodiscard]] uint16_t read16(uint32_t address) const
++        {
++            const uint32_t phys = address & 0x1FFFFFFFu;
++            if (phys < RamSize - 1u)
++            {
++                uint16_t value;
++                std::memcpy(&value, m_ram.data() + phys, sizeof(value));
++                return value;
++            }
++            return read16Slow(address);
++        }
++        [[nodiscard]] uint32_t read32(uint32_t address) const
++        {
++            const uint32_t phys = address & 0x1FFFFFFFu;
++            if ((phys & 3u) == 0u && phys < RamSize)
++            {
++                uint32_t value;
++                std::memcpy(&value, m_ram.data() + phys, sizeof(value));
++                return value;
++            }
++            return read32Slow(address);
++        }
++        void write8(uint32_t address, uint8_t value)
++        {
++            const uint32_t phys = address & 0x1FFFFFFFu;
++            if (phys < RamSize)
++            {
++                m_ram[phys] = value;
++                m_owned[phys] = 1u;
++                return;
++            }
++            write8Slow(address, value);
++        }
++        void write16(uint32_t address, uint16_t value)
++        {
++            const uint32_t phys = address & 0x1FFFFFFFu;
++            if (phys < RamSize - 1u)
++            {
++                std::memcpy(m_ram.data() + phys, &value, sizeof(value));
++                std::memset(m_owned.data() + phys, 1, sizeof(value));
++                return;
++            }
++            write16Slow(address, value);
++        }
++        void write32(uint32_t address, uint32_t value)
++        {
++            const uint32_t phys = address & 0x1FFFFFFFu;
++            if ((phys & 3u) == 0u && phys < RamSize)
++            {
++                std::memcpy(m_ram.data() + phys, &value, sizeof(value));
++                std::memset(m_owned.data() + phys, 1, sizeof(value));
++                return;
++            }
++            write32Slow(address, value);
++        }
++        [[nodiscard]] uint8_t read8Slow(uint32_t address) const;
++        [[nodiscard]] uint16_t read16Slow(uint32_t address) const;
++        [[nodiscard]] uint32_t read32Slow(uint32_t address) const;
++        void write8Slow(uint32_t address, uint8_t value);
++        void write16Slow(uint32_t address, uint16_t value);
++        void write32Slow(uint32_t address, uint32_t value);
+ 
+         [[nodiscard]] bool readRam(uint32_t address, void *destination, size_t size) const;
+         [[nodiscard]] bool writeRam(uint32_t address, const void *source, size_t size);
+@@ -98,6 +162,8 @@ namespace ps2x::iop::detail
+         void setInterruptMask(uint32_t value) noexcept { m_interruptMask = value; }
+         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
+ 
++        // A register write started a DMA that takeDmaStart has not collected yet.
++        [[nodiscard]] bool hasDmaStart() const noexcept { return m_dmaStart.has_value(); }
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+         // Serialized IOP owner supplies both lifetime and authoritative time.
+         // `failed` reports an emulator-level fault (the device is unusable);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index f46f7ea..5a169d5 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -247,6 +247,8 @@ namespace ps2x::iop::detail
+ 
+         void schedulePendingDma()
+         {
++            if (!memory.hasDmaStart())
++                return; // nearly always: this runs after every interpreted instruction
+             try
+             {
+                 if (const auto dma = memory.takeDmaStart())
+@@ -303,13 +305,21 @@ namespace ps2x::iop::detail
+                 });
+         }
+ 
++        // Between samples with no AutoDMA completion waiting, the full path would neither advance the SPU nor take a
++        // completion: return at once (this runs after every interpreted IOP instruction, so the test is inline and
++        // the rest is not).
+         void synchronizeSpu(bool access = false)
+         {
+-            if (!access && !spu) return;
+-            // Between samples with no AutoDMA completion waiting, the full path below would neither advance the SPU nor
+-            // take a completion: return at once (this runs after every interpreted IOP instruction).
+-            if (!access && totalCycles < spuNextSample && !ga2::spu::autoDmaCompletionPending() && !resetRequired && !syncingSpu)
++            if (!access && (!spu || (totalCycles < spuNextSample && !ga2::spu::autoDmaCompletionPending() && !resetRequired && !syncingSpu)))
+                 return;
++            synchronizeSpuNow(access);
++        }
++
++#if defined(__GNUC__) || defined(__clang__)
++        __attribute__((noinline))
++#endif
++        void synchronizeSpuNow(bool access)
++        {
+             if (resetRequired || syncingSpu)
+             { markResetRequired(__LINE__); throw std::runtime_error("SPU access outside quiescent IOP execution"); }
+             syncingSpu = true;
+@@ -681,7 +691,10 @@ namespace ps2x::iop::detail
+             if (checkInterrupt(cpu))
+                 return true;
+ 
+-            if (const auto import = imports.decode(cpu.pc))
++            // One read serves the import check and the interpreter. An import stub starts with `jr ra` (decode looks
++            // at the rest); nothing else can be one.
++            const uint32_t instruction = memory.read32(cpu.pc);
++            if (const auto import = instruction == 0x03E00008u ? imports.decode(cpu.pc) : std::nullopt)
+             {
+                 // A checked call charges the import before nested execution;
+                 // suspended import frames cannot add counters after deadline.
+@@ -697,7 +710,7 @@ namespace ps2x::iop::detail
+                 return !cpu.stopped;
+             }
+ 
+-            const bool running = cpuCore.executeInstruction(cpu);
++            const bool running = cpuCore.executeInstruction(cpu, instruction);
+             if (cpu.exception && (cpu.cop0[13] & 0x7Cu) != 0u)
+             {
+                 // A synchronous CPU exception has no kernel handler here (the
+@@ -723,14 +736,18 @@ namespace ps2x::iop::detail
+ 
+         // GA2_IOP_PC_SAMPLE=1 (diagnostics): every 1024th interpreted instruction's address is counted (in 64-byte
+         // blocks) and the hottest blocks are logged every 5 s of host time.
++        static inline const bool s_pcSample = [] {
++            const char *v = std::getenv("GA2_IOP_PC_SAMPLE");
++            return v && *v == '1';
++        }();
+         void samplePc(uint32_t pc)
+         {
+-            static const bool on = [] {
+-                const char *v = std::getenv("GA2_IOP_PC_SAMPLE");
+-                return v && *v == '1';
+-            }();
+-            if (!on || (totalInstructions & 1023u) != 0u)
+-                return;
++            if (s_pcSample && (totalInstructions & 1023u) == 0u)
++                samplePcNow(pc);
++        }
++
++        void samplePcNow(uint32_t pc)
++        {
+             static std::unordered_map<uint32_t, uint32_t> blocks;
+             static auto last = std::chrono::steady_clock::now();
+             static uint64_t lastInstructions = 0;
+-- 
+2.56.0
+

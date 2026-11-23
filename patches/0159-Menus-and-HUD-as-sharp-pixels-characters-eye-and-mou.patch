@@ -1,0 +1,369 @@
+From 2b8c3cb900b44d99f43c7ede8b358a7650e3aead Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:34:42 -0600
+Subject: [PATCH 159/171] Menus and HUD as sharp pixels, characters' eye and
+ mouth frames upscaled, untextured fills super-sampled
+
+---
+ ps2xRuntime/include/runtime/ga2_options.h |  5 ++
+ ps2xRuntime/src/lib/ga2_present.cpp       |  4 +-
+ ps2xRuntime/src/lib/gs/ga2_uiart.h        | 59 ++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp         |  3 +
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp    | 73 +++++++++++++++++------
+ ps2xRuntime/src/lib/gs/gs_texpacks.h      |  4 +-
+ ps2xTest/src/ga2_flatart_tests.cpp        | 33 ++++++++++
+ 7 files changed, 161 insertions(+), 20 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/gs/ga2_uiart.h
+
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index c20bc66..b55fdd6 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -35,6 +35,7 @@ namespace ga2_options
+         Dither,
+         Deband,
+         HdBattle,
++        UiUpscale,
+         Buttons,
+         SharpText,
+         Vr,
+@@ -118,6 +119,10 @@ namespace ga2_options
+              "At 2x resolution and up, the battle's rings, arrows, stars, clock digits and icons are redrawn as sharp "
+              "shapes, and its panels and portraits upscaled. Off: the original pictures.",
+              "GA2_HD_BATTLE", Apply::Live, {{"1", "On"}, {"0", "Off (original)"}}},
++            {"ui_upscale", "Menus and HUD",
++             "How the menus, windows and battle HUD are enlarged at 2x and 4x. Sharp pixels: the original pixels, crisp. "
++             "Anime4K: smoothed like the characters and backgrounds.",
++             "GA2_UI_UPSCALE", Apply::Live, {{"sharp", "Sharp pixels"}, {"anime4k", "Anime4K"}}},
+             {"buttons", "Button prompts", "Which button icons the games show: follows the controller or keyboard you use.",
+              "GA2_BUTTONS", Apply::Live, {{"auto", "Automatic"}, {"playstation", "PlayStation"}, {"xbox", "Xbox"}, {"keyboard", "Keyboard"}}},
+             {"sharp_text", "Sharp text",
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index 3e54a8c..108299d 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -48,6 +48,7 @@ namespace ga2_present
+             Sides sides = Sides::Black;
+             Filter filter = Filter::Bilinear;
+             bool hdBattle = true; // the battle HUD upscaled (ga2_layers), whatever the 2D filter
++            bool uiSharp = true;  // the interface's upscaled pictures as sharp pixels (else Anime4K)
+             std::string skybox;
+             bool english = false;
+             bool integer2d = false; // 2D scenes at whole multiples of 640x448
+@@ -74,6 +75,7 @@ namespace ga2_present
+             s.skybox = env("GA2_SKYBOX", "");
+             s.filter = filterFor(ga2_settings::value(ga2_options::Filter));
+             s.hdBattle = std::string(ga2_settings::value(ga2_options::HdBattle)) != "0";
++            s.uiSharp = std::string(ga2_settings::value(ga2_options::UiUpscale)) != "anime4k";
+             s.english = std::string(ga2_settings::value(ga2_options::Language)) == "en";
+             s.integer2d = std::string(ga2_settings::value(ga2_options::Scale2d)) == "integer";
+             // By value (the menu lists Low first: it is the default).
+@@ -1329,7 +1331,7 @@ namespace ga2_present
+         const int frameScale = frame.height / 448;
+         if (g_ready && sizesMatch && frame.width % 640 == 0 && frame.height % 448 == 0)
+             ga2_layers::setEnabled(layersAllowed && anime4k && frameScale >= 2, layersAllowed && s.hdBattle && frameScale >= 2,
+-                                   frameScale);
++                                   frameScale, s.uiSharp);
+         if (g_ready && ga2_layers::enabled())
+             processLayerJobs(s.filter == Filter::Anime4KHQ);
+         // Native text: the GS's rendering of the port's text taken out of a 2D picture rendered above 640x448; it is
+diff --git a/ps2xRuntime/src/lib/gs/ga2_uiart.h b/ps2xRuntime/src/lib/gs/ga2_uiart.h
+new file mode 100644
+index 0000000..d1a63e3
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/ga2_uiart.h
+@@ -0,0 +1,59 @@
++// Which 2D textures are pictures (character sprites and their eye and mouth frames, portraits, backgrounds, event
++// pictures) and which are the interface (panels, frames, window pieces, buttons, ornaments, the battle HUD).
++// Per-layer upscaling (gs_texpacks.cpp) gives pictures to Anime4K and draws the interface as sharp pixels.
++//
++// The rule, measured on the story scenes' textures (Eigou 1): every piece of a character carries skin (5 to 80 % of
++// its opaque pixels: a body sprite at least 5 %, an eye or mouth frame 30 % and more); no interface piece does (at
++// most 2 %: blue panels, grey window parts, white wings). Full-screen pictures (backgrounds and event pictures, some
++// without anyone in them) count as pictures by their size.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace ga2_uiart
++{
++    // A warm, moderately saturated, bright colour with red > green > blue (hue under 50 degrees).
++    inline bool skin(uint32_t c)
++    {
++        const int r = int(c & 0xFFu), g = int((c >> 8) & 0xFFu), b = int((c >> 16) & 0xFFu);
++        if (!(r > g && g > b))
++            return false;
++        const int range = r - b; // max - min
++        // saturation range / r in (0.12, 0.6), value r / 255 > 0.55, hue 60 * (g - b) / range < 50
++        return range * 100 > r * 12 && range * 10 < r * 6 && r * 100 > 255 * 55 && (g - b) * 60 < range * 50;
++    }
++
++    // rgba: w x h texels 0xAABBGGRR, alpha 255 = opaque.
++    inline bool isPicture(const uint32_t *rgba, int w, int h)
++    {
++        if (w >= 512 && h >= 400)
++            return true;
++        size_t opaque = 0, warm = 0;
++        const size_t n = size_t(w) * size_t(h);
++        for (size_t i = 0; i < n; ++i)
++        {
++            if ((rgba[i] >> 24) < 128u)
++                continue;
++            ++opaque;
++            warm += skin(rgba[i]) ? 1u : 0u;
++        }
++        return opaque >= 16 && warm * 100 >= opaque * 3;
++    }
++
++    // Each texel repeated scale x scale times (the interface's own pixels at the internal resolution).
++    inline void sharpPixels(const uint32_t *rgba, int w, int h, int scale, uint32_t *out)
++    {
++        const size_t outW = size_t(w) * size_t(scale);
++        for (int y = 0; y < h; ++y)
++        {
++            uint32_t *row = out + size_t(y) * size_t(scale) * outW;
++            for (int x = 0; x < w; ++x)
++                for (int k = 0; k < scale; ++k)
++                    row[size_t(x) * size_t(scale) + size_t(k)] = rgba[size_t(y) * size_t(w) + size_t(x)];
++            for (int k = 1; k < scale; ++k)
++                for (size_t i = 0; i < outW; ++i)
++                    row[size_t(k) * outW + i] = row[i];
++        }
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 2cb47f1..973d343 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -678,6 +678,9 @@ namespace
+         Hacks hacks = {};
+         hacks.disable_dither = envInt("GA2_PGS_DITHER", 0) == 0;
+         hacks.replacements_cover_rect = true; // gs_texpacks identifies and replaces cached regions
++        // Screen-space fills without a texture (the battle map's zones, order beams, gauge bars) are super-sampled,
++        // not drawn at the PS2's resolution on the snapped UI path: smooth edges at 2x and 4x. GA2_PGS_SSAA_FLAT=0: off.
++        hacks.ssaa_untextured_flat = envInt("GA2_PGS_SSAA_FLAT", 1) != 0;
+         for (uint32_t e = 0; e < s.instanceCount(); ++e)
+         {
+             Eye &eye = s.instance(e);
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 69fdcdf..6bc2218 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -7,6 +7,7 @@
+ // pack folder replaces the region, at any resolution.
+ #include "gs_texpacks.h"
+ #include "ga2_flatart.h"
++#include "ga2_uiart.h"
+ #include "runtime/ga2_hitext.h"
+ #include "runtime/ga2_text_icons.h"
+ #include "runtime/ga2_activity.h"
+@@ -65,7 +66,7 @@ namespace ga2_layers
+ {
+     namespace
+     {
+-        std::atomic<bool> g_on{false}, g_on2d{false}, g_onHud{false};
++        std::atomic<bool> g_on{false}, g_on2d{false}, g_onHud{false}, g_uiSharp{true};
+         std::atomic<int> g_scale{4};
+         std::atomic<bool> g_changedLayers{false};
+         std::mutex g_layerMutex;
+@@ -140,13 +141,24 @@ namespace ga2_layers
+         }
+     }
+ 
+-    void setEnabled(bool scenes2d, bool hud, int scale)
++    void setEnabled(bool scenes2d, bool hud, int scale, bool uiSharp)
+     {
+         scale = scale >= 4 ? 4 : 2;
++        if (g_uiSharp.exchange(uiSharp) != uiSharp)
++        {
++            // The interface's images change (sharp pixels or Anime4K): the CPU copies go.
++            std::lock_guard<std::mutex> lock(g_layerMutex);
++            g_results.clear();
++            g_resultOrder.clear();
++            g_resultBytes = 0;
++            g_failed.clear();
++            g_changedLayers = true;
++        }
+         if (g_on2d.exchange(scenes2d) != scenes2d || g_onHud.exchange(hud) != hud || g_scale.exchange(scale) != scale)
+             g_changedLayers = true;
+         g_on = scenes2d || hud;
+     }
++    bool uiSharp() { return g_uiSharp.load(); }
+     bool enabled() { return g_on.load(); }
+     bool enabled2d() { return g_on2d.load(); }
+     bool enabledHud() { return g_onHud.load(); }
+@@ -264,6 +276,17 @@ namespace ga2_layers
+             if (g_queued.count(hash) || g_failed.count(hash))
+                 return nullptr;
+         }
++        // The texture's RGBA (alpha 255 = opaque), made once for the decisions below.
++        std::vector<uint32_t> rgba;
++        const auto rgba255 = [&]() -> const std::vector<uint32_t> & {
++            if (rgba.empty())
++            {
++                rgba = pixels();
++                for (uint32_t &c : rgba)
++                    c = (c & 0x00FFFFFFu) | (std::min<uint32_t>(255u, (c >> 24) * 2u) << 24);
++            }
++            return rgba;
++        };
+         // Flat-coloured art (rings, discs, arrows, stars, digits, icons, up to 128 pixels) is redrawn as shapes
+         // (ga2_flatart.h) on a worker, quickly enough not to be kept on disk; the rest goes to Anime4K.
+         // GA2_FLAT_ART=0: Anime4K for all.
+@@ -273,11 +296,8 @@ namespace ga2_layers
+         }();
+         if (flatOn && w <= uint32_t(ga2_flatart::kMaxSize) && h <= uint32_t(ga2_flatart::kMaxSize))
+         {
+-            std::vector<uint32_t> rgba = pixels();
+-            for (uint32_t &c : rgba)
+-                c = (c & 0x00FFFFFFu) | (std::min<uint32_t>(255u, (c >> 24) * 2u) << 24);
+             ga2_flatart::Classes classes;
+-            if (ga2_flatart::classify(rgba.data(), int(w), int(h), classes))
++            if (ga2_flatart::classify(rgba255().data(), int(w), int(h), classes))
+             {
+                 {
+                     std::lock_guard<std::mutex> lock(g_layerMutex);
+@@ -288,6 +308,23 @@ namespace ga2_layers
+                 return nullptr;
+             }
+         }
++        // The interface (panels, window parts, frames, the HUD) as sharp pixels at once; pictures (characters,
++        // portraits, backgrounds) go on to Anime4K (ga2_uiart.h). "UI upscaling: Anime4K" sends all to Anime4K.
++        if (g_uiSharp.load() && !ga2_uiart::isPicture(rgba255().data(), int(w), int(h)))
++        {
++            auto result = std::make_shared<Result>();
++            result->w = w * uint32_t(scale), result->h = h * uint32_t(scale);
++            result->rgba.resize(size_t(result->w) * size_t(result->h));
++            ga2_uiart::sharpPixels(rgba255().data(), int(w), int(h), scale, result->rgba.data());
++            std::lock_guard<std::mutex> lock(g_layerMutex);
++            if (const auto old = g_results.find(hash); old != g_results.end())
++                g_resultBytes -= old->second->rgba.size() * 4u;
++            g_results[hash] = result;
++            g_resultBytes += result->rgba.size() * 4u;
++            g_resultOrder.push_back(hash);
++            trimResults();
++            return result;
++        }
+         // From an earlier session.
+         const std::filesystem::path file = cacheFile(hash, scale);
+         std::error_code ec;
+@@ -316,9 +353,7 @@ namespace ga2_layers
+         }
+         Job job;
+         job.hash = hash, job.w = w, job.h = h;
+-        job.rgba = pixels();
+-        for (uint32_t &c : job.rgba)
+-            c = (c & 0x00FFFFFFu) | (std::min<uint32_t>(255u, (c >> 24) * 2u) << 24);
++        job.rgba = rgba255();
+         std::lock_guard<std::mutex> lock(g_layerMutex);
+         if (g_queued.insert(hash).second && g_jobs.size() < 4096)
+             g_jobs.push_back(std::move(job));
+@@ -905,12 +940,10 @@ namespace ga2_texpacks
+                                            ? ga2_hitext::enabled()
+                                            : false;
+                 // Per-layer upscaling: 2D art only (a 3D primitive's texture renders natively at the internal
+-                // resolution); 8, 16 and 32-bit textures of some size (the 4-bit ones are fonts and UI glyphs).
+-                // In 3D scenes (battles) the 2D layer is the HUD: its boxes, frames, rings and arrows are often 4-bit
+-                // and small, so there 4-bit textures (but the font cells, which sharp text draws) and anything from
+-                // 16 pixels up are upscaled too. 2D scenes follow the 2D filter (Anime4K), the HUD "HD battle
+-                // graphics" (ga2_layers::setEnabled).
+-                const bool fourBit = psmRaw == 0x14u || psmRaw == 0x24u || psmRaw == 0x2Cu;
++                // resolution), all pixel formats but the font cells (sharp text draws those). In 3D scenes (battles)
++                // the 2D layer is the HUD ("HD battle graphics"), in 2D scenes it follows the 2D filter (Anime4K):
++                // ga2_layers::setEnabled. Flat shapes are redrawn, the interface drawn as sharp pixels, pictures
++                // go to Anime4K (lookup).
+                 const bool hud = ga2_activity::scene3d();
+                 // The HUD's textures are often loaded before the battle's first 3D frame: when the scene turns 3D
+                 // (or back), the GS's cached textures are dropped so each is decided again under the right rule.
+@@ -921,8 +954,11 @@ namespace ga2_texpacks
+                         ga2_layers::sceneChanged();
+                 }
+                 const bool fontCell = (desc.rect.width <= 32u && desc.rect.height == 18u) || (desc.rect.width == 24u && desc.rect.height == 24u);
+-                const bool layers = for2d && (hud ? ga2_layers::enabledHud() && desc.rect.width >= 16u && desc.rect.height >= 16u && !fontCell
+-                                                  : ga2_layers::enabled2d() && desc.rect.width >= 32u && desc.rect.height >= 32u && !fourBit);
++                // 2D scenes: from 8 pixels up, so the characters' eye and mouth frames (16 x 14 to 72 x 40) are
++                // upscaled with their bodies (blurred, magnified native frames looked soft on the sharp faces).
++                const bool layers = for2d && !fontCell &&
++                                    (hud ? ga2_layers::enabledHud() && desc.rect.width >= 16u && desc.rect.height >= 16u
++                                         : ga2_layers::enabled2d() && desc.rect.width >= 8u && desc.rect.height >= 8u);
+                 // GA2_LAYER_DEBUG=1: each texture once, with what the per-layer upscaling made of it.
+                 static const bool layerDebug = std::getenv("GA2_LAYER_DEBUG") != nullptr;
+                 if (layerDebug)
+@@ -1153,7 +1189,8 @@ namespace ga2_texpacks
+                     {
+                         if (!layers)
+                             return {};
+-                        const std::string key = deviceKey(device) + "layer" + std::to_string(ga2_layers::scale()) + name;
++                        const std::string key = deviceKey(device) + "layer" + std::to_string(ga2_layers::scale()) +
++                                                (ga2_layers::uiSharp() ? "s" : "a") + name;
+                         if (const auto cached = g_layerImages.find(key); cached != g_layerImages.end())
+                         {
+                             g_layerOrder.splice(g_layerOrder.end(), g_layerOrder, cached->second.second);
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.h b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+index 90988d2..0a7b62f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.h
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+@@ -54,7 +54,9 @@ namespace ga2_layers
+ {
+     // On, and the scale (2 or 4: the internal resolution). A change drops the GS's cached textures.
+     // In 2D scenes (2D art) and over 3D scenes (the battle HUD), each on its own.
+-    void setEnabled(bool scenes2d, bool hud, int scale);
++    // uiSharp: the interface (ga2_uiart.h) as sharp pixels; else Anime4K like the pictures.
++    void setEnabled(bool scenes2d, bool hud, int scale, bool uiSharp = true);
++    bool uiSharp();
+     bool enabled(); // either
+     bool enabled2d();
+     bool enabledHud();
+diff --git a/ps2xTest/src/ga2_flatart_tests.cpp b/ps2xTest/src/ga2_flatart_tests.cpp
+index cf182de..c86e6f9 100644
+--- a/ps2xTest/src/ga2_flatart_tests.cpp
++++ b/ps2xTest/src/ga2_flatart_tests.cpp
+@@ -1,6 +1,7 @@
+ #include "MiniTest.h"
+ 
+ #include "gs/ga2_flatart.h"
++#include "gs/ga2_uiart.h"
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -97,4 +98,36 @@ void register_ga2_flatart_tests()
+             t.IsFalse(ga2_flatart::classify(big.data(), 256, 256, cls), "large pictures are not either");
+         });
+     });
++
++    MiniTest::Case("UiArt", [](TestCase &tc) {
++        tc.Run("a face is a picture, a blue panel and a grey window part are the interface", [](TestCase &t) {
++            const int n = 32;
++            std::vector<uint32_t> face(size_t(n) * n, 0xFF7A4A2Au); // dark blue hair (B 0x7A, G 0x4A, R 0x2A)
++            for (int i = 0; i < n * n / 3; ++i)
++                face[size_t(i)] = 0xFF9CC8F0u; // skin: R F0, G C8, B 9C
++            t.IsTrue(ga2_uiart::isPicture(face.data(), n, n), "a third skin: a character piece");
++            std::vector<uint32_t> panel(size_t(n) * n);
++            for (int i = 0; i < n * n; ++i)
++                panel[size_t(i)] = 0xFF000000u | uint32_t(0x60 + (i % n)) << 16 | uint32_t(0x20 + (i % 7)) << 8 | 0x08u;
++            t.IsFalse(ga2_uiart::isPicture(panel.data(), n, n), "a blue gradient panel");
++            std::vector<uint32_t> grey(size_t(n) * n, 0xFFD0D0D0u);
++            t.IsFalse(ga2_uiart::isPicture(grey.data(), n, n), "a grey window part");
++            std::vector<uint32_t> sky(size_t(640) * 480, 0xFF904020u);
++            t.IsTrue(ga2_uiart::isPicture(sky.data(), 640, 480), "a full-screen picture without anyone in it");
++            std::vector<uint32_t> clear(size_t(n) * n, 0x009CC8F0u);
++            t.IsFalse(ga2_uiart::isPicture(clear.data(), n, n), "transparent texels do not count");
++        });
++
++        tc.Run("sharp pixels repeat each texel scale x scale times", [](TestCase &t) {
++            const uint32_t src[4] = {1u, 2u, 3u, 4u}; // 2 x 2
++            std::vector<uint32_t> out(16 * 4);
++            ga2_uiart::sharpPixels(src, 2, 2, 4, out.data());
++            t.Equals(out[0], 1u, "top left");
++            t.Equals(out[3], 1u, "the first texel's row");
++            t.Equals(out[4], 2u, "the second texel");
++            t.Equals(out[3 * 8 + 3], 1u, "the first texel's last row");
++            t.Equals(out[4 * 8], 3u, "the second row of texels");
++            t.Equals(out[7 * 8 + 7], 4u, "bottom right");
++        });
++    });
+ }
+-- 
+2.56.0
+

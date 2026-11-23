@@ -1,0 +1,268 @@
+From bd60a8502adab85c19ada31f40a0e94b12d7f1b9 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:15:31 -0600
+Subject: [PATCH 174/174] VR battle table: the chase and cockpit views as a
+ stereo hologram standing over the table (both grips scale it), the unit
+ camera on a screen in the table, the stage's sky kept through the views
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_vr.cpp | 150 +++++++++++++++++++++++++++++----
+ 1 file changed, 132 insertions(+), 18 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 9ac75c9..9542b23 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1001,6 +1001,10 @@ void main()
+         // of the view shows on a screen standing in the table (mono), the table stays around it. The cockpit view puts
+         // the player in the cockpit instead (stereo, all around, as before).
+         bool g_battleView = false;
++        // The chase (rear) and cockpit views: the game's 3D in stereo, seen as a hologram standing where the table was
++        // (a glowing column over its plate); both grips pulled apart / together scale it (g_holoScale).
++        bool g_battleHolo = false;
++        float g_holoScale = 1.0f;
+         ga2_battletable::State g_lastTable; // the table's last state (its ships stay on the plate during the views)
+         bool g_tableRecentred = false; // set by a recentre: the table faces ahead again
+         bool battleViewScreen(float halfHeight, float out[3])
+@@ -1624,7 +1628,7 @@ void main()
+             key(left, kKeyAll, 20, 404, 312, 466, japanese ? "全機" : "All angels", true);
+             key(left, kKeyPause, 328, 404, 620, 466, japanese ? "ポーズ" : "Pause", true);
+             const char *labels[9] = {japanese ? "待機" : "Stay",       japanese ? "必殺技" : "H-Weapon", japanese ? "キャンセル" : "Cancel",
+-                                     g_battleView ? (japanese ? "マップへ" : "Back to table") : japanese ? "追尾視点" : "Pilot view", japanese ? "カメラ" : "Camera",  japanese ? "メニュー" : "Menu",
++                                     g_battleView || g_battleHolo ? (japanese ? "マップへ" : "Back to table") : japanese ? "追尾視点" : "Pilot view", japanese ? "カメラ" : "Camera",  japanese ? "メニュー" : "Menu",
+                                      japanese ? "中央へ" : "Recentre",   japanese ? "ガイド" : "Guide",    japanese ? "配置リセット" : "Reset layout"};
+             const int ids[9] = {kKeyStay, kKeyHWeapon, kKeyCancel, kKeyPilot, kKeyCamera, kKeyMenu, kKeyRecentre, kKeyGuide, kKeyResetLayout};
+             for (int i = 0; i < 9; ++i)
+@@ -1790,7 +1794,8 @@ void main()
+             if (mapShown)
+                 drawHudPanels(viewProj, eye, picture, extentX, extentY, st, pose);
+ 
+-            drawShips(viewProj, eye, st, pose, time);
++            if (mapShown || !g_battleHolo) // the hologram replaces the plate's ships
++                drawShips(viewProj, eye, st, pose, time);
+             glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+ 
+             if (mapShown)
+@@ -2298,7 +2303,7 @@ void main()
+         // True when the stage's sky was drawn (the generic skybox is then left out).
+         bool drawStageSky(const M4 &rotationView, const M4 &proj)
+         {
+-            if (!g_tableView.active && !g_battleView)
++            if (!g_tableView.active && !g_battleView && !g_battleHolo)
+                 return false;
+             const std::shared_ptr<const bvr_ships::Mesh> mesh = bvr_ships::stageSky();
+             V3 rx, fz, up;
+@@ -2341,6 +2346,89 @@ void main()
+             return true;
+         }
+ 
++        // The chase and cockpit views as a hologram (g_battleHolo): this eye's stereo frame of the game's 3D shown only
++        // inside a glowing column standing on the table's plate (radius of the plate, 0.75 m tall), fading at its
++        // side and top, with faint scan lines; around it the stage's sky, the plate's rim, the palms and the hands.
++        const char *kHoloEyeFs = R"(#version 330
++in vec2 v_uv;
++uniform sampler2D tex;
++uniform vec2 extent;
++uniform mat4 invViewProj;
++uniform vec3 eye;
++uniform vec3 centre; // the plate's centre
++uniform float radius, height, time;
++out vec4 o;
++void main()
++{
++    vec2 ndc = vec2(v_uv.x * 2.0 - 1.0, 1.0 - v_uv.y * 2.0); // the quad's uv runs down from its top
++    vec4 far = invViewProj * vec4(ndc, 1.0, 1.0);
++    vec3 dir = normalize(far.xyz / far.w - eye);
++    // The ray's nearest approach to the column's axis (horizontally) and its height there.
++    vec2 e = eye.xz - centre.xz, d = dir.xz;
++    float dd = max(dot(d, d), 1e-6);
++    float t = max(-dot(e, d) / dd, 0.0);
++    float r = length(e + d * t);
++    float y = eye.y + dir.y * t - centre.y;
++    if (t <= 0.0 && length(e) > radius) discard;
++    float side = 1.0 - smoothstep(radius * 0.82, radius, r);
++    float band = smoothstep(-0.03, 0.03, y) * (1.0 - smoothstep(height * 0.85, height, y));
++    float a = side * band;
++    if (a <= 0.003) discard;
++    vec3 c = texture(tex, v_uv * extent).rgb;
++    float scan = 0.94 + 0.06 * sin(gl_FragCoord.y * 1.4 + time * 6.0);
++    float rim = smoothstep(radius * 0.80, radius * 0.95, r) * (1.0 - smoothstep(radius * 0.95, radius, r));
++    vec3 col = c * scan + vec3(0.25, 0.6, 1.0) * rim * 0.35;
++    o = vec4(col * a, a);
++})";
++        GLuint g_holoEyeProgram = 0;
++
++        void drawHologramView(GLuint picture, float extentX, float extentY, const M4 &view, const M4 &proj, V3 eye)
++        {
++            const float time = float(GetTime());
++            glDisable(GL_CULL_FACE);
++            glDisable(GL_BLEND);
++            glEnable(GL_DEPTH_TEST);
++            glDepthMask(GL_TRUE);
++            glClearColor(0, 0, 0, 1);
++            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++            M4 rotationOnly = view;
++            rotationOnly.m[12] = rotationOnly.m[13] = rotationOnly.m[14] = 0.0f;
++            drawStageSky(rotationOnly, proj);
++            if (!g_holoEyeProgram)
++                g_holoEyeProgram = compile(kMeshVs, kHoloEyeFs, "hologram view");
++            const ga2_battletable::Pose &pose = g_tableView.pose;
++            const V3 centre = playPoint(pose, 0.0f, 0.0f, 0.0f);
++            glDisable(GL_DEPTH_TEST);
++            glDepthMask(GL_FALSE);
++            glEnable(GL_BLEND);
++            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++            glUseProgram(g_holoEyeProgram);
++            M4 identity{};
++            identity.m[0] = identity.m[5] = identity.m[10] = identity.m[15] = 1.0f;
++            setMatrix(g_holoEyeProgram, "mvp", identity);
++            setMatrix(g_holoEyeProgram, "invViewProj", inverse(mul(proj, view)));
++            glUniform3f(glGetUniformLocation(g_holoEyeProgram, "eye"), eye.x, eye.y, eye.z);
++            glUniform3f(glGetUniformLocation(g_holoEyeProgram, "centre"), centre.x, centre.y, centre.z);
++            glUniform1f(glGetUniformLocation(g_holoEyeProgram, "radius"), pose.halfWidth);
++            glUniform1f(glGetUniformLocation(g_holoEyeProgram, "height"), 0.75f);
++            glUniform1f(glGetUniformLocation(g_holoEyeProgram, "time"), time);
++            glActiveTexture(GL_TEXTURE0);
++            glBindTexture(GL_TEXTURE_2D, picture);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++            glUniform1i(glGetUniformLocation(g_holoEyeProgram, "tex"), 0);
++            glUniform2f(glGetUniformLocation(g_holoEyeProgram, "extent"), extentX, extentY);
++            rect(V3{0, 0, 0}, V3{1, 0, 0}, V3{0, 1, 0}, false);
++            // The plate under it (rim and glass, no map), the palms and the gloves.
++            glEnable(GL_DEPTH_TEST);
++            drawTable(mul(proj, view), eye, picture, extentX, extentY, false, time, false);
++            glUseProgram(0);
++            glBindVertexArray(0);
++            glEnable(GL_DEPTH_TEST);
++            glDepthMask(GL_TRUE);
++            glDisable(GL_BLEND);
++        }
++
+         void drawScene(const M4 &view, const M4 &proj, V3 eye, GLuint picture, float extentX, float extentY, bool wide,
+                        const std::array<Laser, 2> &lasers)
+         {
+@@ -3378,7 +3466,7 @@ void main()
+                 {
+                     const ga2_battletable::Hand &hand = table.hands[side];
+                     bvr_hands::PalmInput pi;
+-                    pi.valid = (tv.active || g_battleView) && hand.valid && tv.aimValid[side];
++                    pi.valid = (tv.active || g_battleView || g_battleHolo) && hand.valid && tv.aimValid[side];
+                     pi.head = {head.x, head.y, head.z};
+                     pi.palm = {hand.palm[0], hand.palm[1], hand.palm[2]};
+                     pi.busy = tv.grip[side] > 0.6f || tv.trigger[side] > 0.6f || (st.drag && st.dragHand == side) ||
+@@ -3509,6 +3597,24 @@ void main()
+                                  unitId > 0 ? (" unit " + std::to_string(unitId)).c_str() : "");
+                 }
+             }
++            // The hologram's scale: both grips, apart = larger (fewer game units per metre).
++            {
++                static bool stretching = false;
++                static float d0 = 0.0f, s0 = 1.0f;
++                const bool both = g_battleHolo && table.hands[0].valid && table.hands[1].valid && tv.grip[0] > 0.6f && tv.grip[1] > 0.6f;
++                const float dx = table.hands[1].palm[0] - table.hands[0].palm[0], dy = table.hands[1].palm[1] - table.hands[0].palm[1],
++                            dz = table.hands[1].palm[2] - table.hands[0].palm[2];
++                const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
++                if (both && d > 0.05f)
++                {
++                    if (!stretching)
++                        stretching = true, d0 = d, s0 = g_holoScale;
++                    else
++                        g_holoScale = std::clamp(s0 * d0 / d, 0.1f, 10.0f);
++                }
++                else
++                    stretching = false;
++            }
+             ga2_battletable::publishPose(table);
+             tv.pose = table;
+ 
+@@ -3827,7 +3933,7 @@ void main()
+                 const float f = v && *v ? float(std::atof(v)) : 0.0f;
+                 return f > 0.0f ? f : 50.0f;
+             }();
+-            return scale;
++            return scale * (g_battleHolo ? g_holoScale : 1.0f);
+         }
+ 
+         // Both eyes' frames are stereo frames of a 3D scene.
+@@ -3872,7 +3978,7 @@ void main()
+         // The panel is drawn over this eye's frame (both eyes' frames lack their overlay, the overlay arrived).
+         bool hudPanelShowing(const EyeImage &image)
+         {
+-            return hudPanel().enabled && image.uiSplit && g_uiImage.texture && g_uiImage.uiSplit;
++            return (hudPanel().enabled || g_battleHolo) && image.uiSplit && g_uiImage.texture && g_uiImage.uiSplit;
+         }
+ 
+         // An eye's pose in the setup: the head pose moved by -+ipd/2 along its x axis.
+@@ -4043,16 +4149,18 @@ void main()
+             g_lastTable = g_tableView.state;
+         {
+             const ga2_vrpointer::Scene sc = ga2_vrpointer::scene();
+-            g_battleView = !g_tableView.active && std::strcmp(ga2_settings::value(ga2_options::VrBattleSelect), "hand") == 0 &&
+-                           // (the cockpit view is not: it puts the player in the cockpit, the game's 3D all around in stereo)
+-                           (sc == ga2_vrpointer::Scene::UnitCamera || sc == ga2_vrpointer::Scene::Rear) &&
+-                           g_shipGl.lastActive >= 0.0 && GetTime() - g_shipGl.lastActive < 900.0;
+-            static bool was = false;
+-            if (g_battleView != was)
+-                std::fprintf(stderr, "[bvr] %s\n", g_battleView ? "battle view shown inside the table" : "battle view ended");
+-            was = g_battleView;
++            const bool battle = !g_tableView.active && std::strcmp(ga2_settings::value(ga2_options::VrBattleSelect), "hand") == 0 &&
++                                g_shipGl.lastActive >= 0.0 && GetTime() - g_shipGl.lastActive < 900.0;
++            // The unit camera on a screen in the table; the chase and cockpit views as a stereo hologram in its place.
++            g_battleView = battle && sc == ga2_vrpointer::Scene::UnitCamera;
++            g_battleHolo = battle && (sc == ga2_vrpointer::Scene::Rear || sc == ga2_vrpointer::Scene::Cockpit);
++            static int was = 0;
++            const int now = g_battleView ? 1 : g_battleHolo ? 2 : 0;
++            if (now != was)
++                std::fprintf(stderr, "[bvr] %s\n", now == 1 ? "battle view on a screen in the table" : now == 2 ? "battle view as a hologram in the table" : "battle view ended");
++            was = now;
+         }
+-        ga2_pgs::setTableSplit(g_tableView.active); // its HUD and units from the UI layer, the plate from the scene
++        ga2_pgs::setTableSplit(g_tableView.active || g_battleHolo); // the HUD apart from the scene (the hologram is the scene alone)
+         g_tableView.aimValid[0] = g_tableView.aimValid[1] = false;
+         locateHands(frameState.predictedDisplayTime, world);
+         float grips[2] = {script ? script->l1 : scalar(g_xr.l1), script ? script->r1 : scalar(g_xr.r1)};
+@@ -4155,6 +4263,8 @@ void main()
+             if (g_handOnly[1])
+                 in.r1 = std::max(in.r1, grips[1]);
+             in.activeHand = g_xr.activeHand;
++            if (g_battleHolo && grips[0] > 0.6f && grips[1] > 0.6f)
++                in.l1 = in.r1 = 0.0f; // both grips scale the hologram (one grip is still L1 / R1)
+             // A scene the game names counts even when the picture is not a stereo frame (a paused or loading
+             // 3D scene shows the theater screen); otherwise a 3D scene is Stereo and the rest Flat.
+             switch (ga2_vrpointer::scene())
+@@ -4231,7 +4341,7 @@ void main()
+                 if (viewCount >= 2)
+                     publishTablePose(views, world);
+                 updateGuide(stereo);
+-                if (g_tableView.active || g_battleView)
++                if (g_tableView.active || g_battleView || g_battleHolo)
+                     renderPalms(std::strcmp(ga2_settings::value(ga2_options::Language), "ja") == 0);
+                 if (ga2_pgs::stereo() && viewCount >= 2 && ga2_activity::scene3d() && !g_tableView.active && !g_battleView)
+                 {
+@@ -4304,8 +4414,6 @@ void main()
+                         // field of view it was rendered with, so the compositor
+                         // reprojects it to the current head pose.
+                         const EyeImage &image = g_eyeImages[v];
+-                        drawEyeImage(image.texture, image.srcWidth / float(image.texWidth),
+-                                     image.srcHeight / float(image.texHeight));
+                         const ga2_stereo::Setup &st = image.setup;
+                         submitPose = eyePose(st, int(v));
+                         submitFov = {std::atan(st.tanLeft), std::atan(st.tanRight), std::atan(st.tanUp), std::atan(st.tanDown)};
+@@ -4315,6 +4423,12 @@ void main()
+                                               submitPose.orientation.w},
+                                             V3{submitPose.position.x, submitPose.position.y, submitPose.position.z}));
+                         const M4 handProj = projection(st.tanLeft, st.tanRight, st.tanUp, st.tanDown, 0.05f, 100.0f);
++                        if (g_battleHolo && g_tableView.pose.valid)
++                            drawHologramView(image.texture, image.srcWidth / float(image.texWidth), image.srcHeight / float(image.texHeight),
++                                             inverseRigid(submitWorld), handProj, V3{submitWorld.m[12], submitWorld.m[13], submitWorld.m[14]});
++                        else
++                            drawEyeImage(image.texture, image.srcWidth / float(image.texWidth),
++                                         image.srcHeight / float(image.texHeight));
+                         if (hudPanelShowing(image))
+                             drawHudPanel(mul(handProj, inverseRigid(submitWorld)), st);
+                         if (g_menu.texture)
+-- 
+2.56.0
+

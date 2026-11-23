@@ -1,0 +1,459 @@
+From f26fa0e7f6bb49b8418311ed6a4191dd782ae8c1 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:02:24 -0600
+Subject: [PATCH 188/191] IOP: idle grants of EE cycles are counted, not run
+ through the scheduler
+
+The EE grants the IOP its cycles at every branch it takes (8 cycles per call/return, 32 per loop back edge), millions
+of times a second. Each grant went through the call scope (two recursive-mutex locks), the subsystem, and one pass of
+the IOP scheduler loop even when the IOP had nothing to do until a known later cycle. On a Steam Deck that chain was
+about 30 % of the game thread in a movie and 15-20 % in a battle.
+
+After a grant that is applied, the emulator computes how many EE cycles further grants may sum up to before one of
+them can do more than move the clocks: until the earliest of every deadline it has (thread delay, DMA completion,
+alarm/queued callback, hardware timer, the SPU's next sample), or until the EE clock has repaid the IOP's lead when
+something is due now. Grants inside that horizon are summed (IopEmulator::tryDeferEeCycles, asked by
+PS2Runtime::advanceIopEeCycles before it takes the call scope); the grant that reaches the horizon, and anything else
+that enters the emulator, first turns the sum into what the grants would have been one by one: clock ticks.
+
+- The horizon is void as soon as a thread changes state (IopKernel::stateEpoch): a reverse-RPC completion wakes its
+  thread from the host, outside any emulator call (found by ps2_iop_reverse_rpc_tests).
+- No horizon while the IOP is inside a call, a callback, an RPC wait or an SPU access, with an SPU IRQ pending, or
+  with a lead beyond kMaxIopLeadCycles (the next grant forgives part of it: not additive).
+- IopEmulator::cycles() counts the deferred grants.
+- GA2_IOP_DEFER=0 turns it off. GA2_IOP_DEFER=check applies every deferrable grant the old way and aborts if it
+  changed anything but the clocks (instructions run, thread/timer/DMA/callback queues, SPU position, interrupt
+  status).
+
+Game timing is unchanged: the same grant as before is the first to run IOP code, service a deadline or produce a
+sample, at the same IOP cycle.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/include/ps2x/iop/iop_subsystem.h |   3 +
+ ps2xIOP/src/emulator/core/iop_kernel.cpp |   2 +
+ ps2xIOP/src/emulator/core/iop_kernel.h   |   7 +
+ ps2xIOP/src/emulator/iop_emulator.cpp    | 198 +++++++++++++++++++++--
+ ps2xIOP/src/emulator/iop_emulator.h      |   3 +
+ ps2xIOP/src/iop_subsystem.cpp            |   5 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp      |   4 +
+ 7 files changed, 207 insertions(+), 15 deletions(-)
+
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index aeff924..5829ec9 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -34,6 +34,9 @@ namespace ps2x::iop
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
+         void runEeCycles(uint64_t eeCycles) noexcept;
++        // True when the grant was only counted because the IOP is provably idle over it (nothing else to do: the
++        // caller skips runEeCycles and whatever it takes to enter it). Same thread rules as runEeCycles.
++        [[nodiscard]] bool tryDeferEeCycles(uint64_t eeCycles) noexcept;
+ 
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 3279f0a..c98a96d 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -66,6 +66,7 @@ namespace ps2x::iop::detail
+             m_readyCount += thread.state == IopThreadState::Ready ? 1u : 0u;
+         }
+         m_wakeDirty = true;
++        ++m_stateEpoch;
+     }
+ 
+     void IopKernel::setState(IopThread &thread, IopThreadState state) noexcept
+@@ -85,6 +86,7 @@ namespace ps2x::iop::detail
+         if (old == IopThreadState::Delay || state == IopThreadState::Delay)
+             m_wakeDirty = true;
+         thread.state.m_value = state;
++        ++m_stateEpoch;
+     }
+ 
+     uint64_t IopKernel::earliestWakeScan() const noexcept
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 40c6129..658a589 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -142,6 +142,12 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+         [[nodiscard]] bool hasCurrentThread() const noexcept { return m_currentThread != nullptr; }
++        // A thread is Ready now (beginNextReady would pick one without waiting for a delay to expire).
++        [[nodiscard]] bool anyReady() const noexcept { return m_readyCount != 0; }
++        // Moves on every thread state change (setState is the only writer): the emulator's idle deferral is void once
++        // this differs from the value it was computed at, whoever changed the state (a reverse-RPC completion wakes its
++        // thread from the host, outside any emulator call).
++        [[nodiscard]] uint64_t stateEpoch() const noexcept { return m_stateEpoch; }
+         [[nodiscard]] bool ownsCurrentCpu(const IopCpuState &cpu) const noexcept
+         { return m_currentThread && &m_currentThread->cpu == &cpu; }
+         [[nodiscard]] bool hasSemaphoreWaiter(int id) const noexcept;
+@@ -187,6 +193,7 @@ namespace ps2x::iop::detail
+         // The scheduler's idle fast path: how many threads are Ready, and the earliest wake cycle of the Delay
+         // threads (recomputed when a thread entered or left Delay). Kept by setState and rebuildThreadList.
+         size_t m_readyCount = 0;
++        uint64_t m_stateEpoch = 1;
+         mutable bool m_wakeDirty = true;
+         mutable uint64_t m_earliestWake = UINT64_MAX;
+         [[nodiscard]] uint64_t earliestWake() const noexcept;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 1db1d02..f46f7ea 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -19,6 +19,8 @@
+ #include "iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ #include <chrono>
+ #include <unordered_map>
+ #include <cctype>
+@@ -28,6 +30,7 @@
+ #include <span>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
+ #include <sstream>
+ #include <utility>
+ #include <ga2/spu_device.h>
+@@ -188,6 +191,8 @@ namespace ps2x::iop::detail
+             totalInstructions = 0;
+             eeCycleCarry = 0;
+             eeIopClock = 0;
++            deferredEe = 0;
++            quietEe = 0;
+             activeCpu = nullptr;
+             rpcWaitCpu = nullptr;
+             rpcInstructionDeadline = rpcCycleDeadline = 0u;
+@@ -1560,6 +1565,128 @@ namespace ps2x::iop::detail
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
+         uint64_t eeIopClock = 0; // IOP cycles the EE clock has granted
++        // Idle deferral (GA2_IOP_DEFER=0: off; =check: every deferrable grant is applied and verified instead).
++        // While the IOP is provably idle (nothing Ready, no deadline of any kind before a known IOP cycle), a grant of
++        // EE cycles changes nothing but the clocks; such grants are summed here and applied in one piece at the first
++        // grant that reaches the horizon, or before anything else enters the emulator (settle()). The EE grants a few
++        // cycles at every branch it takes, so this is the difference between one addition and a pass through the
++        // scheduler, millions of times a second.
++        uint64_t deferredEe = 0; // EE cycles granted but not applied yet
++        uint64_t quietEe = 0;    // further EE cycles that may be deferred (0: apply every grant at once)
++        uint64_t quietEpoch = 0; // kernel.stateEpoch() the horizon was computed at
++        uint64_t deferChecked = 0; // check mode: grants verified
++        enum class DeferMode { Off, On, Check };
++        static DeferMode deferMode() noexcept
++        {
++            static const DeferMode mode = [] {
++                const char *v = std::getenv("GA2_IOP_DEFER");
++                if (!v || !*v) return DeferMode::On;
++                if (std::string_view(v) == "check") return DeferMode::Check;
++                return *v == '0' ? DeferMode::Off : DeferMode::On;
++            }();
++            return mode;
++        }
++
++        // The grant as it always was: EE cycles become IOP cycles (8:1) and the IOP runs up to the granted clock.
++        void grantEeCycles(uint64_t eeCycles) noexcept
++        {
++            const uint64_t total = eeCycleCarry + eeCycles;
++            const uint64_t iopCycles = total / 8u;
++            eeCycleCarry = total % 8u;
++            // IOP time is EE time / 8. Synchronous RPC waits and slice overshoot
++            // run the IOP past that (measured ~0.9% in GA2, which made the SPU
++            // produce ~48420 samples per real second); the EE clock repays that
++            // lead instead of stacking new budget on top of it. A lead beyond
++            // kMaxIopLeadCycles (e.g. a long module start) is forgiven so the IOP
++            // never stalls for long.
++            eeIopClock += iopCycles;
++            if (totalCycles > eeIopClock + kMaxIopLeadCycles)
++                eeIopClock = totalCycles - kMaxIopLeadCycles;
++            if (eeIopClock > totalCycles)
++                runCycles(eeIopClock - totalCycles);
++        }
++
++        // Ends the deferral: the deferred grants become what they would have been one by one, clock ticks and nothing
++        // else (that is what the horizon proved when it was computed, and nothing can have run since). Called before
++        // anything else enters the emulator, and before a grant that is applied. Not through grantEeCycles: a thread
++        // woken from outside since (stateEpoch) must start at the clock the grants reached, not before them.
++        void settle() noexcept
++        {
++            quietEe = 0;
++            if (deferredEe == 0u)
++                return;
++            const uint64_t total = eeCycleCarry + deferredEe;
++            deferredEe = 0;
++            eeCycleCarry = total % 8u;
++            eeIopClock += total / 8u; // the lead was within kMaxIopLeadCycles and only shrank: nothing to forgive
++            if (eeIopClock > totalCycles)
++                totalCycles = eeIopClock; // below every deadline and the SPU's next sample
++        }
++
++        // How many EE cycles the coming grants may sum up to before one of them does more than move the clocks; 0
++        // when that cannot be shown. The first grant that brings the granted IOP clock to `act` must be applied:
++        // `act` is the earliest deadline of any kind (thread delay, DMA completion, alarm or queued callback, timer,
++        // the SPU's next sample), or the very next cycle past the IOP's own clock when something is due now (a Ready
++        // thread, a passed deadline). Deadlines masked work cannot reach are counted too: applying early is always
++        // exact, it is what happened on every grant before.
++        [[nodiscard]] uint64_t quietEeCycles() const noexcept
++        {
++            if (deferMode() == DeferMode::Off || resetRequired || syncingSpu || callDepth != 0u || activeCpu != nullptr ||
++                rpcWaitCpu != nullptr || servicingDmaInterrupts || servicingGuestCallbacks || executingAlarm != nullptr ||
++                kernel.hasCurrentThread() || pendingSpuIrq)
++                return 0u;
++            if (totalCycles > eeIopClock + kMaxIopLeadCycles)
++                return 0u; // the next grant forgives part of the lead: not additive
++            bool dueNow = kernel.anyReady() || ga2::spu::autoDmaCompletionPending();
++            uint64_t wake = kernel.nextWakeCycle(UINT64_MAX);
++            for (const auto &[irq, dma] : pendingDmaInterrupts)
++                wake = std::min(wake, dma.deadline);
++            if (!pendingGuestCallbacks.empty())
++                wake = std::min(wake, pendingGuestCallbacks.begin()->first);
++            wake = timrman.nextEventCycle(wake);
++            if (spu)
++            {
++                if (spuNextSample == 0u) dueNow = true; // unknown: the next advance takes the full SPU path
++                else wake = std::min(wake, spuNextSample);
++            }
++            if (wake <= totalCycles) dueNow = true;
++            const uint64_t act = dueNow ? totalCycles + 1u : wake;
++            if (act <= eeIopClock)
++                return 0u;
++            const uint64_t iopCycles = std::min<uint64_t>(act - eeIopClock, uint64_t(1) << 40u);
++            return iopCycles * 8u - eeCycleCarry; // eeCycleCarry < 8
++        }
++
++        // GA2_IOP_DEFER=check: what a deferred grant must leave untouched.
++        struct IdleSignature
++        {
++            uint64_t instructions, identity, kernelWake, timerEvent, spuCycle, callbackFirst, dmaDeadlines;
++            size_t callbacks, dmas, threads;
++            uint32_t interruptStatus;
++            bool ready, current, autoDma, spuIrq;
++            bool operator==(const IdleSignature &) const = default;
++        };
++        [[nodiscard]] IdleSignature idleSignature() const noexcept
++        {
++            IdleSignature s{};
++            s.instructions = totalInstructions;
++            s.identity = nextCallbackIdentity;
++            s.kernelWake = kernel.nextWakeCycle(UINT64_MAX);
++            s.timerEvent = timrman.nextEventCycle(UINT64_MAX);
++            s.spuCycle = spu ? spu->lastIopCycle() : 0u;
++            s.callbackFirst = pendingGuestCallbacks.empty() ? 0u : pendingGuestCallbacks.begin()->first;
++            for (const auto &[irq, dma] : pendingDmaInterrupts)
++                s.dmaDeadlines = s.dmaDeadlines * 1099511628211ull + dma.deadline + uint64_t(irq);
++            s.callbacks = pendingGuestCallbacks.size();
++            s.dmas = pendingDmaInterrupts.size();
++            s.threads = kernel.threadCount();
++            s.interruptStatus = memory.interruptStatus();
++            s.ready = kernel.anyReady();
++            s.current = kernel.hasCurrentThread();
++            s.autoDma = ga2::spu::autoDmaCompletionPending();
++            s.spuIrq = pendingSpuIrq;
++            return s;
++        }
+         CpuState *activeCpu = nullptr;
+         CpuState *rpcWaitCpu = nullptr;
+         uint64_t rpcInstructionDeadline = 0;
+@@ -1611,16 +1738,19 @@ namespace ps2x::iop::detail
+ 
+     bool IopEmulator::beginBootNotifications(uint32_t capacity)
+     {
++        m_impl->settle();
+         return m_impl->callDepth == 0u && m_impl->loadcore.beginBootNotifications(capacity);
+     }
+ 
+     bool IopEmulator::finishBootNotifications()
+     {
++        m_impl->settle();
+         return m_impl->callDepth == 0u && m_impl->loadcore.finishBootNotifications(*m_impl);
+     }
+ 
+     void IopEmulator::reset()
+     {
++        m_impl->settle();
+         m_impl->reset();
+     }
+ 
+@@ -1636,45 +1766,77 @@ namespace ps2x::iop::detail
+ 
+     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
++        m_impl->settle();
+         return m_impl->loadModule(path, arguments, argumentSize);
+     }
+ 
+     ModuleLoadResult IopEmulator::loadModuleImage(std::string_view path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
+     {
++        m_impl->settle();
+         return m_impl->loadImage(std::string(path), image, arguments, argumentSize);
+     }
+ 
+     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+     {
++        m_impl->settle();
+         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
+     }
+ 
+     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
+     {
++        m_impl->settle();
+         return m_impl->stopModule(moduleId, result);
+     }
+ 
+     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
+     {
+-        const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+-        const uint64_t iopCycles = total / 8u;
+-        m_impl->eeCycleCarry = total % 8u;
+-        // IOP time is EE time / 8. Synchronous RPC waits and slice overshoot
+-        // run the IOP past that (measured ~0.9% in GA2, which made the SPU
+-        // produce ~48420 samples per real second); the EE clock repays that
+-        // lead instead of stacking new budget on top of it. A lead beyond
+-        // kMaxIopLeadCycles (e.g. a long module start) is forgiven so the IOP
+-        // never stalls for long.
+         Impl &impl = *m_impl;
+-        impl.eeIopClock += iopCycles;
+-        if (impl.totalCycles > impl.eeIopClock + kMaxIopLeadCycles)
+-            impl.eeIopClock = impl.totalCycles - kMaxIopLeadCycles;
+-        if (impl.eeIopClock > impl.totalCycles)
+-            impl.runCycles(impl.eeIopClock - impl.totalCycles);
++        if (eeCycles < impl.quietEe && impl.kernel.stateEpoch() == impl.quietEpoch)
++        {
++            if (Impl::deferMode() != Impl::DeferMode::Check)
++            {
++                // Idle over the whole grant: count it (see Impl::deferredEe).
++                impl.quietEe -= eeCycles;
++                impl.deferredEe += eeCycles;
++                return;
++            }
++            // Check mode: apply the grant the old way and verify it only moved the clocks.
++            const uint64_t quiet = impl.quietEe - eeCycles;
++            const Impl::IdleSignature before = impl.idleSignature();
++            const uint64_t expected = std::max(impl.totalCycles, impl.eeIopClock + (impl.eeCycleCarry + eeCycles) / 8u);
++            impl.grantEeCycles(eeCycles);
++            if (!(impl.idleSignature() == before) || impl.totalCycles != expected || impl.resetRequired)
++            {
++                std::fprintf(stderr, "[IOP] idle deferral check failed: a grant of %llu EE cycles inside the quiet horizon (%llu left) "
++                                     "changed IOP state (cycle %llu, expected %llu)\n",
++                             static_cast<unsigned long long>(eeCycles), static_cast<unsigned long long>(quiet),
++                             static_cast<unsigned long long>(impl.totalCycles), static_cast<unsigned long long>(expected));
++                std::abort();
++            }
++            impl.quietEe = quiet;
++            if ((++impl.deferChecked & 0xFFFFFFu) == 0u)
++                std::fprintf(stderr, "[IOP] idle deferral check: %llu grants verified\n", static_cast<unsigned long long>(impl.deferChecked));
++            return;
++        }
++        impl.settle();
++        impl.grantEeCycles(eeCycles);
++        impl.quietEe = impl.quietEeCycles();
++        impl.quietEpoch = impl.kernel.stateEpoch();
++    }
++
++    bool IopEmulator::tryDeferEeCycles(uint64_t eeCycles) noexcept
++    {
++        Impl &impl = *m_impl;
++        if (eeCycles >= impl.quietEe || impl.kernel.stateEpoch() != impl.quietEpoch || Impl::deferMode() != Impl::DeferMode::On)
++            return false;
++        impl.quietEe -= eeCycles;
++        impl.deferredEe += eeCycles;
++        return true;
+     }
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+     {
++        m_impl->settle();
+         return m_impl->rpc.handleRpc(request, *m_impl);
+     }
+ 
+@@ -1685,11 +1847,13 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
+     {
++        m_impl->settle();
+         return m_impl->memory.allocate(size, alignment);
+     }
+ 
+     bool IopEmulator::freeMemory(uint32_t address)
+     {
++        m_impl->settle();
+         return m_impl->memory.freeAllocation(address);
+     }
+ 
+@@ -1701,12 +1865,14 @@ namespace ps2x::iop::detail
+ 
+     bool IopEmulator::writeMemory(uint32_t address, const void *source, size_t size)
+     {
++        m_impl->settle();
+         return isMemoryRange(address, size) &&
+                m_impl->memory.writeRam(address, source, size);
+     }
+ 
+     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
+     {
++        m_impl->settle();
+         return isMemoryRange(address, size) &&
+                m_impl->memory.zeroRam(address, size);
+     }
+@@ -1724,7 +1890,9 @@ namespace ps2x::iop::detail
+ 
+     uint64_t IopEmulator::cycles() const noexcept
+     {
+-        return m_impl->totalCycles;
++        // Deferred idle grants count: the clock they will produce when applied.
++        const Impl &impl = *m_impl;
++        return std::max(impl.totalCycles, impl.eeIopClock + (impl.eeCycleCarry + impl.deferredEe) / 8u);
+     }
+ 
+     uint64_t IopEmulator::instructions() const noexcept
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 6e20ef0..c3cae96 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -35,6 +35,9 @@ namespace ps2x::iop::detail
+         using HleModuleLoader = std::function<ModuleLoadResult(std::string_view path)>;
+         void setHleModuleLoader(HleModuleLoader loader);
+         void runEeCycles(uint64_t eeCycles) noexcept;
++        // The idle part of runEeCycles alone: true when the grant was only counted (the IOP is provably idle over it;
++        // see Impl::deferredEe). False: nothing was done, call runEeCycles.
++        [[nodiscard]] bool tryDeferEeCycles(uint64_t eeCycles) noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
+ 
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 5ec1924..5b2b727 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -249,6 +249,11 @@ namespace ps2x::iop
+         m_impl->emulator.runEeCycles(eeCycles);
+     }
+ 
++    bool IopSubsystem::tryDeferEeCycles(uint64_t eeCycles) noexcept
++    {
++        return m_impl->emulator.tryDeferEeCycles(eeCycles);
++    }
++
+     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
+     {
+         const Impl::ActivityGuard activity(*m_impl);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 4c54a7a..af67f61 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1251,6 +1251,10 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
++    // Idle IOP: the grant is only counted (IopEmulator's idle deferral). This runs at every branch the EE takes, so it
++    // comes before the call scope and its locks; like every grant it is made by the thread executing the EE.
++    if (m_iopSubsystem->tryDeferEeCycles(eeCycles))
++        return;
+     uint8_t *rdram = m_eeScheduler->rdram();
+     if (!rdram) rdram = m_boundRdram ? m_boundRdram : m_memory.getRDRAM();
+     auto scope = m_iopHost->enterCycleCall(rdram);
+-- 
+2.56.0
+

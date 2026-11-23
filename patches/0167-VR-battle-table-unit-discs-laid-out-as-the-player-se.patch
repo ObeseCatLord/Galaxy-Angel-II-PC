@@ -1,0 +1,77 @@
+From e23b5ba0113db086e4af7ae34871b0debbc7ee5c Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:50:23 -0600
+Subject: [PATCH 167/171] VR battle table: unit discs laid out as the player
+ sees them, each clear of the others
+
+---
+ ps2xRuntime/src/lib/ga2_vr.cpp | 46 ++++++++++++++++++++++++----------
+ 1 file changed, 33 insertions(+), 13 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 74baba3..b0f64c9 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1355,26 +1355,46 @@ void main()
+                 m.tint = unit.selected ? V3{1.0f, 0.78f, 0.25f} : unit.enemy ? V3{1.0f, 0.35f, 0.2f} : V3{0.3f, 0.7f, 1.0f};
+                 m.dist = length(playPoint(pose, u, v, m.lift) - eye);
+             }
+-            // Layout: nearest first keep their height; a disc that would touch an already placed one (closer than
+-            // their two radii across the table, and overlapping in height) moves up above it.
++            // Layout as the player sees it: nearest first keep their height; a disc whose circle would overlap one
++            // already placed (their angular radii as seen from the eye) rises until it is clear, so every disc is its
++            // own layer. Laid out once per frame (the first eye) and reused for the other, so both eyes agree.
+             std::sort(markers, markers + markerCount, [](const Marker &a, const Marker &b) { return a.dist < b.dist; });
+-            for (int i = 0; i < markerCount; ++i)
+-                for (int pass = 0; pass < 12; ++pass)
++            {
++                static double layoutTime = -1.0;
++                static std::map<int, float> layoutLift; // unit index -> lift
++                if (time != layoutTime)
+                 {
+-                    bool moved = false;
+-                    for (int j = 0; j < i; ++j)
++                    layoutTime = time;
++                    layoutLift.clear();
++                    auto centre = [&](const Marker &m) { return playPoint(pose, m.u, m.v, m.lift) + V3{0, m.size, 0}; };
++                    for (int i = 0; i < markerCount; ++i)
+                     {
+-                        const float du = markers[i].u - markers[j].u, dv = markers[i].v - markers[j].v;
+-                        const float reach = (markers[i].size + markers[j].size) * 1.05f;
+-                        if (du * du + dv * dv < reach * reach && std::fabs(markers[i].lift - markers[j].lift) < reach)
++                        for (int pass = 0; pass < 40; ++pass)
+                         {
+-                            markers[i].lift = markers[j].lift + reach * 1.02f;
+-                            moved = true;
++                            const V3 ci = centre(markers[i]);
++                            const float di = length(ci - eye);
++                            const V3 ni = (ci - eye) * (1.0f / di);
++                            float worst = 0.0f;
++                            for (int j = 0; j < i; ++j)
++                            {
++                                const V3 cj = centre(markers[j]);
++                                const float dj = length(cj - eye);
++                                const float cosA = std::clamp(dot(ni, (cj - eye) * (1.0f / dj)), -1.0f, 1.0f);
++                                const float need = (markers[i].size / di + markers[j].size / dj) * 1.08f;
++                                worst = std::max(worst, need - std::acos(cosA));
++                            }
++                            if (worst <= 0.0f || markers[i].lift > 0.45f)
++                                break;
++                            markers[i].lift += std::max(0.004f, worst * di * 0.6f);
+                         }
++                        layoutLift[markers[i].n] = markers[i].lift;
+                     }
+-                    if (!moved)
+-                        break;
+                 }
++                else
++                    for (int i = 0; i < markerCount; ++i)
++                        if (const auto it = layoutLift.find(markers[i].n); it != layoutLift.end())
++                            markers[i].lift = it->second;
++            }
+             glBlendFunc(GL_ONE, GL_ONE);
+             for (int i = 0; i < markerCount; ++i)
+             {
+-- 
+2.56.0
+

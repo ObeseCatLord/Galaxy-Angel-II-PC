@@ -1,0 +1,1205 @@
+From fc781b04d94fdf451fdb575e41400f1b429cb43f Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:44:22 -0600
+Subject: [PATCH 160/171] VR battle renderer: disc assets in C++ (archives,
+ RAIC, AXO models, AGI textures, tables); Anime4K HQ keeps its own cache
+
+---
+ ps2xRuntime/CMakeLists.txt                  |   1 +
+ ps2xRuntime/src/lib/battlevr/bvr_assets.cpp | 769 ++++++++++++++++++++
+ ps2xRuntime/src/lib/battlevr/bvr_assets.h   | 121 +++
+ ps2xRuntime/src/lib/ga2_present.cpp         |   2 +-
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp      |  15 +-
+ ps2xRuntime/src/lib/gs/gs_texpacks.h        |   6 +-
+ ps2xTest/CMakeLists.txt                     |   1 +
+ ps2xTest/src/bvr_assets_tests.cpp           | 140 ++++
+ ps2xTest/src/main.cpp                       |   2 +
+ 9 files changed, 1048 insertions(+), 9 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+ create mode 100644 ps2xRuntime/src/lib/battlevr/bvr_assets.h
+ create mode 100644 ps2xTest/src/bvr_assets_tests.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 8069d21..08f72f6 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -405,6 +405,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ga2_battletable.cpp
+     src/lib/ga2_mpv_shader.cpp
+     src/lib/ga2_vr.cpp
++    src/lib/battlevr/bvr_assets.cpp
+     src/lib/ga2_vr_platform.cpp
+     src/lib/ga2_cheat_menu.cpp
+     src/lib/ga2_settings.cpp
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+new file mode 100644
+index 0000000..e28fe52
+--- /dev/null
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+@@ -0,0 +1,769 @@
++#include "bvr_assets.h"
++
++#include "../ps2_disc_mount.h"
++
++#include <algorithm>
++#include <array>
++#include <cctype>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <map>
++#include <memory>
++#include <mutex>
++
++namespace bvr_assets
++{
++    namespace
++    {
++        constexpr uint64_t kSector = 2048;
++
++        uint32_t u32(const uint8_t *p) { return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24; }
++        uint16_t u16(const uint8_t *p) { return uint16_t(p[0] | p[1] << 8); }
++        float f32(const uint8_t *p)
++        {
++            const uint32_t v = u32(p);
++            float f;
++            std::memcpy(&f, &v, 4);
++            return f;
++        }
++        bool fits(size_t size, uint64_t offset, uint64_t length) { return offset <= size && length <= size - offset; }
++
++        std::string lower(std::string s)
++        {
++            for (char &c : s)
++                c = char(std::tolower(static_cast<unsigned char>(c)));
++            return s;
++        }
++        std::string cstr(const std::vector<uint8_t> &d, uint64_t offset)
++        {
++            std::string s;
++            for (uint64_t i = offset; i < d.size() && d[i]; ++i)
++                s.push_back(char(d[i]));
++            return s;
++        }
++    }
++
++    // ---- disc sources -------------------------------------------------------------------------------------------
++
++    ReadFn mountedDisc()
++    {
++        return [](const std::string &name, uint64_t offset, size_t size, std::vector<uint8_t> &out) {
++            ps2_disc::File file;
++            std::filesystem::path image;
++            if (!ps2_disc::findFile(name, file, &image) || offset > file.size || size > file.size - offset)
++                return false;
++            out.assign(size, 0);
++            std::ifstream in(image, std::ios::binary);
++            std::error_code ec;
++            const uint64_t imageSize = std::filesystem::file_size(image, ec);
++            // Walk the extents to the requested bytes (files are mostly one extent).
++            uint64_t fileOffset = 0, done = 0;
++            for (const ps2_disc::Extent &e : file.extents)
++            {
++                const uint64_t begin = fileOffset, end = fileOffset + e.size;
++                fileOffset = end;
++                if (offset + done >= end || done == size)
++                    continue;
++                const uint64_t from = offset + done - begin;
++                const uint64_t count = std::min<uint64_t>(end - (offset + done), size - done);
++                const uint64_t position = uint64_t(e.lba) * kSector + from;
++                if (!ec && position + count <= imageSize)
++                {
++                    in.seekg(std::streamoff(position));
++                    in.read(reinterpret_cast<char *>(out.data() + done), std::streamsize(count));
++                    if (!in)
++                        return false;
++                }
++                else if (!ps2_disc::readOverlay(image, position, out.data() + done, size_t(count)))
++                    return false;
++                done += count;
++            }
++            return done == size;
++        };
++    }
++
++    ReadFn isoFile(const std::filesystem::path &image)
++    {
++        struct Iso
++        {
++            std::ifstream in;
++            std::map<std::string, std::pair<uint64_t, uint64_t>> files; // upper-case name -> byte offset, size
++            std::mutex mutex;
++        };
++        auto iso = std::make_shared<Iso>();
++        iso->in.open(image, std::ios::binary);
++        if (iso->in)
++        {
++            std::vector<uint8_t> vd(kSector);
++            bool primary = false;
++            for (uint64_t sector = 16; sector < 116 && !primary; ++sector)
++            {
++                iso->in.seekg(std::streamoff(sector * kSector));
++                iso->in.read(reinterpret_cast<char *>(vd.data()), std::streamsize(kSector));
++                if (!iso->in || std::memcmp(vd.data() + 1, "CD001", 5) != 0 || vd[0] == 255)
++                    break;
++                primary = vd[0] == 1;
++            }
++            if (primary)
++            {
++                const uint64_t lba = u32(vd.data() + 156 + 2), size = u32(vd.data() + 156 + 10);
++                std::vector<uint8_t> dir(size_t(std::min<uint64_t>(size, 1u << 20)));
++                iso->in.seekg(std::streamoff(lba * kSector));
++                iso->in.read(reinterpret_cast<char *>(dir.data()), std::streamsize(dir.size()));
++                for (size_t pos = 0; pos < dir.size();)
++                {
++                    const uint8_t n = dir[pos];
++                    if (n == 0) // records do not cross sectors
++                    {
++                        pos = (pos / kSector + 1) * kSector;
++                        continue;
++                    }
++                    if (pos + 34 > dir.size() || pos + n > dir.size())
++                        break;
++                    const uint8_t *rec = dir.data() + pos;
++                    const uint8_t nameLength = rec[32];
++                    std::string name(reinterpret_cast<const char *>(rec + 33), std::min<size_t>(nameLength, n - 33u));
++                    if (!(rec[25] & 2) && name != std::string(1, '\0') && name != std::string(1, '\1'))
++                    {
++                        name = name.substr(0, name.find(';'));
++                        for (char &c : name)
++                            c = char(std::toupper(static_cast<unsigned char>(c)));
++                        const uint64_t extent = u32(rec + 2), bytes = u32(rec + 10);
++                        auto prev = iso->files.find(name);
++                        if (prev != iso->files.end() && !(rec[25] & 0x80)) // a multi-extent file's tail
++                            prev->second.second += bytes;
++                        else
++                            iso->files[name] = {extent * kSector, bytes};
++                    }
++                    pos += n;
++                }
++            }
++        }
++        return [iso](const std::string &name, uint64_t offset, size_t size, std::vector<uint8_t> &out) {
++            std::string key = name;
++            for (char &c : key)
++                c = char(std::toupper(static_cast<unsigned char>(c)));
++            std::lock_guard<std::mutex> lock(iso->mutex);
++            const auto it = iso->files.find(key);
++            if (it == iso->files.end() || offset > it->second.second || size > it->second.second - offset)
++                return false;
++            out.resize(size);
++            iso->in.clear();
++            iso->in.seekg(std::streamoff(it->second.first + offset));
++            iso->in.read(reinterpret_cast<char *>(out.data()), std::streamsize(size));
++            return bool(iso->in);
++        };
++    }
++
++    // ---- RAIC ---------------------------------------------------------------------------------------------------
++
++    bool raicDecompress(const uint8_t *data, size_t size, std::vector<uint8_t> &out)
++    {
++        if (size < 8)
++            return false;
++        char magic[4];
++        for (int i = 0; i < 4; ++i)
++            magic[i] = char(data[i] ^ 0x72);
++        const uint32_t usize = u32(data + 4);
++        out.clear();
++        if (std::memcmp(magic, "RAIB", 4) == 0)
++        {
++            if (size - 8 < usize)
++                return false;
++            out.resize(usize);
++            for (uint32_t i = 0; i < usize; ++i)
++                out[i] = uint8_t(data[8 + i] ^ 0x72);
++            return true;
++        }
++        if (std::memcmp(magic, "RAIC", 4) != 0)
++            return false;
++        out.reserve(usize);
++        uint8_t window[4096] = {};
++        uint32_t r = 0xFEE, flags = 0;
++        size_t i = 8;
++        auto src = [&](size_t k) { return uint8_t(data[k] ^ 0x72); };
++        while (out.size() < usize && i < size)
++        {
++            flags >>= 1;
++            if (!(flags & 0x100))
++            {
++                flags = src(i++) | 0xFF00u;
++                if (i >= size)
++                    break;
++            }
++            if (flags & 1)
++            {
++                const uint8_t c = src(i++);
++                out.push_back(c);
++                window[r] = c;
++                r = (r + 1) & 0xFFF;
++            }
++            else
++            {
++                if (i + 1 >= size)
++                    break;
++                const uint8_t a = src(i), b = src(i + 1);
++                i += 2;
++                const uint32_t p = a | (uint32_t(b & 0xF0) << 4);
++                for (uint32_t k = 0; k < uint32_t(b & 0x0F) + 3u && out.size() < usize; ++k)
++                {
++                    const uint8_t c = window[(p + k) & 0xFFF];
++                    out.push_back(c);
++                    window[r] = c;
++                    r = (r + 1) & 0xFFF;
++                }
++            }
++        }
++        return out.size() == usize;
++    }
++
++    // ---- archives -----------------------------------------------------------------------------------------------
++
++    void Archive::add(const std::string &path, const Entry &entry)
++    {
++        if (!m_byPath.emplace(path, entry).second)
++            return;
++        m_paths.push_back(path);
++        const size_t slash = path.rfind('/');
++        m_byName.emplace(lower(slash == std::string::npos ? path : path.substr(slash + 1)), path);
++    }
++
++    bool Archive::open(ReadFn read)
++    {
++        m_read = std::move(read);
++        m_byPath.clear(), m_byName.clear(), m_paths.clear();
++        std::vector<uint8_t> head, header;
++        // ALL.DAT: a directory-style PIDX, 24-byte records (dir: 1, name, count, first) / (file: 0, name, -, offset,
++        // size, packed size).
++        if (m_read("ALL.DAT", 0, 0x60, head))
++        {
++            const uint32_t stringOffset = u32(head.data() + 0x20), stringSize = u32(head.data() + 0x24);
++            if (m_read("ALL.DAT", 0, size_t(stringOffset) + stringSize, header))
++            {
++                const uint32_t recordOffset = u32(header.data() + 0x0C), count = u32(header.data() + 0x10);
++                if (fits(header.size(), recordOffset, uint64_t(count) * 24))
++                {
++                    std::vector<uint8_t> seen(count, 0);
++                    std::function<void(uint32_t, const std::string &)> walk = [&](uint32_t i, const std::string &prefix) {
++                        if (i >= count || seen[i])
++                            return;
++                        seen[i] = 1;
++                        const uint8_t *r = header.data() + recordOffset + 24u * i;
++                        const std::string name = cstr(header, uint64_t(stringOffset) + u32(r + 4));
++                        if (u32(r) == 1)
++                            for (uint32_t j = u32(r + 12); j < u32(r + 12) + u32(r + 8) && j < count; ++j)
++                                walk(j, prefix + name + "/");
++                        else
++                            add(prefix + name, Entry{"ALL.DAT", "", u32(r + 12), u32(r + 16), u32(r + 20)});
++                    };
++                    for (uint32_t i = 0; i < count; ++i)
++                        walk(i, "");
++                }
++            }
++        }
++        // Pack archives: a PIDX whose table at 0x50 lists (name, 0, offset, size, entries) packs, each an FSTS file:
++        // count, entry table (name, offset, size, packed size), string table.
++        for (const char *dat : {"ADV.DAT", "ADVMAT.DAT", "SLG.DAT"})
++        {
++            if (!m_read(dat, 0, 0x60, head))
++                continue;
++            const uint32_t stringOffset = u32(head.data() + 0x20), stringSize = u32(head.data() + 0x24);
++            if (!m_read(dat, 0, size_t(stringOffset) + stringSize, header) || header.size() < 0x54)
++                continue;
++            const uint32_t packs = u32(header.data() + 0x50);
++            if (!fits(header.size(), 0x54, uint64_t(packs) * 4))
++                continue;
++            for (uint32_t p = 0; p < packs; ++p)
++            {
++                const uint32_t rel = u32(header.data() + 0x54 + 4u * p);
++                if (!fits(header.size(), 0x50ull + rel, 20))
++                    continue;
++                const uint8_t *r = header.data() + 0x50 + rel;
++                const std::string packName = cstr(header, uint64_t(stringOffset) + u32(r));
++                const uint64_t packOffset = u32(r + 8);
++                std::vector<uint8_t> fsHead, fs;
++                if (!m_read(dat, packOffset, 0x20, fsHead) || std::memcmp(fsHead.data(), "FSTS", 4) != 0)
++                    continue;
++                const uint32_t n = u32(fsHead.data() + 4), entryOffset = u32(fsHead.data() + 8);
++                const uint32_t namesOffset = u32(fsHead.data() + 12), namesSize = u32(fsHead.data() + 16);
++                if (!m_read(dat, packOffset, size_t(namesOffset) + namesSize, fs) || !fits(fs.size(), entryOffset, uint64_t(n) * 16))
++                    continue;
++                for (uint32_t i = 0; i < n; ++i)
++                {
++                    const uint8_t *e = fs.data() + entryOffset + 16u * i;
++                    add(cstr(fs, uint64_t(namesOffset) + u32(e)), Entry{dat, packName, packOffset + u32(e + 4), u32(e + 8), u32(e + 12)});
++                }
++            }
++        }
++        return !m_byPath.empty();
++    }
++
++    const Entry *Archive::find(const std::string &path) const
++    {
++        const auto it = m_byPath.find(path);
++        return it == m_byPath.end() ? nullptr : &it->second;
++    }
++
++    const Entry *Archive::findName(const std::string &name) const
++    {
++        const auto it = m_byName.find(lower(name));
++        return it == m_byName.end() ? nullptr : find(it->second);
++    }
++
++    bool Archive::read(const Entry &entry, std::vector<uint8_t> &out) const
++    {
++        const bool packed = entry.packed && entry.packed != entry.size;
++        std::vector<uint8_t> blob;
++        if (!m_read || !m_read(entry.dat, entry.offset, packed ? entry.packed : entry.size, blob))
++            return false;
++        if (!packed)
++        {
++            out = std::move(blob);
++            return true;
++        }
++        return raicDecompress(blob.data(), blob.size(), out) && out.size() == entry.size;
++    }
++
++    bool Archive::read(const std::string &pathOrName, std::vector<uint8_t> &out) const
++    {
++        const Entry *e = find(pathOrName);
++        if (!e)
++            e = findName(pathOrName);
++        return e && read(*e, out);
++    }
++
++    // ---- tables -------------------------------------------------------------------------------------------------
++
++    void parseTable(const uint8_t *data, size_t size, Table &table)
++    {
++        table = Table{};
++        auto trim = [](std::string s) {
++            const size_t a = s.find_first_not_of(" \t\r");
++            const size_t b = s.find_last_not_of(" \t\r");
++            return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
++        };
++        size_t o = 0;
++        while (o < size)
++        {
++            size_t end = o;
++            while (end < size && data[end] != '\n')
++                ++end;
++            std::string line(reinterpret_cast<const char *>(data + o), end - o);
++            o = end + 1;
++            if (const size_t semicolon = line.find(';'); semicolon != std::string::npos)
++                line.resize(semicolon);
++            line = trim(line);
++            if (line.empty())
++                continue;
++            if (line.front() == '[' && line.back() == ']')
++            {
++                table.sections.push_back(Table::Section{trim(line.substr(1, line.size() - 2)), {}});
++                continue;
++            }
++            const size_t equals = line.find('=');
++            if (equals == std::string::npos || table.sections.empty())
++                continue;
++            table.sections.back().entries.emplace_back(trim(line.substr(0, equals)), trim(line.substr(equals + 1)));
++        }
++    }
++
++    const Table::Section *Table::section(const std::string &name) const
++    {
++        for (const Section &s : sections)
++            if (s.name == name)
++                return &s;
++        return nullptr;
++    }
++
++    const std::string *Table::get(const std::string &sectionName, const std::string &key) const
++    {
++        if (const Section *s = section(sectionName))
++            for (const auto &[k, v] : s->entries)
++                if (k == key)
++                    return &v;
++        return nullptr;
++    }
++
++    float Table::number(const std::string &sectionName, const std::string &key, float fallback) const
++    {
++        const std::string *v = get(sectionName, key);
++        if (!v || v->empty())
++            return fallback;
++        char *end = nullptr;
++        const float f = std::strtof(v->c_str(), &end);
++        return end == v->c_str() ? fallback : f;
++    }
++
++    std::vector<std::string> Table::list(const std::string &sectionName) const
++    {
++        std::vector<std::string> out;
++        if (const Section *s = section(sectionName))
++            for (const auto &[k, v] : s->entries)
++                if (!k.empty() && k.front() == '#')
++                    out.push_back(v);
++        return out;
++    }
++
++    // ---- AGI textures -------------------------------------------------------------------------------------------
++
++    bool decodeAgi(const uint8_t *d, size_t n, Texture &t)
++    {
++        if (n < 0x20)
++            return false;
++        const uint32_t pixels = u32(d + 0x08), psm = u16(d + 0x0E), clut = u32(d + 0x1C);
++        const int w = u16(d + 0x18), h = u16(d + 0x1A);
++        if (w <= 0 || h <= 0 || w > 4096 || h > 4096)
++            return false;
++        t.width = w, t.height = h;
++        t.rgba.assign(size_t(w) * size_t(h), 0);
++        auto doubled = [](uint32_t c) { return (c & 0x00FFFFFFu) | (std::min<uint32_t>(255u, (c >> 24) * 2u) << 24); };
++        const size_t count = size_t(w) * size_t(h);
++        if (psm == 0x00) // PSMCT32
++        {
++            if (!fits(n, pixels, count * 4))
++                return false;
++            for (size_t i = 0; i < count; ++i)
++                t.rgba[i] = doubled(u32(d + pixels + 4 * i));
++            return true;
++        }
++        if (psm == 0x13 || psm == 0x14) // PSMT8 / PSMT4
++        {
++            const bool eight = psm == 0x13;
++            const uint32_t colours = eight ? 256u : 16u;
++            if (!fits(n, clut, colours * 4) || !fits(n, pixels, eight ? count : (count + 1) / 2))
++                return false;
++            uint32_t palette[256];
++            for (uint32_t i = 0; i < colours; ++i)
++            {
++                // 8-bit CLUTs are stored in CSM1 order: bits 3 and 4 of the index swapped.
++                const uint32_t k = eight ? ((i & 0xE7u) | ((i & 0x08u) << 1) | ((i & 0x10u) >> 1)) : i;
++                palette[i] = doubled(u32(d + clut + 4 * k));
++            }
++            for (size_t i = 0; i < count; ++i)
++            {
++                const uint8_t index = eight ? d[pixels + i] : uint8_t((d[pixels + i / 2] >> ((i & 1) * 4)) & 15u);
++                t.rgba[i] = palette[index];
++            }
++            return true;
++        }
++        return false;
++    }
++
++    // ---- AXO models ---------------------------------------------------------------------------------------------
++
++    namespace
++    {
++        struct Chunk
++        {
++            size_t offset; // of the 16-byte header
++            std::string tag;
++            uint32_t size, count, recordSize;
++        };
++        // 4cc, u32 payload size, u32 count, u32 record size; then the payload.
++        std::vector<Chunk> chunks(const uint8_t *d, size_t end, size_t o = 0)
++        {
++            std::vector<Chunk> out;
++            while (o + 16 <= end)
++            {
++                bool printable = true;
++                for (int i = 0; i < 4; ++i)
++                    printable = printable && d[o + i] >= 32 && d[o + i] < 127;
++                if (!printable)
++                    break;
++                Chunk c{o, std::string(reinterpret_cast<const char *>(d + o), 4), u32(d + o + 4), u32(d + o + 8), u32(d + o + 12)};
++                out.push_back(c);
++                if (c.size > end - o - 16)
++                    break;
++                o += 16 + c.size;
++            }
++            return out;
++        }
++
++        // DMA chain (tag, then qwc quadwords) into the VIF stream it carries: each tag's upper 64 bits (VIF codes)
++        // and its data, until an END / RET / CALL style tag.
++        std::vector<uint8_t> dmaVif(const uint8_t *d, size_t o, size_t end)
++        {
++            std::vector<uint8_t> out;
++            while (o + 16 <= end)
++            {
++                const uint32_t tag = u32(d + o);
++                const uint32_t qwc = tag & 0xFFFFu, id = (tag >> 28) & 7u;
++                const size_t take = std::min<size_t>(16u * qwc, end - o - 16);
++                out.insert(out.end(), d + o + 8, d + o + 16);
++                out.insert(out.end(), d + o + 16, d + o + 16 + take);
++                o += 16 + 16u * qwc;
++                if (id == 0 || id == 6 || id == 7)
++                    break;
++            }
++            return out;
++        }
++
++        // A batch: what the VIF unpacked to each VU address before an MSCAL (x, y, z, w as floats or integers).
++        struct Batch
++        {
++            std::map<uint32_t, std::vector<std::array<double, 4>>> data;
++        };
++        std::vector<Batch> vifBatches(const std::vector<uint8_t> &v)
++        {
++            std::vector<Batch> out;
++            Batch cur;
++            size_t o = 0;
++            while (o + 4 <= v.size())
++            {
++                const uint32_t code = u32(v.data() + o);
++                o += 4;
++                const uint32_t cmd = (code >> 24) & 0x7Fu, num = (code >> 16) & 0xFFu, imm = code & 0xFFFFu;
++                if ((cmd & 0x60u) == 0x60u) // UNPACK
++                {
++                    const uint32_t vn = (cmd >> 2) & 3u, vl = cmd & 3u, n = num ? num : 256u, comps = vn + 1;
++                    const size_t bytes = ((size_t(32u >> vl) * comps * n + 31) / 32) * 4;
++                    if (o + bytes > v.size())
++                        break;
++                    const uint8_t *p = v.data() + o;
++                    o += bytes;
++                    const uint32_t addr = imm & 0x3FFu;
++                    const bool usn = (imm >> 14) & 1u;
++                    if (vl == 3)
++                        continue;
++                    std::vector<std::array<double, 4>> vectors(n, std::array<double, 4>{0, 0, 0, 0});
++                    for (uint32_t i = 0; i < n; ++i)
++                        for (uint32_t c = 0; c < comps; ++c)
++                        {
++                            const size_t k = size_t(i) * comps + c;
++                            double value = 0;
++                            if (vl == 0)
++                                value = addr == 0 ? double(u32(p + 4 * k)) : double(f32(p + 4 * k));
++                            else if (vl == 1)
++                                value = usn ? double(u16(p + 2 * k)) : double(int16_t(u16(p + 2 * k)));
++                            else
++                                value = usn ? double(p[k]) : double(int8_t(p[k]));
++                            vectors[i][c] = value;
++                        }
++                    cur.data[addr] = std::move(vectors);
++                }
++                else if (cmd == 0x14 || cmd == 0x15 || cmd == 0x17) // MSCAL, MSCALF, MSCNT
++                {
++                    if (!cur.data.empty())
++                        out.push_back(std::move(cur));
++                    cur = Batch{};
++                }
++                else if (cmd == 0x20) // STMASK
++                    o += 4;
++                else if (cmd == 0x30 || cmd == 0x31) // STROW, STCOL
++                    o += 16;
++                else if (cmd == 0x4A) // MPG
++                    o += 8u * (num ? num : 256u);
++                else if (cmd == 0x50 || cmd == 0x51) // DIRECT, DIRECTHL
++                    o += 16u * (imm ? imm : 65536u);
++            }
++            if (!cur.data.empty())
++                out.push_back(std::move(cur));
++            return out;
++        }
++
++        bool finite3(const float *p) { return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]); }
++    }
++
++    size_t Model::triangles() const
++    {
++        size_t n = 0;
++        for (const Part &p : parts)
++            n += p.indices.size() / 3;
++        return n;
++    }
++
++    bool decodeAxo(const uint8_t *d, size_t n, Model &model, std::string *error)
++    {
++        auto fail = [&](const char *why) {
++            if (error)
++                *error = why;
++            return false;
++        };
++        model = Model{};
++        std::map<std::string, Chunk> byTag;
++        for (const Chunk &c : chunks(d, n))
++            byTag.emplace(c.tag, c);
++        for (const char *need : {"ATOM", "FRAM", "MTRL", "TEX ", "GEOG"})
++            if (!byTag.count(need))
++                return fail("an AXO chunk is missing");
++        auto records = [&](const char *tag, size_t minSize) {
++            std::vector<const uint8_t *> out;
++            const Chunk &c = byTag.at(tag);
++            if (c.recordSize < minSize || uint64_t(c.count) * c.recordSize > c.size)
++                return out;
++            for (uint32_t i = 0; i < c.count; ++i)
++                out.push_back(d + c.offset + 16 + size_t(c.recordSize) * i);
++            return out;
++        };
++        for (const uint8_t *r : records("FRAM", 52))
++        {
++            Frame f;
++            f.id = int32_t(u32(r));
++            for (int k = 0; k < 3; ++k)
++                f.t[k] = f32(r + 12 + 4 * k), f.r[k] = f32(r + 24 + 4 * k), f.s[k] = f32(r + 36 + 4 * k);
++            f.parent = int32_t(u32(r + 48));
++            model.frames.push_back(f);
++        }
++        for (const uint8_t *r : records("TEX ", 5))
++        {
++            std::string name;
++            const Chunk &c = byTag.at("TEX ");
++            for (size_t k = 4; k < c.recordSize && r[k]; ++k)
++                name.push_back(char(r[k]));
++            model.textures.push_back(name);
++        }
++        std::vector<int> materialTexture;
++        for (const uint8_t *r : records("MTRL", 64))
++            materialTexture.push_back(int32_t(u32(r + 60)));
++        // GEOG: one sub-chunk per geometry; its DMA chain starts 48 bytes into it.
++        std::vector<std::vector<Batch>> geometries;
++        {
++            const Chunk &g = byTag.at("GEOG");
++            for (const Chunk &c : chunks(d, g.offset + 16 + g.size, g.offset + 16))
++                geometries.push_back(vifBatches(dmaVif(d, c.offset + 48, std::min<size_t>(c.offset + 16 + c.size, n))));
++        }
++        for (const uint8_t *r : records("ATOM", 40))
++        {
++            // Five (4cc, value) pairs: FRAM, MTRL, GEOM, ...
++            int frame = -1, material = -1, geometry = -1;
++            for (int i = 0; i < 5; ++i)
++            {
++                const std::string tag(reinterpret_cast<const char *>(r + 8 * i), 4);
++                const int value = int32_t(u32(r + 8 * i + 4));
++                if (tag == "FRAM")
++                    frame = value;
++                else if (tag == "MTRL")
++                    material = value;
++                else if (tag == "GEOM")
++                    geometry = value;
++            }
++            if (geometry < 0 || size_t(geometry) >= geometries.size())
++                continue;
++            Part part;
++            part.frame = frame;
++            part.texture = material >= 0 && size_t(material) < materialTexture.size() ? materialTexture[size_t(material)] : -1;
++            if (part.texture >= int(model.textures.size()))
++                part.texture = -1;
++            for (const Batch &b : geometries[size_t(geometry)])
++            {
++                const auto tag = b.data.find(0), pos = b.data.find(1), uv = b.data.find(3), col = b.data.find(4);
++                if (tag == b.data.end() || pos == b.data.end() || uv == b.data.end() || col == b.data.end() || tag->second.empty())
++                    continue;
++                const uint32_t prim = uint32_t(tag->second[0][0]) & 7u; // 3 triangles, 4 strip, 5 fan
++                if (prim < 3 || prim > 5)
++                    continue;
++                const size_t count = std::min({pos->second.size(), uv->second.size(), col->second.size()});
++                const uint32_t base = uint32_t(part.vertices.size());
++                for (size_t i = 0; i < count; ++i)
++                {
++                    Vertex v{};
++                    for (int k = 0; k < 3; ++k)
++                        v.pos[k] = float(pos->second[i][size_t(k)]);
++                    for (int k = 0; k < 2; ++k)
++                    {
++                        const float t = float(uv->second[i][size_t(k)]);
++                        v.uv[k] = std::isfinite(t) ? t : 0.0f; // some haze shells carry NaN UVs on uniform textures
++                    }
++                    const auto &c = col->second[i];
++                    v.rgba = uint32_t(c[0]) & 0xFFu | (uint32_t(c[1]) & 0xFFu) << 8 | (uint32_t(c[2]) & 0xFFu) << 16 |
++                             (uint32_t(c[3]) & 0xFFu) << 24;
++                    part.vertices.push_back(v);
++                }
++                auto tri = [&](size_t a, size_t b2, size_t c2) {
++                    if (finite3(part.vertices[base + a].pos) && finite3(part.vertices[base + b2].pos) &&
++                        finite3(part.vertices[base + c2].pos))
++                        part.indices.insert(part.indices.end(), {base + uint32_t(a), base + uint32_t(b2), base + uint32_t(c2)});
++                };
++                if (prim == 3)
++                    for (size_t i = 0; i + 2 < count; i += 3)
++                        tri(i, i + 1, i + 2);
++                else if (prim == 4)
++                    for (size_t i = 0; i + 2 < count; ++i)
++                        (i & 1) ? tri(i + 1, i, i + 2) : tri(i, i + 1, i + 2);
++                else
++                    for (size_t i = 1; i + 1 < count; ++i)
++                        tri(0, i, i + 1);
++            }
++            if (!part.indices.empty())
++                model.parts.push_back(std::move(part));
++        }
++        if (model.parts.empty())
++            return fail("an AXO model without triangles");
++        return true;
++    }
++
++    void frameTransform(const Model &model, int frameId, float out[12])
++    {
++        auto byId = [&](int id) -> const Frame * {
++            for (const Frame &f : model.frames)
++                if (f.id == id)
++                    return &f;
++            return nullptr;
++        };
++        std::vector<const Frame *> chain;
++        for (const Frame *f = byId(frameId); f && chain.size() < 64 && std::find(chain.begin(), chain.end(), f) == chain.end();
++             f = byId(f->parent))
++            chain.push_back(f);
++        double m[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, t[3] = {0, 0, 0};
++        for (auto it = chain.rbegin(); it != chain.rend(); ++it) // root first
++        {
++            const Frame &f = **it;
++            const double cx = std::cos(f.r[0]), sx = std::sin(f.r[0]), cy = std::cos(f.r[1]), sy = std::sin(f.r[1]);
++            const double cz = std::cos(f.r[2]), sz = std::sin(f.r[2]);
++            // Rz * Ry * Rx (X applied first), columns scaled.
++            const double rx[3][3] = {{1, 0, 0}, {0, cx, -sx}, {0, sx, cx}};
++            const double ry[3][3] = {{cy, 0, sy}, {0, 1, 0}, {-sy, 0, cy}};
++            const double rz[3][3] = {{cz, -sz, 0}, {sz, cz, 0}, {0, 0, 1}};
++            double yx[3][3] = {}, local[3][3] = {};
++            for (int i = 0; i < 3; ++i)
++                for (int j = 0; j < 3; ++j)
++                    for (int k = 0; k < 3; ++k)
++                        yx[i][j] += ry[i][k] * rx[k][j];
++            for (int i = 0; i < 3; ++i)
++                for (int j = 0; j < 3; ++j)
++                {
++                    for (int k = 0; k < 3; ++k)
++                        local[i][j] += rz[i][k] * yx[k][j];
++                    local[i][j] *= f.s[j];
++                }
++            double nt[3];
++            for (int i = 0; i < 3; ++i)
++                nt[i] = t[i] + m[i][0] * f.t[0] + m[i][1] * f.t[1] + m[i][2] * f.t[2];
++            double nm[3][3] = {};
++            for (int i = 0; i < 3; ++i)
++                for (int j = 0; j < 3; ++j)
++                    for (int k = 0; k < 3; ++k)
++                        nm[i][j] += m[i][k] * local[k][j];
++            std::memcpy(m, nm, sizeof(m));
++            std::memcpy(t, nt, sizeof(t));
++        }
++        for (int i = 0; i < 3; ++i)
++        {
++            for (int j = 0; j < 3; ++j)
++                out[3 * i + j] = float(m[i][j]);
++            out[9 + i] = float(t[i]);
++        }
++    }
++
++    void modelBounds(const Model &model, float lo[3], float hi[3])
++    {
++        for (int k = 0; k < 3; ++k)
++            lo[k] = 1e30f, hi[k] = -1e30f;
++        for (const Part &p : model.parts)
++        {
++            float m[12];
++            frameTransform(model, p.frame, m);
++            for (uint32_t i : p.indices)
++            {
++                const float *v = p.vertices[i].pos;
++                for (int k = 0; k < 3; ++k)
++                {
++                    const float w = m[3 * k] * v[0] + m[3 * k + 1] * v[1] + m[3 * k + 2] * v[2] + m[9 + k];
++                    lo[k] = std::min(lo[k], w), hi[k] = std::max(hi[k], w);
++                }
++            }
++        }
++    }
++}
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.h b/ps2xRuntime/src/lib/battlevr/bvr_assets.h
+new file mode 100644
+index 0000000..5094966
+--- /dev/null
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.h
+@@ -0,0 +1,121 @@
++// The VR battle renderer's assets, read from the player's own disc at run time (nothing is shipped or written):
++// the archives (ALL.DAT's directory index and the FSTS packs of ADV.DAT, ADVMAT.DAT and SLG.DAT, RAIC-compressed
++// entries), AXO models (the ships: frames, materials, VIF-packed geometry) and AGI textures.
++//
++// A C++ port of the port's Python decoders (tools/assets/extract_skybox.py: Disc, PIDX, FSTS, RAIC, Model, Texture;
++// docs/assets/skybox.md describes the formats). Game coordinates: X right, Y down, Z forward.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <filesystem>
++#include <functional>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace bvr_assets
++{
++    // Reads `size` bytes at `offset` of a disc file named by its root name ("SLG.DAT") into `out`.
++    using ReadFn = std::function<bool(const std::string &discFile, uint64_t offset, size_t size, std::vector<uint8_t> &out)>;
++
++    // The mounted disc (ps2_disc: the image the virtual drive uses, mod overlays included).
++    ReadFn mountedDisc();
++    // A plain ISO image (tests and tools): its root directory's files.
++    ReadFn isoFile(const std::filesystem::path &image);
++
++    // 'RAIC' (XOR 0x72, then LZSS with a 4 KiB window) or 'RAIB' (XOR 0x72 only); false when the stream is neither or
++    // is truncated.
++    bool raicDecompress(const uint8_t *data, size_t size, std::vector<uint8_t> &out);
++
++    struct Entry
++    {
++        std::string dat;     // ALL.DAT, ADV.DAT, ADVMAT.DAT, SLG.DAT
++        std::string pack;    // the FSTS pack ("slginit000200"), empty for ALL.DAT
++        uint64_t offset = 0; // in the DAT file
++        uint32_t size = 0, packed = 0;
++    };
++
++    class Archive
++    {
++    public:
++        // Indexes the disc's archives; false when none could be read.
++        bool open(ReadFn read);
++        // By full path ("slg/machines/si_mon_0000.axo"), or by file name alone ("si_mon_0000.axo", case does not
++        // matter). The first entry seen wins (packs repeat shared files).
++        const Entry *find(const std::string &path) const;
++        const Entry *findName(const std::string &name) const;
++        // Every path (for listings and tests).
++        const std::vector<std::string> &paths() const { return m_paths; }
++        bool read(const Entry &entry, std::vector<uint8_t> &out) const;
++        bool read(const std::string &pathOrName, std::vector<uint8_t> &out) const;
++
++    private:
++        void add(const std::string &path, const Entry &entry);
++        ReadFn m_read;
++        std::unordered_map<std::string, Entry> m_byPath;
++        std::unordered_map<std::string, std::string> m_byName; // lower-case file name -> path
++        std::vector<std::string> m_paths;
++    };
++
++    // The game's text tables (stage.tbl, the model tables): Shift-JIS, ';' comments, [SECTION] headers, KEY =VALUE
++    // lines and "#000 =value" list entries. Keys and values trimmed; values kept as bytes (names are Shift-JIS).
++    struct Table
++    {
++        struct Section
++        {
++            std::string name;
++            std::vector<std::pair<std::string, std::string>> entries;
++        };
++        std::vector<Section> sections;
++        const Section *section(const std::string &name) const;
++        // A value, or null.
++        const std::string *get(const std::string &section, const std::string &key) const;
++        float number(const std::string &section, const std::string &key, float fallback) const;
++        // The "#nnn" entries of a section, in order.
++        std::vector<std::string> list(const std::string &section) const;
++    };
++    void parseTable(const uint8_t *data, size_t size, Table &table);
++
++    struct Texture
++    {
++        int width = 0, height = 0;
++        std::vector<uint32_t> rgba; // 0xAABBGGRR, alpha 255 = opaque (the PS2's 0x80 doubled)
++    };
++    // AGI: pixels at +0x08, pixel format at +0x0E (PSMCT32, PSMT8 with a CSM1 CLUT, PSMT4), size at +0x18, CLUT at +0x1C.
++    bool decodeAgi(const uint8_t *data, size_t size, Texture &texture);
++
++    struct Vertex
++    {
++        float pos[3];
++        float uv[2];
++        uint32_t rgba; // vertex colour, 0x80 = 1.0 per channel (as the GS)
++    };
++    // One atom of a model: geometry in its frame's space, drawn with one texture.
++    struct Part
++    {
++        int frame = -1;   // Frame::id
++        int texture = -1; // index into Model::textures, -1 untextured
++        std::vector<Vertex> vertices;
++        std::vector<uint32_t> indices; // triangles, consistent winding along strips
++    };
++    struct Frame
++    {
++        int id = -1, parent = -1;
++        float t[3] = {0, 0, 0}, r[3] = {0, 0, 0}, s[3] = {1, 1, 1}; // translation, Euler radians (X, then Y, then Z), scale
++    };
++    struct Model
++    {
++        std::vector<Frame> frames;
++        std::vector<std::string> textures; // texture file names without extension ("si_mon_000")
++        std::vector<Part> parts;
++        size_t triangles() const;
++    };
++    bool decodeAxo(const uint8_t *data, size_t size, Model &model, std::string *error = nullptr);
++
++    // A frame's model-space transform (its parents applied): row-major 3x3 in m[0..8], translation in m[9..11];
++    // p' = M p + t.
++    void frameTransform(const Model &model, int frameId, float m[12]);
++    // The model's vertices in model space (each part through its frame), bounds of all parts.
++    void modelBounds(const Model &model, float lo[3], float hi[3]);
++}
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index 108299d..9b38594 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -1331,7 +1331,7 @@ namespace ga2_present
+         const int frameScale = frame.height / 448;
+         if (g_ready && sizesMatch && frame.width % 640 == 0 && frame.height % 448 == 0)
+             ga2_layers::setEnabled(layersAllowed && anime4k && frameScale >= 2, layersAllowed && s.hdBattle && frameScale >= 2,
+-                                   frameScale, s.uiSharp);
++                                   frameScale, s.uiSharp, s.filter == Filter::Anime4KHQ);
+         if (g_ready && ga2_layers::enabled())
+             processLayerJobs(s.filter == Filter::Anime4KHQ);
+         // Native text: the GS's rendering of the port's text taken out of a 2D picture rendered above 640x448; it is
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 6bc2218..3a80dbe 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -66,7 +66,7 @@ namespace ga2_layers
+ {
+     namespace
+     {
+-        std::atomic<bool> g_on{false}, g_on2d{false}, g_onHud{false}, g_uiSharp{true};
++        std::atomic<bool> g_on{false}, g_on2d{false}, g_onHud{false}, g_uiSharp{true}, g_hq{false};
+         std::atomic<int> g_scale{4};
+         std::atomic<bool> g_changedLayers{false};
+         std::mutex g_layerMutex;
+@@ -120,8 +120,9 @@ namespace ga2_layers
+             const std::filesystem::path dir = cacheDir();
+             if (dir.empty())
+                 return {};
++            // The network is part of the name: Anime4K and Anime4K HQ results are different pictures.
+             char name[48];
+-            std::snprintf(name, sizeof(name), "%016llx_x%d.png", (unsigned long long)hash, scale);
++            std::snprintf(name, sizeof(name), "%016llx_x%d%s.png", (unsigned long long)hash, scale, g_hq.load() ? "_hq" : "");
+             return dir / name;
+         }
+ 
+@@ -141,12 +142,13 @@ namespace ga2_layers
+         }
+     }
+ 
+-    void setEnabled(bool scenes2d, bool hud, int scale, bool uiSharp)
++    void setEnabled(bool scenes2d, bool hud, int scale, bool uiSharp, bool hq)
+     {
+         scale = scale >= 4 ? 4 : 2;
+-        if (g_uiSharp.exchange(uiSharp) != uiSharp)
++        const bool uiChanged = g_uiSharp.exchange(uiSharp) != uiSharp;
++        if (g_hq.exchange(hq) != hq || uiChanged)
+         {
+-            // The interface's images change (sharp pixels or Anime4K): the CPU copies go.
++            // The pictures change (sharp pixels or Anime4K for the interface; the network): the CPU copies go.
+             std::lock_guard<std::mutex> lock(g_layerMutex);
+             g_results.clear();
+             g_resultOrder.clear();
+@@ -159,6 +161,7 @@ namespace ga2_layers
+         g_on = scenes2d || hud;
+     }
+     bool uiSharp() { return g_uiSharp.load(); }
++    bool hq() { return g_hq.load(); }
+     bool enabled() { return g_on.load(); }
+     bool enabled2d() { return g_on2d.load(); }
+     bool enabledHud() { return g_onHud.load(); }
+@@ -1190,7 +1193,7 @@ namespace ga2_texpacks
+                         if (!layers)
+                             return {};
+                         const std::string key = deviceKey(device) + "layer" + std::to_string(ga2_layers::scale()) +
+-                                                (ga2_layers::uiSharp() ? "s" : "a") + name;
++                                                (ga2_layers::uiSharp() ? "s" : "a") + (ga2_layers::hq() ? "h" : "m") + name;
+                         if (const auto cached = g_layerImages.find(key); cached != g_layerImages.end())
+                         {
+                             g_layerOrder.splice(g_layerOrder.end(), g_layerOrder, cached->second.second);
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.h b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+index 0a7b62f..33304fd 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.h
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+@@ -54,9 +54,11 @@ namespace ga2_layers
+ {
+     // On, and the scale (2 or 4: the internal resolution). A change drops the GS's cached textures.
+     // In 2D scenes (2D art) and over 3D scenes (the battle HUD), each on its own.
+-    // uiSharp: the interface (ga2_uiart.h) as sharp pixels; else Anime4K like the pictures.
+-    void setEnabled(bool scenes2d, bool hud, int scale, bool uiSharp = true);
++    // uiSharp: the interface (ga2_uiart.h) as sharp pixels; else Anime4K like the pictures. hq: the pictures by
++    // Anime4K HQ (the VL networks) instead of Anime4K (M); each has its own disk cache entries.
++    void setEnabled(bool scenes2d, bool hud, int scale, bool uiSharp = true, bool hq = false);
+     bool uiSharp();
++    bool hq();
+     bool enabled(); // either
+     bool enabled2d();
+     bool enabledHud();
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 377e577..c93a85d 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -32,6 +32,7 @@ add_library(ps2_test_lib STATIC
+     src/ga2_vr_input_tests.cpp
+     src/ga2_vr_hand_tests.cpp
+     src/ga2_flatart_tests.cpp
++    src/bvr_assets_tests.cpp
+     src/ga2_settings_tests.cpp
+     src/ga2_text_icons_tests.cpp
+     src/ga2_hitext_tests.cpp
+diff --git a/ps2xTest/src/bvr_assets_tests.cpp b/ps2xTest/src/bvr_assets_tests.cpp
+new file mode 100644
+index 0000000..5b5c0eb
+--- /dev/null
++++ b/ps2xTest/src/bvr_assets_tests.cpp
+@@ -0,0 +1,140 @@
++#include "MiniTest.h"
++
++#include "battlevr/bvr_assets.h"
++
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace
++{
++    uint64_t fnv(const std::vector<uint32_t> &rgba)
++    {
++        uint64_t h = 0xcbf29ce484222325ull;
++        for (uint32_t c : rgba)
++            for (int k = 0; k < 4; ++k)
++            {
++                h ^= (c >> (8 * k)) & 0xFFu;
++                h *= 0x100000001b3ull;
++            }
++        return h;
++    }
++    void put32(std::vector<uint8_t> &d, size_t at, uint32_t v)
++    {
++        for (int k = 0; k < 4; ++k)
++            d[at + size_t(k)] = uint8_t(v >> (8 * k));
++    }
++}
++
++void register_bvr_assets_tests()
++{
++    MiniTest::Case("BvrAssets", [](TestCase &tc) {
++        tc.Run("RAIC and RAIB streams decompress", [](TestCase &t) {
++            // RAIB: stored, XOR 0x72.
++            std::vector<uint8_t> raib = {'R' ^ 0x72, 'A' ^ 0x72, 'I' ^ 0x72, 'B' ^ 0x72, 3, 0, 0, 0, 'x' ^ 0x72, 'y' ^ 0x72, 'z' ^ 0x72};
++            std::vector<uint8_t> out;
++            t.IsTrue(bvr_assets::raicDecompress(raib.data(), raib.size(), out), "stored stream");
++            t.Equals(std::string(out.begin(), out.end()), std::string("xyz"), "its bytes");
++            // RAIC: flags 0x07 (three literals 'a' 'b' 'c', then a reference to window 0xFEE length 3 = "abc").
++            std::vector<uint8_t> src = {0x07, 'a', 'b', 'c', 0xEE, 0xF0};
++            std::vector<uint8_t> raic = {'R' ^ 0x72, 'A' ^ 0x72, 'I' ^ 0x72, 'C' ^ 0x72, 6, 0, 0, 0};
++            for (uint8_t b : src)
++                raic.push_back(uint8_t(b ^ 0x72));
++            t.IsTrue(bvr_assets::raicDecompress(raic.data(), raic.size(), out), "LZSS stream");
++            t.Equals(std::string(out.begin(), out.end()), std::string("abcabc"), "literals and a back reference");
++            raic[4] = 9; // claims more than it holds
++            t.IsFalse(bvr_assets::raicDecompress(raic.data(), raic.size(), out), "a truncated stream is refused");
++        });
++
++        tc.Run("AGI PSMT8 uses the CSM1 CLUT order and doubles alpha", [](TestCase &t) {
++            std::vector<uint8_t> agi(0x40 + 4 + 256 * 4, 0);
++            put32(agi, 0x08, 0x40);
++            agi[0x0E] = 0x13;
++            agi[0x18] = 2, agi[0x1A] = 2;
++            put32(agi, 0x1C, 0x44);
++            agi[0x40] = 0x08, agi[0x41] = 0x10, agi[0x42] = 1, agi[0x43] = 0;
++            put32(agi, 0x44 + 4 * 0x10, 0x80112233u); // index 0x08 reads CLUT slot 0x10
++            put32(agi, 0x44 + 4 * 0x08, 0x40445566u); // index 0x10 reads CLUT slot 0x08
++            put32(agi, 0x44 + 4 * 0x01, 0x00000000u);
++            bvr_assets::Texture tex;
++            t.IsTrue(bvr_assets::decodeAgi(agi.data(), agi.size(), tex), "decoded");
++            t.Equals(tex.rgba[0], 0xFF112233u, "index 8 -> slot 16, alpha 0x80 -> 255");
++            t.Equals(tex.rgba[1], 0x80445566u, "index 16 -> slot 8, alpha 0x40 -> 0x80");
++            t.Equals(tex.rgba[2], 0x00000000u, "transparent");
++        });
++
++        // GA2_TEST_ISO=<Eigou disc 1 image>: the ship models and their textures match the Python decoder
++        // (tools/assets/extract_skybox.py), numbers taken from it on 2026-11-19.
++        tc.Run("disc models match the Python decoder (GA2_TEST_ISO)", [](TestCase &t) {
++            const char *iso = std::getenv("GA2_TEST_ISO");
++            if (!iso || !*iso)
++            {
++                t.IsTrue(true, "skipped: GA2_TEST_ISO not set");
++                return;
++            }
++            bvr_assets::Archive archive;
++            t.IsTrue(archive.open(bvr_assets::isoFile(iso)), "archives indexed");
++            struct Ref
++            {
++                const char *name;
++                size_t triangles;
++                float lo[3], hi[3];
++                const char *tex[2];
++                uint64_t hash[2];
++            };
++            const Ref refs[] = {
++                {"si_mon_0000.axo", 1708, {-13.333f, -4.26f, -24.867f}, {13.333f, 4.26f, 12.738f}, {"si_mon_000", "si_mon_010"},
++                 {0x85596151e90d7d39ull, 0x33f9e744df3ebe33ull}},
++                {"si_mes_0101.axo", 195, {-30.72f, -40.96f, -83.28f}, {30.72f, 92.6f, 163.76f}, {"enm01", "si_mes_0100"},
++                 {0x4ce4484added7987ull, 0xf9aa923cf254a244ull}},
++                {"si_mon_1000.axo", 1712, {-8.437f, -7.403f, -23.232f}, {8.437f, 7.403f, 12.134f}, {"si_mon_100", "si_mon_110"}, {0, 0}},
++                {"si_mon_2000.axo", 2139, {-10.677f, -10.331f, -15.017f}, {10.677f, 10.331f, 12.334f}, {"si_mon_210", "si_mon_200"}, {0, 0}},
++                {"si_mes_0102b.axo", 130, {-60.16f, -10.24f, -23.12f}, {-20.48f, 10.24f, 42.16f}, {"enm01", "si_mes_0100"}, {0, 0}},
++            };
++            {
++                // The model table names its model, motion and clips.
++                std::vector<uint8_t> text;
++                bvr_assets::Table table;
++                t.IsTrue(archive.read("slg/machines/si_mon_0000.tbl", text), "model table read");
++                bvr_assets::parseTable(text.data(), text.size(), table);
++                const auto models = table.list("MODELFILE");
++                t.IsTrue(!models.empty() && models[0] == "slg/machines/si_mon_0000.axo", "MODELFILE #000");
++                t.IsTrue(table.get("HEADER", "TEXDIR") && *table.get("HEADER", "TEXDIR") == "slg/machines", "TEXDIR");
++                t.IsTrue(table.number("ANIME01", "PLAYSPEED", -1.0f) == 1.0f, "ANIME01 PLAYSPEED");
++                t.IsTrue(table.number("ANIME02", "BEGINFRAME", 0.0f) == -1.0f, "ANIME02 BEGINFRAME");
++            }
++            for (const Ref &r : refs)
++            {
++                std::vector<uint8_t> data;
++                bvr_assets::Model model;
++                std::string error;
++                const bool ok = archive.read(r.name, data) && bvr_assets::decodeAxo(data.data(), data.size(), model, &error);
++                t.IsTrue(ok, std::string(r.name) + " decoded " + error);
++                if (!ok)
++                    continue;
++                t.Equals(model.triangles(), r.triangles, std::string(r.name) + " triangles");
++                float lo[3], hi[3];
++                bvr_assets::modelBounds(model, lo, hi);
++                bool bounds = true;
++                for (int k = 0; k < 3; ++k)
++                    bounds = bounds && std::fabs(lo[k] - r.lo[k]) < 0.01f && std::fabs(hi[k] - r.hi[k]) < 0.01f;
++                t.IsTrue(bounds, std::string(r.name) + " bounds");
++                t.Equals(model.textures.size(), size_t(2), std::string(r.name) + " textures");
++                for (int k = 0; k < 2 && model.textures.size() == 2; ++k)
++                {
++                    t.Equals(model.textures[size_t(k)], std::string(r.tex[k]), "texture name");
++                    if (!r.hash[k])
++                        continue;
++                    bvr_assets::Texture tex;
++                    const bool texOk = archive.read(model.textures[size_t(k)] + ".agi", data) &&
++                                       bvr_assets::decodeAgi(data.data(), data.size(), tex);
++                    t.IsTrue(texOk && tex.width == 256 && tex.height == 256, std::string(r.tex[k]) + " 256 x 256");
++                    t.Equals(fnv(tex.rgba), r.hash[k], std::string(r.tex[k]) + " pixels");
++                }
++            }
++        });
++    });
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 7bec540..aeb0cf8 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -10,6 +10,7 @@ void register_pad_keymap_tests();
+ void register_ga2_vr_input_tests();
+ void register_ga2_vr_hand_tests();
+ void register_ga2_flatart_tests();
++void register_bvr_assets_tests();
+ void register_ga2_settings_tests();
+ void register_ga2_text_icons_tests();
+ void register_ga2_hitext_tests();
+@@ -52,6 +53,7 @@ int main()
+     register_ga2_vr_input_tests();
+     register_ga2_vr_hand_tests();
+     register_ga2_flatart_tests();
++    register_bvr_assets_tests();
+     register_ga2_settings_tests();
+     register_ga2_text_icons_tests();
+     register_ga2_hitext_tests();
+-- 
+2.56.0
+

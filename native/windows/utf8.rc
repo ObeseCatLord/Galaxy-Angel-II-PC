@@ -1,0 +1,17 @@
+// The launcher's and the engines' Windows manifest: the process code page is UTF-8 (Windows 10 1903 and later), so
+// the narrow strings the programs pass around (argv, getenv, std::filesystem::path from char, fopen) are UTF-8 like
+// on Linux: a user name, folder or disc image name in Japanese (or any language) reaches the files it names. Long
+// paths allowed; runs as the user. (No DPI setting: raylib sizes its window itself.)
+1 24
+BEGIN
+"<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?>"
+"<assembly xmlns=""urn:schemas-microsoft-com:asm.v1"" manifestVersion=""1.0"">"
+"<trustInfo xmlns=""urn:schemas-microsoft-com:asm.v3""><security><requestedPrivileges>"
+"<requestedExecutionLevel level=""asInvoker"" uiAccess=""false""/>"
+"</requestedPrivileges></security></trustInfo>"
+"<application xmlns=""urn:schemas-microsoft-com:asm.v3""><windowsSettings>"
+"<activeCodePage xmlns=""http://schemas.microsoft.com/SMI/2019/WindowsSettings"">UTF-8</activeCodePage>"
+"<longPathAware xmlns=""http://schemas.microsoft.com/SMI/2016/WindowsSettings"">true</longPathAware>"
+"</windowsSettings></application>"
+"</assembly>"
+END

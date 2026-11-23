@@ -1,0 +1,446 @@
+From a0e55fdcc03e4140158ac17ab89b54cebe998f3e Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:56:44 -0600
+Subject: [PATCH] Disc images read past 2 GiB on Windows; crash logger
+
+- ga2_fileread (header-only): positional 64-bit reads (pread; ReadFile with a 64-bit OVERLAPPED offset). The Windows
+  release's std::ifstream::seekg (llvm-mingw libc++) and long-based fseek stop at 2 GiB: the Mugen discs' SYSTEM.CNF
+  lies at 4.2-4.5 GB, so the launcher found no BOOT2 line (issue #2; the 0.11.0 Windows launcher reproduces it under
+  Wine, the Linux build was fine). Used by the launcher's ISO reader (native/launcher), the disc mount's overlays and
+  segments taken from the image (the English pack's STRM.DAT segments), battlevr's disc reads; ps2_vfs host files
+  seek with _fseeki64 / fseeko.
+- Crash logger: a hard crash (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT; a Windows unhandled exception) writes its cause,
+  the game time and (glibc) a backtrace to the log before it proceeds (issue #1's Steam Deck log ended with no word).
+
+Verified: Mugen 1 imports with the fixed launcher and boots to its English title; a SIGSEGV run logs the backtrace;
+the Windows filter's types match the SDK's (static_assert) and catch an access violation under Wine.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_fileread.h  | 154 ++++++++++++++++++++
+ ps2xRuntime/src/lib/battlevr/bvr_assets.cpp |  30 ++--
+ ps2xRuntime/src/lib/ps2_disc_mount.cpp      |  10 +-
+ ps2xRuntime/src/lib/ps2_vfs.cpp             |  15 +-
+ ps2xRuntime/src/main.cpp                    |  76 ++++++++++
+ 5 files changed, 258 insertions(+), 27 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_fileread.h
+
+diff --git a/ps2xRuntime/include/runtime/ga2_fileread.h b/ps2xRuntime/include/runtime/ga2_fileread.h
+new file mode 100644
+index 0000000..c165b1c
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_fileread.h
+@@ -0,0 +1,154 @@
++// Reads at a 64-bit offset on every platform. Disc images are over 4 GB and some files live past 2 GiB in them (the
++// Mugen discs' SYSTEM.CNF at 4.2-4.5 GB): std::ifstream::seekg and long-based fseek stop at 2 GiB in the Windows build,
++// so they read the wrong bytes there. Positional reads (pread; ReadFile with a 64-bit OVERLAPPED offset) have no
++// seek pointer and no such limit.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <filesystem>
++#include <utility>
++
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
++namespace ga2_fileread
++{
++    class File
++    {
++    public:
++        File() = default;
++        explicit File(const std::filesystem::path &path) { open(path); }
++        ~File() { close(); }
++        File(const File &) = delete;
++        File &operator=(const File &) = delete;
++        File(File &&other) noexcept { swap(other); }
++        File &operator=(File &&other) noexcept
++        {
++            if (this != &other)
++            {
++                close();
++                swap(other);
++            }
++            return *this;
++        }
++
++        bool open(const std::filesystem::path &path)
++        {
++            close();
++#ifdef _WIN32
++            m_handle = CreateFileW(path.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++            if (m_handle == INVALID_HANDLE_VALUE)
++                return false;
++            LARGE_INTEGER size{};
++            if (!GetFileSizeEx(m_handle, &size))
++            {
++                close();
++                return false;
++            }
++            m_size = uint64_t(size.QuadPart);
++#else
++            m_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++            if (m_fd < 0)
++                return false;
++            struct stat st{};
++            if (fstat(m_fd, &st) != 0)
++            {
++                close();
++                return false;
++            }
++            m_size = uint64_t(st.st_size);
++#endif
++            return true;
++        }
++
++        void close()
++        {
++#ifdef _WIN32
++            if (m_handle != INVALID_HANDLE_VALUE)
++                CloseHandle(m_handle);
++            m_handle = INVALID_HANDLE_VALUE;
++#else
++            if (m_fd >= 0)
++                ::close(m_fd);
++            m_fd = -1;
++#endif
++            m_size = 0;
++        }
++
++        bool isOpen() const
++        {
++#ifdef _WIN32
++            return m_handle != INVALID_HANDLE_VALUE;
++#else
++            return m_fd >= 0;
++#endif
++        }
++        uint64_t size() const { return m_size; }
++
++        // All `count` bytes at `offset`, or false (past the end, or a read error).
++        bool readAt(uint64_t offset, void *destination, size_t count) const
++        {
++            if (!isOpen() || offset > m_size || count > m_size - offset)
++                return false;
++            auto *out = static_cast<uint8_t *>(destination);
++            while (count > 0)
++            {
++#ifdef _WIN32
++                const DWORD chunk = DWORD(count > 0x40000000u ? 0x40000000u : count);
++                OVERLAPPED at{};
++                at.Offset = DWORD(offset & 0xFFFFFFFFu);
++                at.OffsetHigh = DWORD(offset >> 32);
++                DWORD got = 0;
++                if (!ReadFile(m_handle, out, chunk, &got, &at) || got == 0)
++                    return false;
++#else
++                const ssize_t got = ::pread(m_fd, out, count, off_t(offset));
++                if (got <= 0)
++                    return false;
++#endif
++                out += size_t(got);
++                offset += uint64_t(got);
++                count -= size_t(got);
++            }
++            return true;
++        }
++
++    private:
++        void swap(File &other) noexcept
++        {
++#ifdef _WIN32
++            std::swap(m_handle, other.m_handle);
++#else
++            std::swap(m_fd, other.m_fd);
++#endif
++            std::swap(m_size, other.m_size);
++        }
++
++#ifdef _WIN32
++        HANDLE m_handle = INVALID_HANDLE_VALUE;
++#else
++        int m_fd = -1;
++#endif
++        uint64_t m_size = 0;
++    };
++
++    // One-off read of a file at an offset.
++    inline bool readAt(const std::filesystem::path &path, uint64_t offset, void *destination, size_t count)
++    {
++        File file(path);
++        return file.readAt(offset, destination, count);
++    }
++}
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+index 084ed52..51e419c 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+@@ -1,4 +1,5 @@
+ #include "bvr_assets.h"
++#include "runtime/ga2_fileread.h"
+ 
+ #include "../ps2_disc_mount.h"
+ 
+@@ -56,9 +57,9 @@ namespace bvr_assets
+             if (!ps2_disc::findFile(name, file, &image) || offset > file.size || size > file.size - offset)
+                 return false;
+             out.assign(size, 0);
+-            std::ifstream in(image, std::ios::binary);
+-            std::error_code ec;
+-            const uint64_t imageSize = std::filesystem::file_size(image, ec);
++            const ga2_fileread::File in(image); // positional reads: the images are over 4 GB (no 2 GiB seek limit)
++            const bool ec = !in.isOpen();
++            const uint64_t imageSize = in.size();
+             // Walk the extents to the requested bytes (files are mostly one extent).
+             uint64_t fileOffset = 0, done = 0;
+             for (const ps2_disc::Extent &e : file.extents)
+@@ -72,9 +73,7 @@ namespace bvr_assets
+                 const uint64_t position = uint64_t(e.lba) * kSector + from;
+                 if (!ec && position + count <= imageSize)
+                 {
+-                    in.seekg(std::streamoff(position));
+-                    in.read(reinterpret_cast<char *>(out.data() + done), std::streamsize(count));
+-                    if (!in)
++                    if (!in.readAt(position, out.data() + done, size_t(count)))
+                         return false;
+                 }
+                 else if (!ps2_disc::readOverlay(image, position, out.data() + done, size_t(count)))
+@@ -89,21 +88,19 @@ namespace bvr_assets
+     {
+         struct Iso
+         {
+-            std::ifstream in;
++            ga2_fileread::File in;
+             std::map<std::string, std::pair<uint64_t, uint64_t>> files; // upper-case name -> byte offset, size
+             std::mutex mutex;
+         };
+         auto iso = std::make_shared<Iso>();
+-        iso->in.open(image, std::ios::binary);
+-        if (iso->in)
++        if (iso->in.open(image))
+         {
+             std::vector<uint8_t> vd(kSector);
+             bool primary = false;
+             for (uint64_t sector = 16; sector < 116 && !primary; ++sector)
+             {
+-                iso->in.seekg(std::streamoff(sector * kSector));
+-                iso->in.read(reinterpret_cast<char *>(vd.data()), std::streamsize(kSector));
+-                if (!iso->in || std::memcmp(vd.data() + 1, "CD001", 5) != 0 || vd[0] == 255)
++                if (!iso->in.readAt(sector * kSector, vd.data(), kSector) || std::memcmp(vd.data() + 1, "CD001", 5) != 0 ||
++                    vd[0] == 255)
+                     break;
+                 primary = vd[0] == 1;
+             }
+@@ -111,8 +108,8 @@ namespace bvr_assets
+             {
+                 const uint64_t lba = u32(vd.data() + 156 + 2), size = u32(vd.data() + 156 + 10);
+                 std::vector<uint8_t> dir(size_t(std::min<uint64_t>(size, 1u << 20)));
+-                iso->in.seekg(std::streamoff(lba * kSector));
+-                iso->in.read(reinterpret_cast<char *>(dir.data()), std::streamsize(dir.size()));
++                if (!iso->in.readAt(lba * kSector, dir.data(), dir.size()))
++                    dir.clear();
+                 for (size_t pos = 0; pos < dir.size();)
+                 {
+                     const uint8_t n = dir[pos];
+@@ -151,10 +148,7 @@ namespace bvr_assets
+             if (it == iso->files.end() || offset > it->second.second || size > it->second.second - offset)
+                 return false;
+             out.resize(size);
+-            iso->in.clear();
+-            iso->in.seekg(std::streamoff(it->second.first + offset));
+-            iso->in.read(reinterpret_cast<char *>(out.data()), std::streamsize(size));
+-            return bool(iso->in);
++            return iso->in.readAt(it->second.first + offset, out.data(), size);
+         };
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.cpp b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+index 105b14a..b0381d3 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+@@ -2,6 +2,7 @@
+ #define NOMINMAX
+ #endif
+ #include "ps2_disc_mount.h"
++#include "runtime/ga2_fileread.h"
+ #include "ps2_runtime.h"
+ 
+ #include <nlohmann/json.hpp>
+@@ -643,10 +644,8 @@ namespace ps2_disc
+             }
+             else if (within < overlay->size)
+             {
+-                std::ifstream in(overlay->host, std::ios::binary);
+-                in.seekg(static_cast<std::streamoff>(within));
+                 const size_t wanted = static_cast<size_t>(std::min<uint64_t>(chunk, overlay->size - within));
+-                if (!in.read(reinterpret_cast<char *>(destination), static_cast<std::streamsize>(wanted)))
++                if (!ga2_fileread::readAt(overlay->host, within, destination, wanted))
+                     return false;
+             }
+             destination += chunk; position += chunk; size -= chunk;
+@@ -694,9 +693,8 @@ namespace ps2_disc
+             {
+                 const uint64_t within = offset - start;
+                 const size_t chunk = static_cast<size_t>(std::min<uint64_t>(size, segment.length - within));
+-                std::ifstream in(segment.fromImage ? image : file, std::ios::binary);
+-                in.seekg(static_cast<std::streamoff>(segment.source + within));
+-                if (!in.read(reinterpret_cast<char *>(destination), static_cast<std::streamsize>(chunk)))
++                // Segments taken from the disc image reach past 2 GiB (positional reads: no seek limit on Windows).
++                if (!ga2_fileread::readAt(segment.fromImage ? image : file, segment.source + within, destination, chunk))
+                     return false;
+                 destination += chunk;
+                 offset += chunk;
+diff --git a/ps2xRuntime/src/lib/ps2_vfs.cpp b/ps2xRuntime/src/lib/ps2_vfs.cpp
+index aff25e6..5dacfd9 100644
+--- a/ps2xRuntime/src/lib/ps2_vfs.cpp
++++ b/ps2xRuntime/src/lib/ps2_vfs.cpp
+@@ -49,12 +49,21 @@ namespace
+             return static_cast<int64_t>(bytes);
+         }
+ 
++        // 64-bit seeks (long is 32-bit on Windows: fseek stopped at 2 GiB there).
+         int64_t seek(int64_t offset, int whence) override
+         {
+-            if (!m_file || offset < std::numeric_limits<long>::min() || offset > std::numeric_limits<long>::max() || std::fseek(m_file, static_cast<long>(offset), whence) != 0)
++            if (!m_file)
+                 return -1;
+-            const long position = std::ftell(m_file);
+-            return position < 0 ? -1 : static_cast<int64_t>(position);
++#ifdef _WIN32
++            if (_fseeki64(m_file, offset, whence) != 0)
++                return -1;
++            const int64_t position = _ftelli64(m_file);
++#else
++            if (fseeko(m_file, static_cast<off_t>(offset), whence) != 0)
++                return -1;
++            const int64_t position = static_cast<int64_t>(ftello(m_file));
++#endif
++            return position < 0 ? -1 : position;
+         }
+ 
+     private:
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 88adfad..b202d97 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -14,6 +14,16 @@
+ #include <vector>
+ #include <filesystem>
+ #include <exception>
++#include <csignal>
++#include <cstdio>
++#include "runtime/ga2_activity.h"
++#if !defined(_WIN32) && !defined(__ANDROID__)
++#include <signal.h>
++#include <unistd.h>
++#if defined(__GLIBC__)
++#include <execinfo.h>
++#endif
++#endif
+ #include <algorithm>
+ #include <cstdlib>
+ 
+@@ -37,6 +47,21 @@ extern "C"
+     __declspec(dllimport) void *__stdcall LocalFree(void *);
+     __declspec(dllimport) int __stdcall WideCharToMultiByte(unsigned, unsigned long, const wchar_t *, int, char *, int,
+                                                            const char *, int *);
++    // The crash logger's filter (EXCEPTION_RECORD / EXCEPTION_POINTERS as the SDK lays them out).
++    struct Ga2ExceptionRecord
++    {
++        unsigned long ExceptionCode, ExceptionFlags;
++        Ga2ExceptionRecord *ExceptionRecord;
++        void *ExceptionAddress;
++        unsigned long NumberParameters;
++        unsigned long long ExceptionInformation[15];
++    };
++    struct Ga2ExceptionPointers
++    {
++        Ga2ExceptionRecord *ExceptionRecord;
++        void *ContextRecord;
++    };
++    __declspec(dllimport) void *__stdcall SetUnhandledExceptionFilter(long(__stdcall *)(Ga2ExceptionPointers *));
+ }
+ #endif
+ 
+@@ -109,6 +134,56 @@ namespace
+     }
+ #endif
+ 
++    // Hard crashes (a bad access, an abort, a bus error) used to end the log with no word (a Steam Deck report, issue
++    // #1): the signal or exception, the game time and (glibc) a backtrace go to the log first, then the crash proceeds.
++#if defined(_WIN32)
++    long __stdcall crashFilter(Ga2ExceptionPointers *info)
++    {
++        const Ga2ExceptionRecord *r = info ? info->ExceptionRecord : nullptr;
++        std::fprintf(stderr, "[crash] exception 0x%08lx at %p (game time %.1f s)\n", r ? static_cast<unsigned long>(r->ExceptionCode) : 0ul,
++                     r ? r->ExceptionAddress : nullptr, ga2_activity::gameSeconds());
++        if (r && r->ExceptionCode == 0xC0000005ul /* access violation */ && r->NumberParameters >= 2)
++            std::fprintf(stderr, "[crash] %s address 0x%llx\n", r->ExceptionInformation[0] ? "write to" : "read from",
++                         static_cast<unsigned long long>(r->ExceptionInformation[1]));
++        std::fflush(stderr);
++        return 0; // EXCEPTION_CONTINUE_SEARCH: the crash goes on as it would have
++    }
++    void setupCrashLogger() { SetUnhandledExceptionFilter(crashFilter); }
++#elif !defined(__ANDROID__)
++    void crashSignal(int sig)
++    {
++        const char *name = sig == SIGSEGV ? "SIGSEGV (bad memory access)" : sig == SIGBUS ? "SIGBUS" : sig == SIGILL ? "SIGILL"
++                         : sig == SIGFPE ? "SIGFPE" : sig == SIGABRT ? "SIGABRT (abort)" : "signal";
++        char line[160];
++        const int n = std::snprintf(line, sizeof(line), "[crash] %s (game time %.1f s); backtrace:\n", name, ga2_activity::gameSeconds());
++        if (n > 0)
++            (void)!::write(2, line, size_t(n));
++#if defined(__GLIBC__)
++        void *frames[64];
++        const int count = backtrace(frames, 64);
++        backtrace_symbols_fd(frames, count, 2);
++#endif
++        // SA_RESETHAND restored the default action: the crash goes on as it would have (core dump, exit status).
++        raise(sig);
++    }
++    void setupCrashLogger()
++    {
++        static std::vector<char> altStack(64 * 1024);
++        stack_t ss{};
++        ss.ss_sp = altStack.data();
++        ss.ss_size = altStack.size();
++        sigaltstack(&ss, nullptr);
++        struct sigaction sa{};
++        sa.sa_handler = crashSignal;
++        sigemptyset(&sa.sa_mask);
++        sa.sa_flags = SA_RESETHAND | SA_ONSTACK;
++        for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT})
++            sigaction(sig, &sa, nullptr);
++    }
++#else
++    void setupCrashLogger() {}
++#endif
++
+     void setupTerminateLogger() // to help on release build crashs
+     {
+         std::set_terminate([]()
+@@ -214,6 +289,7 @@ int main(int argc, char *argv[])
+     redirectStdioToLogcat();
+ #endif
+     setupTerminateLogger();
++    setupCrashLogger();
+ #ifdef _WIN32
+     // The CRT's argv is in the ANSI code page: a path with characters outside
+     // it (a user name, the launcher's data folder) would arrive as '?'. Decode
+-- 
+2.56.0
+

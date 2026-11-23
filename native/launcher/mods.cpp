@@ -44,7 +44,7 @@ namespace ga2
             if (!entry.is_directory(ec) || !std::filesystem::exists(manifest, ec))
                 continue;
             ModInfo mod;
-            mod.id = entry.path().filename().string();
+            mod.id = pathUtf8(entry.path().filename());
             mod.dir = entry.path();
             mod.name = mod.id;
             try

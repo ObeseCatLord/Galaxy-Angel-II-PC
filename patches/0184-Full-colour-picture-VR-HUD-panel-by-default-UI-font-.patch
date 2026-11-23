@@ -1,0 +1,156 @@
+From 515fb1ef19c983cc60afdaab95d04764fbb3c653 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 02:22:12 -0600
+Subject: [PATCH] Full-colour picture; VR HUD panel by default; UI font atlas
+ fix
+
+- Full colour (paraLLEl-GS full_color_scanout, GA2_PGS_FULL_COLOR, default on unless the PS2 dither is chosen): a
+  frame whose scanout buffer holds only the game's plain copy of its 32-bit target shows the target, so gradients
+  (nebula skies, glows, fades) have no 16-bit bands; other frames are scanned out as before. GA2_PERF logs how many
+  vsyncs used it.
+- VR: the stereo views' HUD is on its own panel by default (GS split and headset panel; GA2_VR_HUD_PANEL=0 bakes it
+  into the eyes as before, where the 4:3 HUD was stretched over the headset's nearly square view).
+- ga2_ui_font: the batch drawn with an atlas is flushed before that atlas is rebuilt for a new glyph (lines drawn
+  before showed another layout's glyphs: the Japanese VR guide was garbled); the guide's Japanese wrapping keeps
+  closing punctuation off the start of a line.
+
+Verified: Eigou 1 battle at 4x on the GPU path: band steps (6-12 levels between neighbours) 19 % -> 1.4 % of pixel
+pairs, the frame 1280x896 as before, 86 of 91 five-second windows fully in full colour (title, story, menus,
+battle); Zettai in the simulated headset: the cockpit HUD on its panel, smooth nebula, the guide's Japanese text
+readable; unit tests 661/662 (the known VU0 table check).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_ui_font.h |  6 +++++
+ ps2xRuntime/src/lib/ga2_vr.cpp            |  8 ++++--
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp         | 31 ++++++++++++++++++-----
+ 3 files changed, 37 insertions(+), 8 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_ui_font.h b/ps2xRuntime/include/runtime/ga2_ui_font.h
+index 743f42e..f79642a 100644
+--- a/ps2xRuntime/include/runtime/ga2_ui_font.h
++++ b/ps2xRuntime/include/runtime/ga2_ui_font.h
+@@ -14,6 +14,7 @@
+ // Sizes are "DrawText font sizes": a size-20 line is about as tall as raylib's default font at 20.
+ 
+ #include "raylib.h"
++#include "rlgl.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -102,8 +103,13 @@ namespace ga2_ui_font
+ 
+         inline void unload(Face &face)
+         {
++            // Text already drawn with this atlas waits in raylib's batch: draw it before the texture goes (a new
++            // atlas can get the same texture name with another layout, and the waiting lines would show wrong glyphs).
+             if (face.font.texture.id)
++            {
++                rlDrawRenderBatchActive();
+                 UnloadFont(face.font);
++            }
+             face.font = Font{};
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index ae49587..b8af5ac 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -2270,7 +2270,11 @@ void main()
+                 {
+                     // A word ends here (a Japanese character is a word of its own).
+                     std::string next = line.empty() ? word : line + (line.back() == ' ' || japanese ? "" : " ") + word;
+-                    if (!word.empty() && ga2_ui_font::measure(next, size) > width)
++                    // Closing punctuation never starts a line (it stays with the character before it).
++                    static const char *const kNoStart[] = {"、", "。", "，", "．", "）", "」", "』", "！", "？", "・", "ー", "〜"};
++                    const bool noStart = japanese && std::any_of(std::begin(kNoStart), std::end(kNoStart),
++                                                                 [&](const char *p) { return word == p; });
++                    if (!word.empty() && !noStart && ga2_ui_font::measure(next, size) > width)
+                     {
+                         flush();
+                         next = word;
+@@ -4080,7 +4084,7 @@ void main()
+             static const HudPanel panel = [] {
+                 HudPanel p;
+                 const char *v = std::getenv("GA2_VR_HUD_PANEL");
+-                p.enabled = v && std::strcmp(v, "1") == 0;
++                p.enabled = !(v && std::strcmp(v, "0") == 0); // on unless GA2_VR_HUD_PANEL=0 (as the GS split, gs_pgs.cpp)
+                 const char *lock = std::getenv("GA2_VR_HUD_LOCK");
+                 p.headLock = lock && std::strcmp(lock, "head") == 0;
+                 p.distance = envFloat("GA2_VR_HUD_DISTANCE", 1.6f, 0.4f, 20.0f);
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index e6728a5..9a98939 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -265,7 +265,7 @@ namespace
+         InstanceWorker jitterWorkers[3];
+         bool uiLayer = false;
+         bool desktopNative = false; // the UI layer instance serves the desktop's native battle map
+-        bool uiPanelStereo = false; // GA2_VR_HUD_PANEL=1: the overlay as one panel over the stereo views
++        bool uiPanelStereo = false; // the overlay as one panel over the stereo views (GA2_VR_HUD_PANEL=0: baked in)
+         uint32_t instanceCount() const { return eyeCount + jitterCount + (uiLayer ? 1u : 0u); }
+         // The worker of instance i, or null when the calling thread runs it.
+         InstanceWorker *worker(uint32_t i)
+@@ -666,7 +666,9 @@ namespace
+         // 1: the game's 640x480; 4 scans it out at 1280x960, smoother on a panel close to the eyes) for about 2 ms of
+         // EE-thread time per vsync. GA2_VR_HUD_PANEL=0: no UI layer (the table cuts the HUD out of the picture).
+         s.hudDebug = envInt("GA2_VR_HUD_DEBUG", 0) == 1;
+-        s.uiPanelStereo = envInt("GA2_VR_HUD_PANEL", -1) == 1;
++        // Stereo views: the HUD on its own panel by default. Baked into the eye pictures it would be stretched to the
++        // headset's field of view (the game lays it out for 640x448 at 4:3; the eyes see a nearly square frame).
++        s.uiPanelStereo = envInt("GA2_VR_HUD_PANEL", -1) != 0;
+         // (Only for a headset's two eyes: widescreen detail also runs two instances, and needs no UI layer.)
+         // The desktop's native battle map (ga2_nativemap) lays the 3D under the game's 2D: the UI layer gives the 2D
+         // with its real alpha (one picture per game frame, on this worker: no game-thread cost measured).
+@@ -685,13 +687,18 @@ namespace
+                 std::fprintf(stderr, "[pgs] HUD panel: UI layer instance failed; the HUD stays in the eye images\n");
+         }
+         // The GA2 discs render into a 32-bit buffer, copy it with the GS's
+-        // ordered dither into a 16-bit scanout buffer and draw the UI on top
+-        // there (so backbuffer promotion cannot apply). Without the dither the
+-        // copy truncates to 16 bits; GA2_PGS_DITHER=1 (launcher option) keeps
+-        // the PS2 checkerboard.
++        // ordered dither into a 16-bit scanout buffer (the UI is drawn on top
++        // there in some scenes). Without the dither the copy truncates to 16
++        // bits (see full colour below); GA2_PGS_DITHER=1 (launcher option)
++        // keeps the PS2 checkerboard.
+         Hacks hacks = {};
+         hacks.disable_dither = envInt("GA2_PGS_DITHER", 0) == 0;
+         hacks.replacements_cover_rect = true; // gs_texpacks identifies and replaces cached regions
++        // Full colour: a frame whose scanout buffer holds only the plain copy of the 32-bit target shows that target
++        // (the copy's 16 bits band every gradient: the nebula skies, glows, fades); frames with anything else on the
++        // scanout buffer, or a tinted copy, are scanned out as before. The PS2 dither (GA2_PGS_DITHER=1) keeps the
++        // 16-bit picture. GA2_PGS_FULL_COLOR=0: always the 16-bit picture.
++        hacks.full_color_scanout = envInt("GA2_PGS_FULL_COLOR", 1) != 0 && hacks.disable_dither;
+         // Screen-space fills without a texture (the battle map's zones, order beams, gauge bars) are super-sampled,
+         // not drawn at the PS2's resolution on the snapped UI path: smooth edges at 2x and 4x. GA2_PGS_SSAA_FLAT=0: off.
+         hacks.ssaa_untextured_flat = envInt("GA2_PGS_SSAA_FLAT", 1) != 0;
+@@ -701,6 +708,8 @@ namespace
+             eye.hacks = hacks;
+             if (s.uiLayer)
+                 eye.hacks.ui_layer = e < s.eyeCount ? 1u : 2u;
++            if (eye.hacks.ui_layer == 2)
++                eye.hacks.full_color_scanout = false; // the UI layer instance takes its own snapshots
+             // Jitter instance k (1..3) samples (k & 1, k >> 1) eighths of a PS2 pixel right/down of eye 0: its
+             // geometry moves the other way (1/16 pixel units); only eye 0 reports the prompt sprites.
+             if (e >= s.eyeCount && e < s.eyeCount + s.jitterCount)
+@@ -1340,6 +1349,16 @@ namespace ga2_pgs
+                 eye.gs.set_hacks(eye.hacks);
+             }
+         }
++        if (std::getenv("GA2_PERF") && s.eyes[0].hacks.full_color_scanout)
++        {
++            static uint32_t shown = 0, vsyncs = 0;
++            shown += s.eyes[0].gs.consume_full_color_shown();
++            if (++vsyncs >= 300)
++            {
++                std::fprintf(stderr, "[pgs] full colour: %u of %u vsyncs showed the 32-bit frame\n", shown, vsyncs);
++                shown = vsyncs = 0;
++            }
++        }
+         {
+             const FlushStats f = s.eyes[0].gs.consume_flush_stats();
+             s.flushAcc.num_primitives += f.num_primitives;
+-- 
+2.56.0
+

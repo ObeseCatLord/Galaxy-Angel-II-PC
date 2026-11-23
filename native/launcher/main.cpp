@@ -255,7 +255,7 @@ namespace
                 {
                     {
                         std::lock_guard lock(m_mutex);
-                        m_importing = image.filename().string();
+                        m_importing = ga2::pathUtf8(image.filename());
                     }
                     try
                     {

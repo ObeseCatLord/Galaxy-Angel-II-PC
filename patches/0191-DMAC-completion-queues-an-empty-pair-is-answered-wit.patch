@@ -1,0 +1,93 @@
+From b52a87a745404fb9fee2ca317916941d88073d58 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:02:24 -0600
+Subject: [PATCH 191/191] DMAC completion queues: an empty pair is answered
+ without taking the lock twice
+
+PS2Runtime::Store32 drains the completed and the delayed DMAC cause queues after every guest store to a special
+address (scratchpad, uncached mirrors, MMIO), as do the IPU register paths: two mutex round trips and two vectors
+each time, with both queues empty nearly always (about 2 % of the game thread in a movie on a Steam Deck). A count of queued entries,
+kept under the queue's mutex, answers the empty case.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_memory.cpp | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index c1e40f6..6aea56f 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -166,6 +166,12 @@ namespace
+     constexpr uint32_t kEeTimerModeOvfe = 1u << 9;
+     constexpr uint32_t kEeTimerModeEquf = 1u << 10;
+     constexpr uint32_t kEeTimerModeOvff = 1u << 11;
++    // Entries waiting in the completed and delayed DMAC cause queues of all PS2Memory objects (changed under the
++    // queue's mutex). The queues are drained after every guest store to a special address and at every checkpoint
++    // (PS2Runtime::drainCompletedDmacHandlers) and are empty nearly every time: an empty pair of queues is answered
++    // from this count, without two locks. Kept here so the header the game code precompiles is untouched.
++    std::atomic<uint32_t> g_dmacCausesQueued{0};
++
+     // GIF_STAT's slot in the m_ioRegisters of one PS2Memory (the one that advanced its timers last), so
+     // advanceEeTimers does not look it up at every branch the EE takes. Kept here instead of in the class so the header
+     // the game code precompiles is untouched. An unordered_map's values keep their address until the map is cleared
+@@ -443,6 +449,7 @@ PS2Memory::PS2Memory()
+ 
+ PS2Memory::~PS2Memory()
+ {
++    g_dmacCausesQueued.fetch_sub(static_cast<uint32_t>(m_completedDmacCauses.size() + m_delayedDmacCauses.size()), std::memory_order_relaxed);
+     if (g_eeTimerDeferral.owner == this)
+         g_eeTimerDeferral = {};
+     if (g_gifStatOwner == this)
+@@ -526,6 +533,7 @@ bool PS2Memory::initialize(size_t ramSize)
+     m_vifWriteCount.store(0, std::memory_order_relaxed);
+     {
+         std::lock_guard<std::mutex> lock(m_completedDmacMutex);
++        g_dmacCausesQueued.fetch_sub(static_cast<uint32_t>(m_completedDmacCauses.size()), std::memory_order_relaxed);
+         m_completedDmacCauses.clear();
+     }
+     m_codeRegions.clear();
+@@ -2242,15 +2250,22 @@ void PS2Memory::completeDmacChannelDelayed(uint32_t channelBase, uint32_t cause,
+     // completeDmacChannel queued the cause for immediate dispatch; move it.
+     auto it = std::find(m_completedDmacCauses.rbegin(), m_completedDmacCauses.rend(), cause);
+     if (it != m_completedDmacCauses.rend())
++    {
+         m_completedDmacCauses.erase(std::next(it).base());
++        g_dmacCausesQueued.fetch_sub(1u, std::memory_order_relaxed);
++    }
+     m_delayedDmacCauses.emplace_back(cause, latencyCycles);
++    g_dmacCausesQueued.fetch_add(1u, std::memory_order_relaxed);
+ }
+ 
+ std::vector<std::pair<uint32_t, uint64_t>> PS2Memory::consumeDelayedDmacCauses()
+ {
++    if (g_dmacCausesQueued.load(std::memory_order_relaxed) == 0u)
++        return {}; // nothing queued anywhere (see g_dmacCausesQueued)
+     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+     std::vector<std::pair<uint32_t, uint64_t>> causes;
+     causes.swap(m_delayedDmacCauses);
++    g_dmacCausesQueued.fetch_sub(static_cast<uint32_t>(causes.size()), std::memory_order_relaxed);
+     return causes;
+ }
+ 
+@@ -2854,13 +2869,17 @@ void PS2Memory::queueCompletedDmacCause(uint32_t cause)
+ {
+     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+     m_completedDmacCauses.push_back(cause);
++    g_dmacCausesQueued.fetch_add(1u, std::memory_order_relaxed);
+ }
+ 
+ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
+ {
++    if (g_dmacCausesQueued.load(std::memory_order_relaxed) == 0u)
++        return {}; // nothing queued anywhere (see g_dmacCausesQueued)
+     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+     std::vector<uint32_t> causes;
+     causes.swap(m_completedDmacCauses);
++    g_dmacCausesQueued.fetch_sub(static_cast<uint32_t>(causes.size()), std::memory_order_relaxed);
+     return causes;
+ }
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,109 @@
+From 42e3170cc7fa3b2d7258a6bf839516c87239b23a Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:17:59 -0600
+Subject: [PATCH 180/180] VR: follow the runtime's refresh rate;
+ GA2_FREERUN_UNTIL test aid
+
+- The headset's rate is the runtime's (SteamVR / Monado / the device's setting): nothing is requested unless
+  GA2_VR_REFRESH asks (was: 90 when offered). The game's cap follows the predicted display period as before and now
+  also XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB at once.
+- GA2_FREERUN_UNTIL=<game seconds>: free-running (GA2_FREERUN) until that game time, real time after it: a test
+  reaches a battle in about half the wall time and measures it at real speed (inputs timed by game time).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp |  8 +++++++
+ ps2xRuntime/src/lib/ga2_vr.cpp             | 28 ++++++++++++++++------
+ 2 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 8bc5973..1ca66e0 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -22,12 +22,20 @@ namespace
+     // events fire at their EE cycle alone and guest time no longer depends on the
+     // host's speed (two runs of the same input match however loaded the host is;
+     // the game runs as fast as the host can, sound is not real time).
++    // GA2_FREERUN_UNTIL=<game seconds> (test aid): free-running only until that game time, real time after it (runs
++    // reach a battle in a fraction of the time, then measure it at real speed; time inputs by game time, GA2_PAD_SCRIPT).
+     bool freeRun()
+     {
+         static const bool value = [] {
+             const char *v = std::getenv("GA2_FREERUN");
+             return v && *v && *v != '0';
+         }();
++        static const double until = [] {
++            const char *v = std::getenv("GA2_FREERUN_UNTIL");
++            return v && *v ? std::atof(v) : -1.0;
++        }();
++        if (until > 0.0)
++            return ga2_activity::gameSeconds() < until;
+         return value;
+     }
+     // Not time_point{}: processDueDeadlines uses that as "nothing due".
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 14ab335..ae49587 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -3177,8 +3177,8 @@ void main()
+             return true;
+         }
+ 
+-        // XR_FB_display_refresh_rate: the rates the headset offers; ask for GA2_VR_REFRESH (Hz) if set, else 90 when
+-        // offered (the battle table's target), else leave the runtime's choice.
++        // XR_FB_display_refresh_rate: the rates the headset offers are logged; the runtime's rate is kept (OpenXR
++        // practice: the user sets it in SteamVR / Monado / on the device) unless GA2_VR_REFRESH asks for one.
+         void requestRefreshRate()
+         {
+             if (!extensionEnabled(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
+@@ -3201,13 +3201,12 @@ void main()
+             std::string list;
+             for (float r : rates)
+                 list += " " + std::to_string(int(std::lround(r)));
++            // The runtime decides the rate (SteamVR's or Monado's setting, the user's choice on the device) and the game
++            // follows it: its frame-rate cap tracks the predicted display period and the refresh-rate-changed event.
++            // Nothing is requested unless GA2_VR_REFRESH asks for a rate (the nearest offered).
+             float want = 0.0f;
+             if (const char *v = std::getenv("GA2_VR_REFRESH"); v && *v)
+                 want = float(std::atof(v));
+-            else
+-                for (float r : rates)
+-                    if (std::fabs(r - 90.0f) < 1.0f)
+-                        want = r;
+             float now = 0.0f;
+             if (current)
+                 current(g_xr.session, &now);
+@@ -3223,7 +3222,7 @@ void main()
+                              XR_SUCCEEDED(res) ? "ok" : "refused");
+             }
+             else
+-                std::fprintf(stderr, "[vr] refresh rates offered:%s Hz; %.0f kept (no 90)\n", list.c_str(), now);
++                std::fprintf(stderr, "[vr] refresh rates offered:%s Hz; the runtime's %.0f Hz (followed)\n", list.c_str(), now);
+         }
+ 
+         bool startXr()
+@@ -3364,6 +3363,21 @@ void main()
+                         std::fprintf(stderr, "[vr] session ended; continuing on the monitor\n");
+                     }
+                 }
++                else if (event.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB)
++                {
++                    // The runtime changed the headset's rate (the user's setting): the game's cap follows at once.
++                    const auto &e = reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB &>(event);
++                    const int hz = int(std::lround(e.toDisplayRefreshRate));
++                    if (hz >= 50 && ga2_framepace::fps() > 0)
++                    {
++                        g_xr.capHz = hz;
++                        g_xr.periodCount = 0; // the period median starts over at the new rate
++                        const int cap = hz > 60 ? std::min(hz, ga2_framepace::fps()) : 60;
++                        ga2_framepace::setUserCap(cap);
++                        std::fprintf(stderr, "[vr] headset refresh changed %.0f -> %d Hz: game frame rate cap %d\n",
++                                     double(e.fromDisplayRefreshRate), hz, cap);
++                    }
++                }
+                 else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED)
+                 {
+                     // Which controllers the runtime found (and so which suggested bindings apply).
+-- 
+2.56.0
+

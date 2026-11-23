@@ -1,0 +1,226 @@
+From 2e9ceeff4141509693f05e4ac3b769cbc5ebf3e6 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:02:11 -0600
+Subject: [PATCH 186/191] Review fixes: scanout layout, native map split,
+ 64-bit CD reads, EINTR, helper threads off pinned cores
+
+- gs_pgs readback: the scanout image goes back to READ_ONLY_OPTIMAL after its copy (a full-colour frame shown on
+  two vsyncs is the same image; the second barrier declared a layout it no longer had).
+- ga2_nativemap: a frame that is not the battle map clears "ready", so the desktop's Fast map stops splitting the
+  picture into scene and UI layer after a battle.
+- readHostRange (EE-side sceCdRead stubs): positional 64-bit reads (ga2_fileread) instead of ifstream::seekg,
+  which stops at 2 GiB on Windows.
+- ga2_fileread: pread retried on EINTR.
+- ga2_affinity: the process's CPU mask saved before the game thread is pinned (big.LITTLE); the sharp-text worker,
+  the flat-art redraw worker and the Anime4K cache writer give themselves the original mask back.
+
+From the 0.12.0 code review (research/review-0.12/review.md). Verified: unit tests 661/662 (the known VU0 table
+check); desktop runs of the Eigou 1 battle and story.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_affinity.h    | 29 +++++++++++++++++++
+ ps2xRuntime/include/runtime/ga2_fileread.h    |  3 ++
+ .../src/lib/Kernel/Stubs/Helpers/Support.h    | 19 +++++-------
+ ps2xRuntime/src/lib/ga2_nativemap.cpp         |  5 ++++
+ ps2xRuntime/src/lib/gs/gs_hitext.cpp          |  6 +++-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp             |  8 +++++
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp        |  3 ++
+ 7 files changed, 60 insertions(+), 13 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_affinity.h
+
+diff --git a/ps2xRuntime/include/runtime/ga2_affinity.h b/ps2xRuntime/include/runtime/ga2_affinity.h
+new file mode 100644
+index 0000000..b00b220
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_affinity.h
+@@ -0,0 +1,29 @@
++// The game thread may be pinned to the largest cores of a big.LITTLE CPU (ps2_runtime.cpp, pinToFastestCores). Threads
++// it starts afterwards inherit that mask; helper threads that should not share the game thread's cores call
++// unpinThisThread() first, which gives them the process's original mask back (nothing happens when nothing was pinned).
++#pragma once
++
++#if defined(__linux__)
++#include <sched.h>
++#endif
++
++namespace ga2_affinity
++{
++#if defined(__linux__)
++    inline cpu_set_t g_original;
++    inline bool g_saved = false;
++    // The mask before pinning (called once, by the pinning thread, before it pins).
++    inline void saveOriginal(const cpu_set_t &mask)
++    {
++        g_original = mask;
++        g_saved = true;
++    }
++    inline void unpinThisThread()
++    {
++        if (g_saved)
++            sched_setaffinity(0, sizeof(g_original), &g_original);
++    }
++#else
++    inline void unpinThisThread() {}
++#endif
++}
+diff --git a/ps2xRuntime/include/runtime/ga2_fileread.h b/ps2xRuntime/include/runtime/ga2_fileread.h
+index c165b1c..f2dad1d 100644
+--- a/ps2xRuntime/include/runtime/ga2_fileread.h
++++ b/ps2xRuntime/include/runtime/ga2_fileread.h
+@@ -18,6 +18,7 @@
+ #endif
+ #include <windows.h>
+ #else
++#include <cerrno>
+ #include <fcntl.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+@@ -116,6 +117,8 @@ namespace ga2_fileread
+                     return false;
+ #else
+                 const ssize_t got = ::pread(m_fd, out, count, off_t(offset));
++                if (got < 0 && errno == EINTR)
++                    continue; // interrupted by a signal: read again
+                 if (got <= 0)
+                     return false;
+ #endif
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index 425b6b0..bee32d0 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1,6 +1,7 @@
+ #include <algorithm>
+ #include <cctype>
+ #include "../../../ps2_disc_mount.h"
++#include "runtime/ga2_fileread.h"
+ #include "runtime/ee_scheduler.h"
+ 
+ namespace
+@@ -445,22 +446,16 @@ namespace
+         if (mountedImage && !ps2_disc::imageReadable())
+         { g_lastCdError = -1; return false; }
+         std::vector<uint8_t> staged(byteCount, 0u);
+-        std::ifstream file(path, std::ios::binary);
+-        if (!file.is_open())
++        // Positional 64-bit reads (ga2_fileread.h): disc images are over 4 GB and seekg/long seeks stop at 2 GiB on Windows.
++        const ga2_fileread::File file(path);
++        if (!file.isOpen())
+         {
+             g_lastCdError = -1;
+             return false;
+         }
+-
+-        file.seekg(static_cast<std::streamoff>(offsetBytes), std::ios::beg);
+-        if (!file.good())
+-        {
+-            g_lastCdError = -1;
+-            return false;
+-        }
+-
+-        file.read(reinterpret_cast<char *>(staged.data()), static_cast<std::streamsize>(byteCount));
+-        if (static_cast<size_t>(file.gcount()) != byteCount && (!allowPadding || !file.eof() || file.bad()))
++        const uint64_t size = file.size();
++        const size_t available = offsetBytes >= size ? 0u : size_t(std::min<uint64_t>(byteCount, size - offsetBytes));
++        if ((available < byteCount && !allowPadding) || (available > 0 && !file.readAt(offsetBytes, staged.data(), available)))
+         { g_lastCdError = -1; return false; }
+         if (mountedImage && (readGeneration != ps2_disc::generation() || !ps2_disc::imageReadable()))
+         { g_lastCdError = -1; return false; }
+diff --git a/ps2xRuntime/src/lib/ga2_nativemap.cpp b/ps2xRuntime/src/lib/ga2_nativemap.cpp
+index 13a60d9..bfc5063 100644
+--- a/ps2xRuntime/src/lib/ga2_nativemap.cpp
++++ b/ps2xRuntime/src/lib/ga2_nativemap.cpp
+@@ -345,7 +345,12 @@ void main()
+         ga2_native3d::Frame f;
+         const bool mapFrame = ga2_native3d::frameFor(flip, f) && f.scene == ga2_native3d::Scene::BattleMap;
+         if (!mapFrame)
++        {
++            // Not the battle map (dialogue, menus, other views, after the battle): the game draws its own picture
++            // again, unsplit, until the next map frame.
++            ga2_native3d::setReady(ga2_native3d::Scene::BattleMap, false);
+             return split && ui ? overlay(scene, w, h, ui) : scene;
++        }
+         // The stage: identified from the units as the VR table does (and dropped when a unit does not belong to it).
+         bvr_ships::start();
+         {
+diff --git a/ps2xRuntime/src/lib/gs/gs_hitext.cpp b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+index eb14b59..61cc279 100644
+--- a/ps2xRuntime/src/lib/gs/gs_hitext.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+@@ -10,6 +10,7 @@
+ // squeezed to the original ink box) and with one vertical transform (em 17.1 px, baseline row 15.75 of the 18 px
+ // cell); descenders longer than the game's are compressed below the baseline, glyphs the game draws away from
+ // where the font does (~ ^ `) are moved to the game's height.
++#include "runtime/ga2_affinity.h"
+ #include "runtime/ga2_display.h"
+ #include "runtime/ga2_hitext.h"
+ #include "runtime/ga2_activity.h"
+@@ -630,7 +631,10 @@ namespace ga2_hitext
+             if (!r.workerStarted)
+             {
+                 r.workerStarted = true;
+-                std::thread(workerLoop).detach();
++                std::thread([] {
++                    ga2_affinity::unpinThisThread(); // not on the game thread's pinned cores
++                    workerLoop();
++                }).detach();
+             }
+             r.wake.notify_one();
+         }
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index a60c3e6..5c0e293 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -979,6 +979,10 @@ namespace
+                            VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+                            VK_ACCESS_2_TRANSFER_READ_BIT);
+         cmd->copy_image_to_buffer(*slot.buffer, *slot.small, 0, {}, {sw, sh, 1}, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
++        // The scanout image back to its read-only layout: the GS may hand the same image to the next vsync (a full-colour
++        // frame shown twice), whose barrier starts from READ_ONLY_OPTIMAL.
++        cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
++                           VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
+         cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
+                      VK_ACCESS_2_HOST_READ_BIT);
+         eye.device.submit(cmd);
+@@ -1050,6 +1054,10 @@ namespace
+                            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+         cmd->copy_image_to_buffer(*slot.buffer, *result.image, 0, {}, {w, h, 1}, 0, 0,
+                                   {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
++        // The scanout image back to its read-only layout: the GS may hand the same image to the next vsync (a full-colour
++        // frame shown twice), whose barrier starts from READ_ONLY_OPTIMAL.
++        cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
++                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
+         cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+         Fence fence;
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 3a80dbe..1d6a9fb 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -6,6 +6,7 @@
+ // runtime keeps alongside the GPU renderer. A PNG named after that hash in a
+ // pack folder replaces the region, at any resolution.
+ #include "gs_texpacks.h"
++#include "runtime/ga2_affinity.h"
+ #include "ga2_flatart.h"
+ #include "ga2_uiart.h"
+ #include "runtime/ga2_hitext.h"
+@@ -208,6 +209,7 @@ namespace ga2_layers
+         const std::filesystem::path file = keep ? cacheFile(hash, scale) : std::filesystem::path();
+         if (!file.empty())
+             std::thread([result, file] {
++                ga2_affinity::unpinThisThread();
+                 std::error_code ec;
+                 std::filesystem::create_directories(file.parent_path(), ec);
+                 const std::filesystem::path partial = file.string() + ".part";
+@@ -237,6 +239,7 @@ namespace ga2_layers
+         static std::once_flag started;
+         std::call_once(started, [] {
+             std::thread([] {
++                ga2_affinity::unpinThisThread();
+                 for (;;)
+                 {
+                     FlatJob job;
+-- 
+2.56.0
+

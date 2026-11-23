@@ -1,0 +1,137 @@
+From 8fa3a64679f1fc857b940e4d161020391f9b23aa Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:11:23 -0600
+Subject: [PATCH 164/171] VR battle table: unit markers stacked clear of each
+ other and drawn with depth (no discs cutting into each other)
+
+---
+ ps2xRuntime/src/lib/ga2_vr.cpp | 93 ++++++++++++++++++++++++++--------
+ 1 file changed, 71 insertions(+), 22 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index a9ba3df..a89c907 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -64,6 +64,7 @@ namespace ga2_vr
+         V3 operator-(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+         V3 operator*(V3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
+         float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
++        float length(V3 a) { return std::sqrt(dot(a, a)); }
+         V3 cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+         V3 normalize(V3 a)
+         {
+@@ -1296,8 +1297,17 @@ void main()
+             drawShips(viewProj, eye, st, pose, time);
+             glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+ 
+-            // The units: a ring on the table, a stalk and the icon as a disc over it (facing the player).
+-            glBlendFunc(GL_ONE, GL_ONE);
++            // The units: a ring on the table, a stalk and the icon as a disc over it (facing the player). The discs
++            // never cut into each other: crowded ones are stacked (each sits clear above any neighbour it would touch),
++            // and they are drawn with depth, far to near.
++            struct Marker
++            {
++                int n;
++                float u, v, lift, size, dist;
++                V3 head, tint;
++            };
++            Marker markers[ga2_battletable::kMaxUnits];
++            int markerCount = 0;
+             for (int n = 0; n < st.unitCount; ++n)
+             {
+                 const ga2_battletable::Unit &unit = st.units[n];
+@@ -1305,32 +1315,71 @@ void main()
+                 ga2_battletable::mapToTable(st, unit.x, unit.z, u, v);
+                 if (std::fabs(u) > pose.halfWidth * 0.97f || std::fabs(v) > pose.halfDepth * 0.97f)
+                     continue;
+-                const float lift = unit.hovered ? 0.075f : 0.06f;
+-                const V3 foot = playPoint(pose, u, v, 0.002f), head = playPoint(pose, u, v, lift);
++                Marker &m = markers[markerCount++];
++                m.n = n, m.u = u, m.v = v;
++                m.size = unit.hovered ? 0.030f : 0.022f;
++                m.lift = unit.hovered ? 0.085f : 0.07f; // over the ship
++                m.tint = unit.selected ? V3{1.0f, 0.78f, 0.25f} : unit.enemy ? V3{1.0f, 0.35f, 0.2f} : V3{0.3f, 0.7f, 1.0f};
++                m.dist = length(playPoint(pose, u, v, m.lift) - eye);
++            }
++            // Layout: nearest first keep their height; a disc that would touch an already placed one (closer than
++            // their two radii across the table, and overlapping in height) moves up above it.
++            std::sort(markers, markers + markerCount, [](const Marker &a, const Marker &b) { return a.dist < b.dist; });
++            for (int i = 0; i < markerCount; ++i)
++                for (int pass = 0; pass < 12; ++pass)
++                {
++                    bool moved = false;
++                    for (int j = 0; j < i; ++j)
++                    {
++                        const float du = markers[i].u - markers[j].u, dv = markers[i].v - markers[j].v;
++                        const float reach = (markers[i].size + markers[j].size) * 1.05f;
++                        if (du * du + dv * dv < reach * reach && std::fabs(markers[i].lift - markers[j].lift) < reach)
++                        {
++                            markers[i].lift = markers[j].lift + reach * 1.02f;
++                            moved = true;
++                        }
++                    }
++                    if (!moved)
++                        break;
++                }
++            glBlendFunc(GL_ONE, GL_ONE);
++            for (int i = 0; i < markerCount; ++i)
++            {
++                Marker &m = markers[i];
++                const ga2_battletable::Unit &unit = st.units[m.n];
++                m.head = playPoint(pose, m.u, m.v, m.lift);
++                const V3 foot = playPoint(pose, m.u, m.v, 0.002f);
+                 // Team colours (BattleGroupVR): blue friends, red-orange enemies; the selected angel gold.
+-                const V3 tint = unit.selected ? V3{1.0f, 0.78f, 0.25f} : unit.enemy ? V3{1.0f, 0.35f, 0.2f} : V3{0.3f, 0.7f, 1.0f};
+-                drawLine(viewProj, eye, foot, head, unit.selected ? 0.005f : 0.003f, tint, unit.hovered || unit.selected ? 0.9f : 0.45f);
+-                drawTableRing(viewProj, pose, u, v, unit.hovered ? 0.028f : 0.018f, unit.hovered ? 1.0f : 0.5f, time);
++                drawLine(viewProj, eye, foot, m.head, unit.selected ? 0.005f : 0.003f, m.tint, unit.hovered || unit.selected ? 0.9f : 0.45f);
++                drawTableRing(viewProj, pose, m.u, m.v, unit.hovered ? 0.028f : 0.018f, unit.hovered ? 1.0f : 0.5f, time);
+                 if (unit.selected) // a second, wider ring that marks the selection
+-                    drawTableRing(viewProj, pose, u, v, 0.036f + 0.003f * std::sin(time * 4.0f), 0.8f, time);
+-                // The icon disc, a billboard turned toward the eye about the vertical.
+-                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+-                glUseProgram(g_tableGl.icon);
+-                setMatrix(g_tableGl.icon, "mvp", viewProj);
+-                glUniform2f(glGetUniformLocation(g_tableGl.icon, "extent"), extentX, extentY);
+-                bindTableUi(g_tableGl.icon);
++                    drawTableRing(viewProj, pose, m.u, m.v, 0.036f + 0.003f * std::sin(time * 4.0f), 0.8f, time);
++            }
++            // The icon discs, billboards turned toward the eye about the vertical: far to near, with depth.
++            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++            glUseProgram(g_tableGl.icon);
++            setMatrix(g_tableGl.icon, "mvp", viewProj);
++            glUniform2f(glGetUniformLocation(g_tableGl.icon, "extent"), extentX, extentY);
++            bindTableUi(g_tableGl.icon);
++            glEnable(GL_DEPTH_TEST);
++            glDepthMask(GL_TRUE);
++            const GLint locSrc = glGetUniformLocation(g_tableGl.icon, "src"), locTint = glGetUniformLocation(g_tableGl.icon, "tint");
++            const GLint locGlow = glGetUniformLocation(g_tableGl.icon, "glow");
++            for (int i = markerCount - 1; i >= 0; --i)
++            {
++                const Marker &m = markers[i];
++                const ga2_battletable::Unit &unit = st.units[m.n];
+                 const float iconHalf = 24.0f;
+-                glUniform4f(glGetUniformLocation(g_tableGl.icon, "src"), unit.sx / 640.0f, unit.sy / 480.0f, iconHalf / 640.0f,
+-                            iconHalf / 480.0f);
+-                glUniform3f(glGetUniformLocation(g_tableGl.icon, "tint"), tint.x, tint.y, tint.z);
+-                glUniform1f(glGetUniformLocation(g_tableGl.icon, "glow"), unit.hovered ? 1.0f : 0.0f);
+-                const V3 toEye = eye - head;
++                glUniform4f(locSrc, unit.sx / 640.0f, unit.sy / 480.0f, iconHalf / 640.0f, iconHalf / 480.0f);
++                glUniform3f(locTint, m.tint.x, m.tint.y, m.tint.z);
++                glUniform1f(locGlow, unit.hovered ? 1.0f : 0.0f);
++                const V3 toEye = eye - m.head;
+                 const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
+                 const V3 right = normalize(cross(V3{0, 1, 0}, flat));
+-                const float size = unit.hovered ? 0.030f : 0.022f;
+-                rect(head + V3{0, size, 0}, right * size, V3{0, size, 0}, false);
+-                glBlendFunc(GL_ONE, GL_ONE);
++                rect(m.head + V3{0, m.size, 0}, right * m.size, V3{0, m.size, 0}, false);
+             }
++            glDepthMask(GL_FALSE);
++            glBlendFunc(GL_ONE, GL_ONE);
+ 
+             // The order being dragged: a beam from the hand's fingertip to the target, a ring there.
+             // Coloured by what letting go would do: cyan move, red attack, green support; grey (a short stub along
+-- 
+2.56.0
+

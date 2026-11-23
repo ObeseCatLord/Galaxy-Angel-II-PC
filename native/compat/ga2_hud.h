@@ -38,4 +38,7 @@ namespace ga2_hud
     void captureAreas(bool on);
     // The last whole frame's areas; returns their count.
     int areas(Area *out, int max);
+    // The last whole frame's items themselves (before merging; an area's panel shows only what lies inside them, not
+    // the map's own 2D markers that happen to fall inside the area's box).
+    int items(Area *out, int max);
 }

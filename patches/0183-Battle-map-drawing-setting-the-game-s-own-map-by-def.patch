@@ -1,0 +1,138 @@
+From 7c1d6e370111452e3b44d349c737fdc418992ebd Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:50:53 -0600
+Subject: [PATCH] Battle map drawing setting: the game's own map by default
+
+- New option "Battle map drawing" (battle_map, GA2_BATTLE_MAP; restart): Original (default) leaves the desktop
+  battle map's 3D to the game, as on the PS2; Fast has the PC draw it (the native map of 0179: about half the game
+  thread, high frame rates; close to the original, not identical). ga2_native3d::desktopMap() decides for the
+  presenter's pass and the UI layer instance; GA2_NATIVE_MAP=0 still forces it off. The VR battle table always draws
+  its own map.
+
+Verified: unit tests (option table round trip); GPU-path desktop runs of the Eigou 1 battle: by default no native map
+(the game draws it, 60-75 fps as before 0179); with GA2_BATTLE_MAP=fast the native map is drawn.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_native3d.h |  3 +++
+ ps2xRuntime/include/runtime/ga2_options.h  |  6 ++++++
+ ps2xRuntime/src/lib/ga2_native3d.cpp       | 12 ++++++++++++
+ ps2xRuntime/src/lib/ga2_nativemap.cpp      |  2 +-
+ ps2xRuntime/src/lib/ga2_nativemap.h        |  5 +++--
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp          |  2 +-
+ 6 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_native3d.h b/ps2xRuntime/include/runtime/ga2_native3d.h
+index 94a35c5..4c7bb37 100644
+--- a/ps2xRuntime/include/runtime/ga2_native3d.h
++++ b/ps2xRuntime/include/runtime/ga2_native3d.h
+@@ -45,6 +45,9 @@ namespace ga2_native3d
+ 
+     // Whether the desktop renderer draws the battle map natively (GA2_NATIVE_MAP, default on; native/compat skips the
+     // game's map meshes then). Set by the renderer once it can draw (its pipeline and the stage's assets ready).
++    // The desktop draws the battle map natively: the "Battle map drawing" setting is Fast (GA2_BATTLE_MAP=fast; the
++    // default, Original, leaves the map to the game) and GA2_NATIVE_MAP is not 0. Read once.
++    bool desktopMap();
+     void setReady(Scene scene, bool ready);
+     bool ready(Scene scene);
+ }
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index f838b2d..4de3b14 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -35,6 +35,7 @@ namespace ga2_options
+         Dither,
+         Deband,
+         HdBattle,
++        BattleMap,
+         UiUpscale,
+         Buttons,
+         SharpText,
+@@ -119,6 +120,11 @@ namespace ga2_options
+              "At 2x resolution and up, the battle's rings, arrows, stars, clock digits and icons are redrawn as sharp "
+              "shapes, and its panels and portraits upscaled. Off: the original pictures.",
+              "GA2_HD_BATTLE", Apply::Live, {{"1", "On"}, {"0", "Off (original)"}}},
++            {"battle_map", "Battle map drawing",
++             "Original: the game draws the battle map's 3D as on the PS2. Fast: the PC draws the map's grid, obstacles and "
++             "sky itself, about half the processor time, for high frame rates (close to the original, not identical). "
++             "The VR battle table always draws its own map.",
++             "GA2_BATTLE_MAP", Apply::Restart, {{"original", "Original"}, {"fast", "Fast (drawn by the PC)"}}},
+             {"ui_upscale", "Menus and HUD",
+              "How the menus, windows and battle HUD are enlarged at 2x and 4x. Sharp pixels: the original pixels, crisp. "
+              "Anime4K: smoothed like the characters and backgrounds.",
+diff --git a/ps2xRuntime/src/lib/ga2_native3d.cpp b/ps2xRuntime/src/lib/ga2_native3d.cpp
+index 16e6c98..6fda354 100644
+--- a/ps2xRuntime/src/lib/ga2_native3d.cpp
++++ b/ps2xRuntime/src/lib/ga2_native3d.cpp
+@@ -2,7 +2,9 @@
+ 
+ #include <array>
+ #include <atomic>
++#include <cstdlib>
+ #include <mutex>
++#include <string>
+ 
+ namespace ga2_native3d
+ {
+@@ -54,6 +56,16 @@ namespace ga2_native3d
+         return true;
+     }
+ 
++    bool desktopMap()
++    {
++        static const bool on = [] {
++            const char *mode = std::getenv("GA2_BATTLE_MAP");
++            const char *native = std::getenv("GA2_NATIVE_MAP");
++            return mode && std::string(mode) == "fast" && !(native && *native == '0');
++        }();
++        return on;
++    }
++
+     void setReady(Scene scene, bool ready)
+     {
+         const size_t i = static_cast<size_t>(scene);
+diff --git a/ps2xRuntime/src/lib/ga2_nativemap.cpp b/ps2xRuntime/src/lib/ga2_nativemap.cpp
+index fe87905..13a60d9 100644
+--- a/ps2xRuntime/src/lib/ga2_nativemap.cpp
++++ b/ps2xRuntime/src/lib/ga2_nativemap.cpp
+@@ -338,7 +338,7 @@ void main()
+ 
+     unsigned compose(unsigned scene, int w, int h, uint64_t flip, unsigned ui, bool split)
+     {
+-        static const bool on = envOn("GA2_NATIVE_MAP", true);
++        static const bool on = ga2_native3d::desktopMap();
+         static const bool debug = envOn("GA2_NATIVE_MAP_DEBUG", false);
+         if (!on || !scene || w <= 0 || h <= 0)
+             return scene;
+diff --git a/ps2xRuntime/src/lib/ga2_nativemap.h b/ps2xRuntime/src/lib/ga2_nativemap.h
+index 568a169..ff770c5 100644
+--- a/ps2xRuntime/src/lib/ga2_nativemap.h
++++ b/ps2xRuntime/src/lib/ga2_nativemap.h
+@@ -2,8 +2,9 @@
+ // under the GS picture. While it is ready the game skips its map meshes (native/compat/ga2_battledraw.cpp), so the GS
+ // frame holds only the 2D layer and the remaining effects over black; this pass draws the stage's sky and map model
+ // with the game's own camera (captured per frame, ga2_native3d) and lays the GS frame over them, keyed by brightness.
+-// GA2_NATIVE_MAP=0: off (the game draws the map as before). GA2_NATIVE_MAP_DEBUG=1: the game keeps drawing the map and
+-// the native lines are drawn over it in magenta (registration check).
++// Off by default: the setting "Battle map drawing" (GA2_BATTLE_MAP=fast) turns it on; GA2_NATIVE_MAP=0 forces it off.
++// GA2_NATIVE_MAP_DEBUG=1 (with fast): the game keeps drawing the map and the native lines are drawn over it in magenta
++// (registration check).
+ #pragma once
+ 
+ #include <cstdint>
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 33bf34b..e6728a5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -670,7 +670,7 @@ namespace
+         // (Only for a headset's two eyes: widescreen detail also runs two instances, and needs no UI layer.)
+         // The desktop's native battle map (ga2_nativemap) lays the 3D under the game's 2D: the UI layer gives the 2D
+         // with its real alpha (one picture per game frame, on this worker: no game-thread cost measured).
+-        s.desktopNative = s.eyeCount == 1 && s.jitterCount == 0 && envInt("GA2_NATIVE_MAP", 1) != 0;
++        s.desktopNative = s.eyeCount == 1 && s.jitterCount == 0 && ga2_native3d::desktopMap();
+         if ((s.eyeCount == 2 && !s.wideDetail && envInt("GA2_VR_HUD_PANEL", -1) != 0) || s.hudDebug || s.desktopNative)
+         {
+             GSOptions uiOptions = eyeOptions;
+-- 
+2.56.0
+

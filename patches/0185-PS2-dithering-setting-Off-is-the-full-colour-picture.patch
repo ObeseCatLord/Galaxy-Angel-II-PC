@@ -1,0 +1,57 @@
+From 5bb09da5c9a73bde20dcbe852bcc4e52c978f70a Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 02:23:44 -0600
+Subject: [PATCH] PS2 dithering setting: Off is the full-colour picture, live
+
+- The option's text says what Off now shows (the games' full-colour picture) and On (the PS2's 16-bit picture with
+  its checkerboard).
+- Changing it in the settings menu switches full colour with the dither on every instance (never on the UI layer
+  instance), not only at start.
+
+Verified: builds of all five discs; unit tests 661/662 (the known VU0 table check).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_options.h | 6 ++++--
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp         | 6 +++++-
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index 4de3b14..50bae98 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -111,8 +111,10 @@ namespace ga2_options
+               {"170", "170"}, {"175", "175"}, {"180", "180"}, {"200", "200"}, {"240", "240"}, {"300", "300"},
+               {"360", "360"}, {"480", "480"}, {"monitor", "Monitor refresh rate"}, {"custom", "Custom"}},
+              16, 61, 500, 120},
+-            {"dither", "PS2 dithering", "The PS2's checkerboard dither when it reduces colours to 16 bits.", "GA2_PGS_DITHER",
+-             Apply::Live, {{"0", "Off"}, {"1", "On (original look)"}}},
++            {"dither", "PS2 dithering",
++             "Off: the games' full-colour picture, smooth gradients. On: the PS2's 16-bit picture with its checkerboard "
++             "dither (original look).",
++             "GA2_PGS_DITHER", Apply::Live, {{"0", "Off (full colour)"}, {"1", "On (original look)"}}},
+             {"deband", "Debanding",
+              "Smooths the visible colour steps of the PS2's 16-bit gradients (backgrounds, CGs, nebula skies, fades) in 2D and 3D scenes; edges and text stay sharp. High smooths more and costs a little more GPU time.",
+              "GA2_DEBAND", Apply::Live, {{"low", "Low"}, {"high", "High"}, {"off", "Off"}}},
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 9a98939..a60c3e6 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -1282,9 +1282,13 @@ namespace ga2_pgs
+             for (uint32_t e = 0; e < s.instanceCount(); ++e)
+             {
+                 Eye &inst = s.instance(e);
+-                if (inst.hacks.disable_dither != (wanted == 0))
++                // Full colour follows (the dither asks for the PS2's 16-bit picture); never on the UI layer instance.
++                static const bool fullColor = envInt("GA2_PGS_FULL_COLOR", 1) != 0;
++                const bool full = fullColor && wanted == 0 && inst.hacks.ui_layer != 2;
++                if (inst.hacks.disable_dither != (wanted == 0) || inst.hacks.full_color_scanout != full)
+                 {
+                     inst.hacks.disable_dither = wanted == 0;
++                    inst.hacks.full_color_scanout = full;
+                     inst.gs.set_hacks(inst.hacks);
+                 }
+             }
+-- 
+2.56.0
+

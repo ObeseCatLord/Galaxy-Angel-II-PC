@@ -1,0 +1,97 @@
+From e79110034b05b06746e64cd0395aedd1c56a8e85 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:14:16 -0600
+Subject: [PATCH] Native movies composed at the game frame's size
+
+The movie picture (and its subtitles) is drawn into a render texture of the size the presenter gets for the
+game's own frames at the current internal resolution (640x448 at native, 1280x896 at 2x, ...), so the presenter,
+its filters and the headset treat it exactly as a game frame: it fills the same 4:3 area.
+
+Verified: Zettai's title opening movie fills the game picture's area at native resolution; Eigou 1 at 2x.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_movie.h |  7 ++++---
+ ps2xRuntime/src/lib/ga2_movie.cpp       | 17 ++++++++++++-----
+ ps2xRuntime/src/lib/ps2_runtime.cpp     |  3 ++-
+ 3 files changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_movie.h b/ps2xRuntime/include/runtime/ga2_movie.h
+index 1c810c5..b2645d8 100644
+--- a/ps2xRuntime/include/runtime/ga2_movie.h
++++ b/ps2xRuntime/include/runtime/ga2_movie.h
+@@ -33,9 +33,10 @@ namespace ga2_movie
+     // Game thread: stop and free (the end or a skip).
+     void close();
+ 
+-    // Present thread (GL current): the picture to show while a movie is open, subtitles drawn in; false while none is
+-    // ready yet (show the game's own picture). Rows top first.
+-    bool frame(unsigned &texture, int &width, int &height);
++    // Present thread (GL current): the picture to show while a movie is open, subtitles drawn in, at the size of the
++    // game's own frames (width x height: what the presenter expects at this internal resolution; the 4:3 movie fills
++    // it as the game's 4:3 picture does); false while none is ready yet (show the game's own picture). Rows top first.
++    bool frame(unsigned &texture, int width, int height);
+ 
+     // Audio callback: adds the movie's sound (48 kHz stereo, interleaved) into `output`; its position is the clock.
+     void mixAudio(std::span<int16_t> output);
+diff --git a/ps2xRuntime/src/lib/ga2_movie.cpp b/ps2xRuntime/src/lib/ga2_movie.cpp
+index 4bf6d62..a9c747d 100644
+--- a/ps2xRuntime/src/lib/ga2_movie.cpp
++++ b/ps2xRuntime/src/lib/ga2_movie.cpp
+@@ -607,8 +607,10 @@ namespace ga2_movie
+             std::fprintf(stderr, "[movie] close %s (shown up to picture %d)\n", p->file.c_str(), p->shownIndex);
+     }
+ 
+-    bool frame(unsigned &texture, int &width, int &height)
++    bool frame(unsigned &texture, int width, int height)
+     {
++        width = std::clamp(width, 64, 8192);
++        height = std::clamp(height, 64, 8192);
+         std::shared_ptr<Player> p;
+         {
+             std::lock_guard lock(g_mutex);
+@@ -651,8 +653,15 @@ namespace ga2_movie
+             g_gl.picture = LoadTextureFromImage(blank);
+             UnloadImage(blank);
+             SetTextureFilter(g_gl.picture, TEXTURE_FILTER_BILINEAR);
+-            // Twice the picture's size: subtitles are drawn at that resolution.
+-            g_gl.target = LoadRenderTexture(kWidth * 2, kHeight * 2);
++        }
++        if (g_gl.target.texture.width != width || g_gl.target.texture.height != height)
++        {
++            if (g_gl.target.id)
++            {
++                rlDrawRenderBatchActive();
++                UnloadRenderTexture(g_gl.target);
++            }
++            g_gl.target = LoadRenderTexture(width, height);
+             SetTextureFilter(g_gl.target.texture, TEXTURE_FILTER_BILINEAR);
+         }
+         if (index >= 0)
+@@ -703,8 +712,6 @@ namespace ga2_movie
+         rlEnableBackfaceCulling();
+         EndTextureMode();
+         texture = g_gl.target.texture.id;
+-        width = tw;
+-        height = th;
+         return true;
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index af67f61..849e7f0 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -3603,8 +3603,9 @@ void PS2Runtime::run()
+         UploadFrame(frameTex, shownTex, this, presentWidth, presentHeight);
+         // A native movie (ga2_movie) is shown in place of the game's picture, on the screen and in the headset.
+         {
++            // At the size of the game's frames (the presenter and its filters expect that size).
+             unsigned movieTexture = 0;
+-            int movieWidth = 0, movieHeight = 0;
++            const int movieWidth = int(std::max<uint32_t>(640u, presentWidth)), movieHeight = int(std::max<uint32_t>(448u, presentHeight));
+             if (ga2_movie::frame(movieTexture, movieWidth, movieHeight))
+             {
+                 shownTex = Texture2D{movieTexture, movieWidth, movieHeight, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+-- 
+2.56.0
+

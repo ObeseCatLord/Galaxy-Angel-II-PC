@@ -1,4 +1,4 @@
-// High frame rate without speeding the game up (GA2_FPS=<61..240>), and the
+// High frame rate without speeding the game up (GA2_FPS=<61..500>), and the
 // frame-timing oracle trace (GA2_FRAMETRACE=<file>, tools/framerate_oracle.py).
 // docs/rendering/horplus-and-framerate.md has the reverse-engineering notes
 // and the per-disc address table.
@@ -16,8 +16,8 @@
 //   - setMaxFrames / setMinFrames store the values in N-Hz frames (a native
 //     maxFrames m means m/59.94 s of catch-up: ceil(m*N/60) frames; a native
 //     minFrames of 1 means no limit and stays 1; larger values (the battle's 30 fps
-//     views) keep the native 30 fps (round(m*N/60) frames; GA2_FPS_BATTLE=full
-//     renders them at N, but their dialogue then reacts sooner than natively);
+//     views) render at N too (GA2_FPS_BATTLE=30 keeps them at the native 30 fps, round(m*N/60) frames; at N
+//     their dialogue reacts up to 0.45 s sooner than natively);
 //   - RenderFlip's WaitVSync (recognised by its return address; the other
 //     callers keep the real VBLANK wait) sleeps on the runtime's frame clock
 //     (runtime/ga2_framepace.h) instead, so the loop runs at N Hz while the
@@ -151,13 +151,20 @@ namespace
     bool g_fieldsKnown = false;
     uint32_t scaledMax(uint32_t native) { return std::max<uint32_t>(1u, uint32_t(std::ceil(native * ratio() - 1e-6))); }
     // The views the game limits to 30 fps (minFrames 2: the battle's camera views, some adventure scenes) render at the
-    // full rate only with GA2_FPS_BATTLE=full: the whole Zettai battle through the oracle (2026-10-22, free-running
-    // runs) showed the battle dialogue reacting up to 0.45 s sooner after a press at full rate (state machines that
-    // step once per iteration: 30 steps a second natively, N at full rate); kept at the native 30 they match.
+    // full rate by default (user, 2026-11-20: smooth everywhere, the game need not be 1:1 with the PS2). Known
+    // difference: the whole Zettai battle through the oracle (2026-10-22) showed the battle dialogue reacting up to
+    // 0.45 s sooner after a press at full rate (a message flow that steps once per iteration, not yet found and gated).
+    // GA2_FPS_BATTLE=30 keeps those views at the native 30 fps.
+    uint32_t g_sceneId = 0xffffffffu; // the scene manager record's scene id (+8)
     bool fullRateBattle()
     {
-        static const bool full = [] { const char *v = std::getenv("GA2_FPS_BATTLE"); return v && std::strcmp(v, "full") == 0; }();
-        return full;
+        // GA2_FPS_BATTLE=full: every 30 fps view at N (the adventure scenes' too); =30: none; default: the battle's
+        // (scene 3) only: the adventure scenes' dialogue and voices keep the native cadence.
+        static const int mode = [] {
+            const char *v = std::getenv("GA2_FPS_BATTLE");
+            return v && std::strcmp(v, "full") == 0 ? 2 : v && std::strcmp(v, "30") == 0 ? 0 : 1;
+        }();
+        return mode == 2 || (mode == 1 && g_sceneId == 3u);
     }
     uint32_t scaledMin(uint32_t native)
     {
@@ -191,7 +198,6 @@ namespace
     };
     std::vector<EffectCall> g_effectCalls; // the effect's calls of the last boundary iteration
     size_t g_effectCursor = 0;
-    uint32_t g_sceneId = 0xffffffffu; // the scene manager record's scene id (+8)
     bool g_native = false;           // this iteration runs at the native rate
     uint64_t g_mapIteration = ~0ull; // the last iteration the ship map's update ran in
     // GA2_FPS_NOFIX=1 (a diagnostic, and the oracle's negative control): none of the iteration-counting fixes (gates, effect and
@@ -606,7 +612,7 @@ namespace
     // blocked on the GS worker or on a saturated GPU counts; and the VU thread and GS worker count as well, the busiest
     // of them deciding; GA2_FPS_GOVERNOR_LOAD=cpu uses the game thread's CPU time alone, as before), the effective rate drops at an iteration boundary to the highest rung whose estimated cost
     // fits, else to the native cadence (iterations at 59.94 Hz with the game's own limits, the 30 fps views included:
-    // the code path of the scenes that run native). Rungs: N, the settings menu's rates below it (240, 200, 180, 175,
+    // the code path of the scenes that run native). Rungs: N, the settings menu's rates below it (480, 360, 300, 240, 200, 180, 175,
     // 165, 144, 120, 100, 90, 75), 60 (full-rate iterations), native. The cost of a rung is estimated from what the game thread spent per guest second (CPU time of the thread,
     // the IOP and audio work it does while waiting included): C(R') = C * R' / (iterations per guest second), i.e.
     // every iteration costs what it did, which leans high. It climbs, at most two rungs at a time, when the
@@ -659,7 +665,7 @@ namespace
     // the native cadence (0). A top of 60 or less is the native cadence alone.
     void govLadder(int top)
     {
-        static constexpr int kRungs[] = {240, 200, 180, 175, 165, 144, 120, 100, 90, 75, 60};
+        static constexpr int kRungs[] = {480, 360, 300, 240, 200, 180, 175, 165, 144, 120, 100, 90, 75, 60};
         g_gov.ladder.clear();
         if (top > 60)
         {
@@ -790,6 +796,20 @@ namespace
         auto ratioTo = [&](size_t k) { return (g.ladder[k] > 0 ? g.ladder[k] : 59.94) / itsPerGuest; };
         auto cost = [&](size_t k) { return perGuest * ratioTo(k); };
         auto hope = [&](size_t k) { return perGuest * (0.55 + 0.45 * ratioTo(k)); };
+        // GA2_PERF: the governor's view every 5 s (why it holds a rate): its load parts and the next rung's estimate.
+        {
+            static const bool perf = std::getenv("GA2_PERF") != nullptr;
+            static double lastLog = 0.0;
+            if (perf && now - lastLog >= 5.0)
+            {
+                lastLog = now;
+                const size_t up = g.idx > 0 ? g.idx - 1 : 0;
+                std::fprintf(stderr, "[ga2 fps] governor at %d: speed %.2f, %.1f iterations/s, load %.2f (cpu %.2f, busy %.2f, vu %.2f,"
+                             " gs %.2f), next %d hoped %.2f, hold %.0f s\n",
+                             rate, speed, itRate, load, cpu / span, busy, vuLoad, gsLoad,
+                             g.ladder[up], hope(up), std::max(0.0, g.holdUntil - now));
+            }
+        }
         if (rate > 0)
         {
             const bool behind = (speed < 0.97 || itRate < 0.85 * rate) && load > 0.85;

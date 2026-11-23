@@ -43,6 +43,9 @@ foreach(disc IN LISTS GA2_DISC_IDS)
         "${CMAKE_SOURCE_DIR}/ps2xRuntime/src/main.cpp"
         ${generated_sources}
     )
+    if(WIN32)
+        target_sources(ga2_${target_id} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/windows/utf8.rc")
+    endif()
     # Per-disc SDK bindings: compat/<target_id>_*.cpp (zettai_*, mugen_1_*, ...).
     file(GLOB _ga2_compat CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/compat/${target_id}_*.cpp")
     if(NOT disc STREQUAL "zettai")
@@ -52,6 +55,8 @@ foreach(disc IN LISTS GA2_DISC_IDS)
     list(APPEND _ga2_compat "${CMAKE_CURRENT_LIST_DIR}/compat/ga2_features.cpp"
                             "${CMAKE_CURRENT_LIST_DIR}/compat/ga2_framerate.cpp"
                             "${CMAKE_CURRENT_LIST_DIR}/compat/ga2_battlepointer.cpp"
+                            "${CMAKE_CURRENT_LIST_DIR}/compat/ga2_battledraw.cpp"
+                            "${CMAKE_CURRENT_LIST_DIR}/compat/ga2_movie.cpp"
                             "${CMAKE_CURRENT_LIST_DIR}/compat/ga2_cheats.cpp"
                             "${CMAKE_CURRENT_LIST_DIR}/compat/ga2_text.cpp"
                             "${CMAKE_CURRENT_LIST_DIR}/compat/ga2_exetext.cpp"
@@ -155,6 +160,9 @@ add_executable(ga2
     "${CMAKE_CURRENT_LIST_DIR}/launcher/settings.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/launcher/assets.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/launcher/mods.cpp")
+if(WIN32)
+    target_sources(ga2 PRIVATE "${CMAKE_CURRENT_LIST_DIR}/windows/utf8.rc")
+endif()
 target_compile_features(ga2 PRIVATE cxx_std_20)
 target_compile_definitions(ga2 PRIVATE "GA2_VERSION=\"${GA2_VERSION}\"")
 target_link_libraries(ga2 PRIVATE raylib nlohmann_json::nlohmann_json)

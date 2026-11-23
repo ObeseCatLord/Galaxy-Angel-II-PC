@@ -1,0 +1,164 @@
+From b65632590b3b289b5acf0c5c8e5b01a45bc126f2 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:01:38 -0600
+Subject: [PATCH] Full-colour and HUD snapshots stay in the device's frame
+ context
+
+full_color_observe() (and the VR HUD layer's ui_scanout_blit()) take a snapshot in the middle of GIF processing:
+a flush, then scan_out_buffer(), which submits again. Both ended with Device::next_frame_context(), as the
+vsync's submits do, so a frame advanced the device four contexts instead of two. next_frame_context() waits for
+everything submitted num_frame_contexts advances ago; with the runtime's four contexts that became the frame
+being drawn, so the GS thread waited for the GPU inside GIF processing and the game and the GPU took turns.
+
+flush_submit() and scan_out_buffer() take a next_frame flag (default: as before); both snapshots pass false.
+The commands and their order are unchanged.
+
+Measured on a Steam Deck at 2x: the snapshot went from 10.7-11.0 ms per frame (all in next_frame_context) to
+0.13 ms; the 3-D title free-runs at 115-133 fps instead of 56-60; a battle's 60-flip phase holds 100 % speed
+instead of 60-76 %.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gs/gs_interface.cpp | 26 +++++++++++++++++++++-----
+ gs/gs_renderer.cpp  | 11 ++++++-----
+ gs/gs_renderer.hpp  |  9 +++++++--
+ 3 files changed, 34 insertions(+), 12 deletions(-)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index a9f9775..c7dca0e 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -3095,8 +3095,15 @@ void GSInterface::ui_scanout_blit(uint32_t tbp, uint32_t tbw, uint32_t tpsm, int
+ 	ui_main_dirty = false;
+ 
+ 	// The target as it is, RGBA with alpha: the region the copy reads (the discs render into a 640x480 target
+-	// and the copy squeezes it to the 448 lines of the display).
+-	flush();
++	// and the copy squeezes it to the 448 lines of the display). Submitted within the device's current frame
++	// context, as the full-colour snapshot (see GSRenderer::flush_submit).
++	flush_pending_transfer(true);
++	{
++		const uint64_t value = tracker.mark_submission_timeline();
++		renderer.flush_submit(value, false);
++		if (debug_mode.deterministic_timeline_query)
++			renderer.wait_timeline(value);
++	}
+ 	DISPFBBits fb = {};
+ 	fb.FBP = tbp / PGS_BLOCKS_PER_PAGE;
+ 	fb.FBW = tbw;
+@@ -3106,7 +3113,7 @@ void GSInterface::ui_scanout_blit(uint32_t tbp, uint32_t tbw, uint32_t tpsm, int
+ 	const uint32_t width = tbw * 64u;
+ 	const uint32_t height = src_h > 0 && src_h <= 2048 ? uint32_t(src_h) : 480u;
+ 	ScanoutResult result = renderer.scan_out_buffer(fb, width, height, ui_snapshot_info, sampling_rate_x_log2,
+-	                                                sampling_rate_y_log2);
++	                                                sampling_rate_y_log2, 0, false);
+ 	if (result.image)
+ 	{
+ 		ui_snapshot = std::move(result);
+@@ -3167,7 +3174,16 @@ void GSInterface::full_color_observe(unsigned nv)
+ 		src_y = int(std::min(ua.y, ub.y)) >> 4;
+ 		src_h = (std::abs(int(ub.y) - int(ua.y)) + 8) >> 4;
+ 	}
+-	flush();
++	// As flush(), and the snapshot's own submit below, but within the device's current frame context: two more
++	// context advances per frame made the GS thread wait for the GPU here, in the middle of GIF processing,
++	// so the game and the GPU took turns instead of working at the same time (see GSRenderer::flush_submit).
++	flush_pending_transfer(true);
++	{
++		const uint64_t value = tracker.mark_submission_timeline();
++		renderer.flush_submit(value, false);
++		if (debug_mode.deterministic_timeline_query)
++			renderer.wait_timeline(value);
++	}
+ 	DISPFBBits fb = {};
+ 	fb.FBP = tbp / PGS_BLOCKS_PER_PAGE;
+ 	fb.FBW = uint32_t(ctx.tex0.desc.TBW);
+@@ -3177,7 +3193,7 @@ void GSInterface::full_color_observe(unsigned nv)
+ 	const uint32_t width = uint32_t(ctx.tex0.desc.TBW) * 64u;
+ 	const uint32_t height = src_h > 0 && src_h <= 2048 ? uint32_t(src_h) : 480u;
+ 	ScanoutResult result = renderer.scan_out_buffer(fb, width, height, fc_info, sampling_rate_x_log2, sampling_rate_y_log2,
+-	                                                fc_out_height);
++	                                                fc_out_height, false);
+ 	if (result.image)
+ 	{
+ 		fc_snapshot = std::move(result);
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index 6994164..71e8a34 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -1118,7 +1118,7 @@ void GSRenderer::flush_qword_clears()
+ 	qword_clears.clear();
+ }
+ 
+-void GSRenderer::flush_submit(uint64_t value)
++void GSRenderer::flush_submit(uint64_t value, bool next_frame)
+ {
+ 	if (!device)
+ 		return;
+@@ -1217,7 +1217,7 @@ void GSRenderer::flush_submit(uint64_t value)
+ 
+ 	// If we have a timeline trace, we'd like it to be somewhat readable.
+ 	// Only do garbage collection at frame boundaries.
+-	if (!device->get_system_handles().timeline_trace_file)
++	if (next_frame && !device->get_system_handles().timeline_trace_file)
+ 		device->next_frame_context();
+ 
+ 	log_timestamps();
+@@ -4292,7 +4292,8 @@ bool GSRenderer::vsync_can_skip(const PrivRegisterState &priv, const VSyncInfo &
+ }
+ 
+ ScanoutResult GSRenderer::scan_out_buffer(const DISPFBBits &fb, uint32_t width, uint32_t height, const VSyncInfo &info,
+-                                          uint32_t sampling_rate_x_log2, uint32_t sampling_rate_y_log2, uint32_t out_height)
++                                          uint32_t sampling_rate_x_log2, uint32_t sampling_rate_y_log2, uint32_t out_height,
++                                          bool next_frame)
+ {   // [vrhud]
+ 	ScanoutResult result = {};
+ 	if (!device || !width || !height)
+@@ -4345,7 +4346,7 @@ ScanoutResult GSRenderer::scan_out_buffer(const DISPFBBits &fb, uint32_t width,
+ 		cmd.image_barrier(*out, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, info.dst_layout,
+ 		                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, info.dst_stage, info.dst_access);
+ 		cmd.end_region();
+-		flush_submit(0);
++		flush_submit(0, next_frame);
+ 		result.image = std::move(out);
+ 		result.internal_width = width;
+ 		result.internal_height = out_height;
+@@ -4360,7 +4361,7 @@ ScanoutResult GSRenderer::scan_out_buffer(const DISPFBBits &fb, uint32_t width,
+ 	                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+ 	                  info.dst_stage, info.dst_access);
+ 	cmd.end_region();
+-	flush_submit(0);
++	flush_submit(0, next_frame);
+ 
+ 	result.image = std::move(image);
+ 	result.internal_width = width;
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index 24cfd0d..9a1a682 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -332,7 +332,11 @@ public:
+ 	void flush_readback(const uint32_t *page_indices, uint32_t num_indices);
+ 
+ 	// Submit to GPU and signal when done.
+-	void flush_submit(uint64_t timeline);
++	// [ga2] next_frame = false: the device's frame context is not advanced. Device::next_frame_context() waits for
++	// everything submitted num_frame_contexts advances ago; a caller that submits more than once per displayed
++	// frame (the full-colour snapshot: twice more) would otherwise shrink that distance to about one frame and
++	// make the GS thread wait for the GPU inside GIF processing.
++	void flush_submit(uint64_t timeline, bool next_frame = true);
+ 
+ 	// Wait until timeline reaches value. After waiting, it may be safe to read from host VRAM.
+ 	void wait_timeline(uint64_t value);
+@@ -353,7 +357,8 @@ public:
+ 	// info.high_resolution_scanout (as vsync() does). The result is in info.dst_layout / dst_stage / dst_access.
+ 	// [ga2] out_height (not 0, not height): resized to that many lines (filtered), for the full-colour scanout.
+ 	ScanoutResult scan_out_buffer(const DISPFBBits &fb, uint32_t width, uint32_t height, const VSyncInfo &info,
+-	                              uint32_t sampling_rate_x_log2, uint32_t sampling_rate_y_log2, uint32_t out_height = 0);
++	                              uint32_t sampling_rate_x_log2, uint32_t sampling_rate_y_log2, uint32_t out_height = 0,
++	                              bool next_frame = true); // [ga2] next_frame: as for flush_submit
+ 
+ 	static TexRect compute_effective_texture_rect(const TextureDescriptor &desc);
+ 
+-- 
+2.56.0
+

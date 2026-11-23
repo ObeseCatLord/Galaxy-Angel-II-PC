@@ -1,0 +1,946 @@
+From 3ed3dce555b7a790903170b799c8a8bd4237245c Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:02:11 -0600
+Subject: [PATCH 187/191] Native movies with subtitles
+
+- ga2_movie: the games' movies (PSS: MPEG-2 640x480, 16-bit 48 kHz stereo PCM in private stream 1) played by the
+  PC. A thread reads the movie's sectors (the disc image, or the mod overlay past its end), demuxes the program
+  stream itself (video to FFmpeg's mpeg2video parser and decoder, the SShd/SSbd audio de-interleaved), converts
+  pictures with swscale; the audio is mixed into the SPU2 output stream (ps2_audio's callback) and is the clock;
+  pictures are shown by frame number against it. FFmpeg calls available from 4.x to 8 only (the release's static
+  FFmpeg already has the parts used).
+- Subtitles: <pack>/subtitles/<program>/<file>.srt (or GA2_SUBTITLE_DIR), drawn with the UI font under the
+  picture, into a render texture with the picture so the headset's screen shows them too.
+- Presented in place of the game's picture (desktop and VR theater screen), as a 4:3 bilinear picture.
+- Settings "Movies" (movies: native / original, GA2_MOVIES) and "Movie subtitles" (movie_subtitles, GA2_MOVIE_
+  SUBTITLES). The game hooks are in native/compat/ga2_movie.cpp.
+- ps2_runtime: also includes the game thread's mask save for ga2_affinity.
+
+Verified: Eigou 1's mv060 (61.8 s, 1852 pictures at 29.97 fps) plays natively in real time with the game at 60 fps
+around it, closed through the game's own end path; subtitles drawn (test file); unit tests 661/662.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt                |   1 +
+ ps2xRuntime/include/runtime/ga2_movie.h   |  42 ++
+ ps2xRuntime/include/runtime/ga2_options.h |   9 +
+ ps2xRuntime/src/lib/ga2_movie.cpp         | 736 ++++++++++++++++++++++
+ ps2xRuntime/src/lib/ga2_present.cpp       |   7 +-
+ ps2xRuntime/src/lib/ps2_audio.cpp         |   2 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp       |  14 +
+ 7 files changed, 809 insertions(+), 2 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_movie.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_movie.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index e92f456..fd4dd1a 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -400,6 +400,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ps2_mouse.cpp
+     src/lib/ps2_mouse_menus.cpp
+     src/lib/ga2_present.cpp
++    src/lib/ga2_movie.cpp
+     src/lib/ga2_zerocopy.cpp
+     src/lib/ga2_vuthread.cpp
+     src/lib/ga2_battletable.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_movie.h b/ps2xRuntime/include/runtime/ga2_movie.h
+new file mode 100644
+index 0000000..1c810c5
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_movie.h
+@@ -0,0 +1,42 @@
++// Native movie playback: the games' movies (PSS: MPEG-2 640x480 video, 16-bit 48 kHz stereo PCM in private stream 1,
++// research/native-movies/report.txt) decoded by FFmpeg on a thread of their own and shown by the presenter instead of
++// the emulated IPU/IOP/SPU2 path. The game keeps its movie manager, script command, skip button and "seen" flag: the
++// port's hooks (native/compat/ga2_movie.cpp) replace only the low-level player (open, decode step, draw, finished
++// test, close) and call this.
++//
++//   GA2_MOVIES=original      the emulated player (the setting "Movies")
++//   GA2_MOVIE_SUBTITLES=0    no subtitles (the setting "Movie subtitles")
++//   GA2_MOVIE_TRACE=1        open/close/end lines and per-second frame/audio counts
++//
++// Subtitles: <pack>/subtitles/<program>/<file>.srt in each language pack (the parent of every GA2_MODS root), first
++// found wins; or GA2_SUBTITLE_DIR/<program>/<file>.srt. SRT timing, UTF-8 text, drawn under the picture's centre.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <string>
++
++namespace ga2_movie
++{
++    // Native playback chosen (the setting, read at each open).
++    bool enabled();
++
++    // Game thread. program: the disc's program ("SLPM_662.43"); file: the guest path the game opened ("movie/8004.pss");
++    // the movie's bytes are `size` bytes from disc sector `lsn` (0 size: look the file up by its path); volume 0..1.
++    // False when it cannot be played natively (the caller then runs the game's own player).
++    bool open(const std::string &program, const std::string &file, uint32_t lsn, uint32_t size, float volume);
++    // A movie is open (until close).
++    bool active();
++    // The movie has shown its last picture (the game then stops it).
++    bool finished();
++    // Game thread: stop and free (the end or a skip).
++    void close();
++
++    // Present thread (GL current): the picture to show while a movie is open, subtitles drawn in; false while none is
++    // ready yet (show the game's own picture). Rows top first.
++    bool frame(unsigned &texture, int &width, int &height);
++
++    // Audio callback: adds the movie's sound (48 kHz stereo, interleaved) into `output`; its position is the clock.
++    void mixAudio(std::span<int16_t> output);
++}
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index 50bae98..904fe6b 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -36,6 +36,8 @@ namespace ga2_options
+         Deband,
+         HdBattle,
+         BattleMap,
++        Movies,
++        MovieSubtitles,
+         UiUpscale,
+         Buttons,
+         SharpText,
+@@ -127,6 +129,13 @@ namespace ga2_options
+              "sky itself, about half the processor time, for high frame rates (close to the original, not identical). "
+              "The VR battle table always draws its own map.",
+              "GA2_BATTLE_MAP", Apply::Restart, {{"original", "Original"}, {"fast", "Fast (drawn by the PC)"}}},
++            {"movies", "Movies",
++             "Native: the PC decodes and shows the movies itself (smooth on any PC, with subtitles where a pack has them). "
++             "Original: the emulated PS2 movie player.",
++             "GA2_MOVIES", Apply::Live, {{"native", "Native"}, {"original", "Original (emulated)"}}},
++            {"movie_subtitles", "Movie subtitles",
++             "Subtitles for the movies' spoken lines, from the language pack (native movies only).",
++             "GA2_MOVIE_SUBTITLES", Apply::Live, {{"1", "On"}, {"0", "Off"}}},
+             {"ui_upscale", "Menus and HUD",
+              "How the menus, windows and battle HUD are enlarged at 2x and 4x. Sharp pixels: the original pixels, crisp. "
+              "Anime4K: smoothed like the characters and backgrounds.",
+diff --git a/ps2xRuntime/src/lib/ga2_movie.cpp b/ps2xRuntime/src/lib/ga2_movie.cpp
+new file mode 100644
+index 0000000..4bf6d62
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_movie.cpp
+@@ -0,0 +1,736 @@
++#include "runtime/ga2_movie.h"
++
++#include "ps2_disc_mount.h"
++#include "runtime/ga2_fileread.h"
++#include "runtime/ga2_options.h"
++#include "runtime/ga2_settings.h"
++#include "runtime/ga2_ui_font.h"
++
++#include "raylib.h"
++#include "rlgl.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <mutex>
++#include <sstream>
++#include <thread>
++#include <vector>
++
++#if PS2X_HAS_FFMPEG
++extern "C"
++{
++#include <libavcodec/avcodec.h>
++#include <libavutil/frame.h>
++#include <libswscale/swscale.h>
++}
++#endif
++
++namespace ga2_movie
++{
++    namespace
++    {
++        constexpr uint32_t kSector = 2048;
++        constexpr int kWidth = 640, kHeight = 480;
++
++        std::filesystem::path fromUtf8(const std::string &s)
++        {
++            return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t *>(s.data()), s.size()));
++        }
++
++        std::string utf8(const std::filesystem::path &p)
++        {
++            const std::u8string u = p.u8string();
++            return std::string(reinterpret_cast<const char *>(u.data()), u.size());
++        }
++
++        bool trace()
++        {
++            static const bool on = [] {
++                const char *v = std::getenv("GA2_MOVIE_TRACE");
++                return v && *v && *v != '0';
++            }();
++            return on;
++        }
++
++        // ---- subtitles ------------------------------------------------------------------------------------------
++        struct Cue
++        {
++            double start = 0, end = 0;
++            std::string text; // lines separated by '\n'
++        };
++
++        double srtTime(const std::string &s)
++        {
++            int h = 0, m = 0, sec = 0, ms = 0;
++            if (std::sscanf(s.c_str(), "%d:%d:%d%*[,.]%d", &h, &m, &sec, &ms) < 3)
++                return -1;
++            return h * 3600.0 + m * 60.0 + sec + ms / 1000.0;
++        }
++
++        std::vector<Cue> loadSrt(const std::filesystem::path &file)
++        {
++            std::vector<Cue> cues;
++            std::ifstream in(file, std::ios::binary);
++            if (!in)
++                return cues;
++            std::string line;
++            Cue cue;
++            int state = 0; // 0 index, 1 time, 2 text
++            auto flush = [&] {
++                if (state == 2 && !cue.text.empty())
++                    cues.push_back(cue);
++                cue = Cue{};
++                state = 0;
++            };
++            while (std::getline(in, line))
++            {
++                if (!line.empty() && line.back() == '\r')
++                    line.pop_back();
++                if (line.size() >= 3 && uint8_t(line[0]) == 0xEF && uint8_t(line[1]) == 0xBB && uint8_t(line[2]) == 0xBF)
++                    line.erase(0, 3);
++                if (line.empty())
++                {
++                    flush();
++                    continue;
++                }
++                if (state == 0)
++                {
++                    if (line.find("-->") != std::string::npos)
++                        state = 1; // no index line
++                    else
++                    {
++                        state = 1;
++                        continue;
++                    }
++                }
++                if (state == 1)
++                {
++                    const size_t arrow = line.find("-->");
++                    if (arrow == std::string::npos)
++                    {
++                        state = 0;
++                        continue;
++                    }
++                    cue.start = srtTime(line.substr(0, arrow));
++                    cue.end = srtTime(line.substr(arrow + 3));
++                    state = cue.start >= 0 && cue.end > cue.start ? 2 : 0;
++                    continue;
++                }
++                cue.text += (cue.text.empty() ? "" : "\n") + line;
++            }
++            flush();
++            return cues;
++        }
++
++        std::vector<Cue> findSubtitles(const std::string &program, const std::string &file)
++        {
++            if (std::string(ga2_settings::value(ga2_options::MovieSubtitles)) == "0")
++                return {};
++            const std::string name = utf8(fromUtf8(file).filename());
++            std::filesystem::path srt = fromUtf8(name).replace_extension(".srt");
++            std::vector<std::filesystem::path> roots;
++            if (const char *dir = std::getenv("GA2_SUBTITLE_DIR"); dir && *dir)
++                roots.push_back(fromUtf8(dir));
++            if (const char *mods = std::getenv("GA2_MODS"); mods && *mods)
++            {
++                std::stringstream list(mods);
++                std::string item;
++                while (std::getline(list, item, ';'))
++                    if (!item.empty())
++                        roots.push_back(fromUtf8(item).parent_path() / "subtitles");
++            }
++            std::error_code ec;
++            for (const auto &root : roots)
++                if (const auto candidate = root / program / srt; std::filesystem::exists(candidate, ec))
++                {
++                    auto cues = loadSrt(candidate);
++                    if (trace())
++                        std::fprintf(stderr, "[movie] subtitles %s: %zu cues\n", utf8(candidate).c_str(), cues.size());
++                    return cues;
++                }
++            return {};
++        }
++
++        // ---- the movie's bytes ----------------------------------------------------------------------------------
++        // Byte ranges of the disc image (sector positions; past the image's end: a mod file, served by readOverlay).
++        struct Source
++        {
++            std::filesystem::path image;
++            std::vector<std::pair<uint64_t, uint64_t>> ranges; // position, length
++            uint64_t size = 0;
++            ga2_fileread::File file;
++            uint64_t imageSize = 0;
++
++            bool read(uint64_t offset, uint8_t *out, size_t count)
++            {
++                uint64_t base = 0;
++                for (const auto &[position, length] : ranges)
++                {
++                    if (count == 0)
++                        break;
++                    if (offset < base + length)
++                    {
++                        const uint64_t from = offset - base;
++                        const size_t n = size_t(std::min<uint64_t>(count, length - from));
++                        const uint64_t at = position + from;
++                        const bool ok = file.isOpen() && at + n <= imageSize ? file.readAt(at, out, n)
++                                                                            : ps2_disc::readOverlay(image, at, out, n);
++                        if (!ok)
++                            return false;
++                        out += n;
++                        offset += n;
++                        count -= n;
++                    }
++                    base += length;
++                }
++                return count == 0;
++            }
++        };
++
++        // ---- the player -----------------------------------------------------------------------------------------
++        struct Picture
++        {
++            int index = 0; // frame number from the start
++            std::vector<uint8_t> rgba;
++        };
++
++        struct Player
++        {
++            Source source;
++            std::string program, file;
++            std::vector<Cue> cues;
++            float volume = 1.0f;
++
++            std::thread thread;
++            std::atomic<bool> stop{false};
++            std::mutex mutex;
++            std::condition_variable wake;
++            std::deque<Picture> pictures; // decoded, in order (bounded)
++            std::deque<int16_t> audio;     // interleaved stereo samples not yet played
++            double fps = 30.0;
++            bool demuxDone = false, failed = false;
++            int lastIndex = -1;            // the last picture decoded once demuxing is done
++            int shownIndex = -1;
++            uint64_t samplesPlayed = 0;    // movie samples (per channel) the audio callback consumed
++            std::atomic<bool> audioRunning{false};
++            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++            bool started = false;          // the first picture is up (the clock starts there)
++
++            // Seconds since the first picture: the audio's position while audio plays, else the wall clock.
++            double clock()
++            {
++                if (!started)
++                    return 0.0;
++                if (audioRunning.load(std::memory_order_relaxed))
++                    return double(samplesPlayed) / 48000.0;
++                return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++            }
++
++            void run();
++        };
++
++        std::mutex g_mutex;               // guards g_player (open/close vs present and audio)
++        std::shared_ptr<Player> g_player;
++
++        // GL side (present thread only).
++        struct Gl
++        {
++            Texture2D picture{};
++            RenderTexture2D target{};
++            int uploaded = -1;
++            bool ready = false;
++        } g_gl;
++
++#if PS2X_HAS_FFMPEG
++        void Player::run()
++        {
++            const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
++            AVCodecContext *ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
++            AVCodecParserContext *parser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
++            AVPacket *packet = av_packet_alloc();
++            AVFrame *frame = av_frame_alloc();
++            SwsContext *sws = nullptr;
++            if (!ctx || !parser || !packet || !frame || avcodec_open2(ctx, codec, nullptr) < 0)
++            {
++                std::lock_guard lock(mutex);
++                failed = true;
++                demuxDone = true;
++            }
++            int index = 0;
++            uint32_t interleave = 0;
++            std::vector<uint8_t> pcm; // audio body bytes not yet de-interleaved (blocks of `interleave` L then R)
++
++            auto deliver = [&](AVFrame *f) {
++                if (f->width <= 0 || f->height <= 0)
++                    return;
++                if (index == 0 && ctx->framerate.num > 0 && ctx->framerate.den > 0)
++                {
++                    std::lock_guard lock(mutex);
++                    fps = double(ctx->framerate.num) / double(ctx->framerate.den);
++                }
++                sws = sws_getCachedContext(sws, f->width, f->height, AVPixelFormat(f->format), kWidth, kHeight,
++                                           AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
++                if (!sws)
++                    return;
++                Picture p;
++                p.index = index++;
++                p.rgba.resize(size_t(kWidth) * kHeight * 4);
++                uint8_t *dst[1] = {p.rgba.data()};
++                int stride[1] = {kWidth * 4};
++                sws_scale(sws, f->data, f->linesize, 0, f->height, dst, stride);
++                std::unique_lock lock(mutex);
++                wake.wait(lock, [&] { return stop.load() || pictures.size() < 6; });
++                if (!stop.load())
++                    pictures.push_back(std::move(p));
++            };
++            auto decode = [&](AVPacket *pkt) {
++                if (avcodec_send_packet(ctx, pkt) < 0)
++                    return;
++                while (!stop.load() && avcodec_receive_frame(ctx, frame) == 0)
++                    deliver(frame);
++            };
++            auto video = [&](const uint8_t *data, size_t size) {
++                while (size > 0 && !stop.load())
++                {
++                    uint8_t *out = nullptr;
++                    int outSize = 0;
++                    const int used = av_parser_parse2(parser, ctx, &out, &outSize, data, int(size), AV_NOPTS_VALUE,
++                                                      AV_NOPTS_VALUE, 0);
++                    if (used < 0)
++                        return;
++                    data += used;
++                    size -= size_t(used);
++                    if (outSize > 0)
++                    {
++                        packet->data = out;
++                        packet->size = outSize;
++                        decode(packet);
++                    }
++                }
++            };
++            auto sound = [&](const uint8_t *data, size_t size) {
++                pcm.insert(pcm.end(), data, data + size);
++                if (interleave == 0)
++                    return;
++                const size_t pair = size_t(interleave) * 2;
++                const size_t blocks = pcm.size() / pair;
++                if (blocks == 0)
++                    return;
++                std::vector<int16_t> samples(blocks * interleave); // interleave/2 samples per channel per block, x2
++                for (size_t b = 0; b < blocks; ++b)
++                {
++                    const uint8_t *left = pcm.data() + b * pair, *right = left + interleave;
++                    for (uint32_t i = 0; i < interleave / 2; ++i)
++                    {
++                        int16_t l, r;
++                        std::memcpy(&l, left + i * 2, 2);
++                        std::memcpy(&r, right + i * 2, 2);
++                        samples[b * interleave + i * 2] = l;
++                        samples[b * interleave + i * 2 + 1] = r;
++                    }
++                }
++                pcm.erase(pcm.begin(), pcm.begin() + ptrdiff_t(blocks * pair));
++                std::lock_guard lock(mutex);
++                audio.insert(audio.end(), samples.begin(), samples.end());
++            };
++
++            // MPEG-PS demux (pack 0xBA, system header 0xBB, PES 0xE0 video / 0xBD audio / others skipped).
++            std::vector<uint8_t> buf;
++            uint64_t readPos = 0;
++            size_t pos = 0;
++            auto need = [&](size_t n) {
++                while (buf.size() - pos < n && readPos < source.size)
++                {
++                    if (pos > (1u << 20))
++                    {
++                        buf.erase(buf.begin(), buf.begin() + ptrdiff_t(pos));
++                        pos = 0;
++                    }
++                    const size_t chunk = size_t(std::min<uint64_t>(256u << 10, source.size - readPos));
++                    const size_t old = buf.size();
++                    buf.resize(old + chunk);
++                    if (!source.read(readPos, buf.data() + old, chunk))
++                    {
++                        buf.resize(old);
++                        readPos = source.size;
++                        std::lock_guard lock(mutex);
++                        failed = index == 0;
++                        break;
++                    }
++                    readPos += chunk;
++                }
++                return buf.size() - pos >= n;
++            };
++            while (!failed && !stop.load() && need(4))
++            {
++                const uint8_t *d = buf.data() + pos;
++                if (d[0] != 0 || d[1] != 0 || d[2] != 1)
++                {
++                    ++pos;
++                    continue;
++                }
++                const uint8_t id = d[3];
++                if (id == 0xB9)
++                    break; // program end
++                if (id == 0xBA)
++                {
++                    if (!need(14))
++                        break;
++                    d = buf.data() + pos;
++                    pos += 14 + (d[13] & 7);
++                    continue;
++                }
++                if (id < 0xBB)
++                {
++                    pos += 4;
++                    continue;
++                }
++                if (!need(6))
++                    break;
++                d = buf.data() + pos;
++                const size_t length = size_t(d[4]) << 8 | d[5];
++                if (!need(6 + length))
++                    break;
++                d = buf.data() + pos;
++                if ((id == 0xE0 || id == 0xBD) && length >= 3)
++                {
++                    const size_t payload = 9 + d[8];
++                    if (payload <= 6 + length)
++                    {
++                        const uint8_t *p = d + payload;
++                        size_t n = 6 + length - payload;
++                        if (id == 0xE0)
++                            video(p, n);
++                        else if (n > 4)
++                        {
++                            p += 4; // ff a0 00 00
++                            n -= 4;
++                            if (n >= 8 && std::memcmp(p, "SShd", 4) == 0)
++                            {
++                                uint32_t headerLength = 0, header[6] = {};
++                                std::memcpy(&headerLength, p + 4, 4);
++                                if (n >= 8 + 24)
++                                    std::memcpy(header, p + 8, 24);
++                                // type 1 = 16-bit PCM; rate 48000, 2 channels expected
++                                if (header[0] == 1 && header[1] == 48000 && header[2] == 2 && header[3] >= 2 && header[3] % 2 == 0)
++                                    interleave = header[3];
++                                const size_t skip = 8 + headerLength;
++                                if (n >= skip + 8 && std::memcmp(p + skip, "SSbd", 4) == 0)
++                                {
++                                    p += skip + 8;
++                                    n -= skip + 8;
++                                }
++                                else
++                                    n = 0;
++                            }
++                            if (n)
++                                sound(p, n);
++                        }
++                    }
++                }
++                pos += 6 + length;
++            }
++            if (ctx && !stop.load())
++            {
++                // The parser's last picture, then the decoder's.
++                video(nullptr, 0);
++                uint8_t *out = nullptr;
++                int outSize = 0;
++                av_parser_parse2(parser, ctx, &out, &outSize, nullptr, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
++                if (outSize > 0)
++                {
++                    packet->data = out;
++                    packet->size = outSize;
++                    decode(packet);
++                }
++                decode(nullptr);
++            }
++            {
++                std::lock_guard lock(mutex);
++                demuxDone = true;
++                lastIndex = index - 1;
++                if (index == 0)
++                    failed = true;
++            }
++            if (sws)
++                sws_freeContext(sws);
++            av_frame_free(&frame);
++            av_packet_free(&packet);
++            if (parser)
++                av_parser_close(parser);
++            avcodec_free_context(&ctx);
++            if (trace())
++                std::fprintf(stderr, "[movie] %s: decoded %d pictures at %.3f fps\n", file.c_str(), index, fps);
++        }
++#else
++        void Player::run()
++        {
++            std::lock_guard lock(mutex);
++            failed = true;
++            demuxDone = true;
++        }
++#endif
++
++        void drawOutlined(const std::string &line, float x, float y, float size)
++        {
++            const Color shadow{0, 0, 0, 230}, text{255, 255, 255, 255};
++            const float o = std::max(1.0f, size / 16.0f);
++            for (int dy = -1; dy <= 1; ++dy)
++                for (int dx = -1; dx <= 1; ++dx)
++                    if (dx || dy)
++                        ga2_ui_font::draw(line, x + dx * o, y + dy * o, size, shadow);
++            ga2_ui_font::draw(line, x, y, size, text);
++        }
++    }
++
++    bool enabled()
++    {
++#if PS2X_HAS_FFMPEG
++        return std::string(ga2_settings::value(ga2_options::Movies)) != "original";
++#else
++        return false;
++#endif
++    }
++
++    bool open(const std::string &program, const std::string &file, uint32_t lsn, uint32_t size, float volume)
++    {
++        close();
++        if (!enabled())
++            return false;
++        auto player = std::make_shared<Player>();
++        player->program = program;
++        player->file = file;
++        player->volume = std::clamp(volume, 0.0f, 1.0f);
++        Source &src = player->source;
++        if (size > 0)
++        {
++            src.image = ps2_disc::currentImage();
++            src.ranges.emplace_back(uint64_t(lsn) * kSector, size);
++            src.size = size;
++        }
++        else
++        {
++            ps2_disc::File found;
++            if (!ps2_disc::findFile(file, found, &src.image))
++                return false;
++            uint64_t left = found.size;
++            for (const auto &e : found.extents)
++            {
++                const uint64_t n = std::min<uint64_t>(left, e.size);
++                src.ranges.emplace_back(uint64_t(e.lba) * kSector, n);
++                left -= n;
++            }
++            src.size = found.size;
++        }
++        if (src.image.empty() || src.size == 0)
++            return false;
++        src.file.open(src.image);
++        src.imageSize = src.file.size();
++        player->cues = findSubtitles(program, file);
++        player->thread = std::thread([p = player.get()] { p->run(); });
++        // The first picture (or the failure) decides: a movie that cannot be decoded goes to the game's player.
++        {
++            std::unique_lock lock(player->mutex);
++            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
++            while (player->pictures.empty() && !player->failed && !player->demuxDone &&
++                   std::chrono::steady_clock::now() < deadline)
++            {
++                lock.unlock();
++                std::this_thread::sleep_for(std::chrono::milliseconds(2));
++                lock.lock();
++            }
++            if (player->pictures.empty())
++            {
++                lock.unlock();
++                player->stop = true;
++                player->wake.notify_all();
++                player->thread.join();
++                std::fprintf(stderr, "[movie] %s: no picture natively; the game's own player takes it\n", file.c_str());
++                return false;
++            }
++        }
++        if (trace())
++            std::fprintf(stderr, "[movie] open %s (%s, %u bytes at sector %u, volume %.2f)\n", file.c_str(),
++                         program.c_str(), unsigned(src.size), lsn, player->volume);
++        std::lock_guard lock(g_mutex);
++        g_player = std::move(player);
++        return true;
++    }
++
++    bool active()
++    {
++        std::lock_guard lock(g_mutex);
++        return g_player != nullptr;
++    }
++
++    bool finished()
++    {
++        std::shared_ptr<Player> p;
++        {
++            std::lock_guard lock(g_mutex);
++            p = g_player;
++        }
++        if (!p)
++            return true;
++        std::lock_guard lock(p->mutex);
++        if (p->failed && p->started && p->pictures.empty())
++            return true;
++        if (!p->demuxDone || !p->pictures.empty() || !p->started)
++            return false;
++        // The last picture has had its time on screen.
++        return p->clock() >= double(p->lastIndex + 1) / p->fps;
++    }
++
++    void close()
++    {
++        std::shared_ptr<Player> p;
++        {
++            std::lock_guard lock(g_mutex);
++            p = std::move(g_player);
++        }
++        if (!p)
++            return;
++        p->stop = true;
++        p->wake.notify_all();
++        if (p->thread.joinable())
++            p->thread.join();
++        if (trace())
++            std::fprintf(stderr, "[movie] close %s (shown up to picture %d)\n", p->file.c_str(), p->shownIndex);
++    }
++
++    bool frame(unsigned &texture, int &width, int &height)
++    {
++        std::shared_ptr<Player> p;
++        {
++            std::lock_guard lock(g_mutex);
++            p = g_player;
++        }
++        if (!p)
++        {
++            g_gl.uploaded = -1;
++            return false;
++        }
++        // The newest picture whose time has come (the first one at once: the clock starts with it).
++        std::vector<uint8_t> rgba;
++        int index = -1;
++        {
++            std::lock_guard lock(p->mutex);
++            if (!p->started && !p->pictures.empty())
++            {
++                p->started = true;
++                p->start = std::chrono::steady_clock::now();
++            }
++            const double now = p->clock();
++            while (!p->pictures.empty() && double(p->pictures.front().index) / p->fps <= now)
++            {
++                if (p->pictures.size() == 1 || double(p->pictures[1].index) / p->fps > now)
++                {
++                    rgba = std::move(p->pictures.front().rgba);
++                    index = p->pictures.front().index;
++                    p->pictures.pop_front();
++                    break;
++                }
++                p->pictures.pop_front(); // late: dropped
++            }
++            if (index >= 0)
++                p->shownIndex = index;
++        }
++        p->wake.notify_all();
++        if (!g_gl.picture.id)
++        {
++            Image blank = GenImageColor(kWidth, kHeight, BLACK);
++            g_gl.picture = LoadTextureFromImage(blank);
++            UnloadImage(blank);
++            SetTextureFilter(g_gl.picture, TEXTURE_FILTER_BILINEAR);
++            // Twice the picture's size: subtitles are drawn at that resolution.
++            g_gl.target = LoadRenderTexture(kWidth * 2, kHeight * 2);
++            SetTextureFilter(g_gl.target.texture, TEXTURE_FILTER_BILINEAR);
++        }
++        if (index >= 0)
++        {
++            UpdateTexture(g_gl.picture, rgba.data());
++            g_gl.uploaded = index;
++        }
++        if (g_gl.uploaded < 0)
++            return false;
++        // Compose: the picture, then the subtitle of this moment. The projection is flipped so the render texture's
++        // rows come out top first, like an uploaded picture.
++        const double now = [&] {
++            std::lock_guard lock(p->mutex);
++            return p->clock();
++        }();
++        const int tw = g_gl.target.texture.width, th = g_gl.target.texture.height;
++        rlDrawRenderBatchActive();
++        BeginTextureMode(g_gl.target);
++        rlMatrixMode(RL_PROJECTION);
++        rlLoadIdentity();
++        rlOrtho(0, tw, 0, th, 0.0, 1.0);
++        rlMatrixMode(RL_MODELVIEW);
++        rlLoadIdentity();
++        rlDisableBackfaceCulling(); // the flipped projection turns every quad around
++        ClearBackground(BLACK);
++        DrawTexturePro(g_gl.picture, Rectangle{0, 0, float(kWidth), float(kHeight)},
++                       Rectangle{0, 0, float(tw), float(th)}, Vector2{0, 0}, 0.0f, WHITE);
++        for (const Cue &cue : p->cues)
++        {
++            if (now < cue.start || now >= cue.end)
++                continue;
++            std::vector<std::string> lines;
++            std::stringstream ss(cue.text);
++            std::string line;
++            while (std::getline(ss, line))
++                lines.push_back(line);
++            const float size = th * 0.055f, gap = size * 1.25f;
++            float y = th * 0.93f - gap * float(lines.size());
++            for (const auto &l : lines)
++            {
++                const float w = ga2_ui_font::measure(l, size);
++                drawOutlined(l, (tw - w) * 0.5f, y, size);
++                y += gap;
++            }
++            break;
++        }
++        rlDrawRenderBatchActive();
++        rlEnableBackfaceCulling();
++        EndTextureMode();
++        texture = g_gl.target.texture.id;
++        width = tw;
++        height = th;
++        return true;
++    }
++
++    void mixAudio(std::span<int16_t> output)
++    {
++        std::shared_ptr<Player> p;
++        {
++            std::unique_lock lock(g_mutex, std::try_to_lock);
++            if (!lock.owns_lock())
++                return;
++            p = g_player;
++        }
++        if (!p)
++            return;
++        std::lock_guard lock(p->mutex);
++        if (!p->started)
++            return;
++        p->audioRunning.store(true, std::memory_order_relaxed);
++        const size_t n = std::min(output.size(), p->audio.size());
++        for (size_t i = 0; i < n; ++i)
++        {
++            const int mixed = int(output[i]) + int(float(p->audio[i]) * p->volume);
++            output[i] = int16_t(std::clamp(mixed, -32768, 32767));
++        }
++        p->audio.erase(p->audio.begin(), p->audio.begin() + ptrdiff_t(n));
++        // The clock moves with the device even when the movie's audio ran out (it ends after the picture).
++        p->samplesPlayed += output.size() / 2;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index 5633c98..8255125 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -1,4 +1,5 @@
+ #include "ga2_present.h"
++#include "runtime/ga2_movie.h"
+ #include "runtime/ga2_settings.h"
+ #include "runtime/ga2_display.h"
+ #include "ga2_mpv_shader.h"
+@@ -1320,9 +1321,11 @@ namespace ga2_present
+         // Upscalers, smoothing and integer scaling are made for 2D art: 3D
+         // scenes always fill the play area with plain bilinear. Hor+ 3D
+         // frames are anamorphic and fill the whole area.
+-        const bool scene3d = ga2_activity::scene3d();
++        // A native movie (ga2_movie) is a 4:3 video: plain bilinear like a 3D scene, never the wide shape.
++        const bool movie = ga2_movie::active();
++        const bool scene3d = ga2_activity::scene3d() || movie;
+         {
+-            const bool wide = ga2_activity::wideFrame();
++            const bool wide = ga2_activity::wideFrame() && !movie;
+             // GA2_WIDE_TRACE=1: when the picture switches between the wide and the 4:3 shape (diagnostic).
+             static const bool trace = std::getenv("GA2_WIDE_TRACE") != nullptr;
+             if (trace && wide != g_wide)
+diff --git a/ps2xRuntime/src/lib/ps2_audio.cpp b/ps2xRuntime/src/lib/ps2_audio.cpp
+index e521210..d2911f6 100644
+--- a/ps2xRuntime/src/lib/ps2_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ga2_movie.h"
+ #include "runtime/ps2_audio.h"
+ #include "runtime/ps2_memory.h"
+ #include "ps2_host_backend.h"
+@@ -145,6 +146,7 @@ struct PS2AudioBackend::Impl
+         std::lock_guard lock(callbackMutex);
+         if (callbackOwner) callbackOwner->pcm.consume(output);
+         else std::fill(output.begin(), output.end(), int16_t{});
++        ga2_movie::mixAudio(output); // a native movie's sound (its clock)
+     }
+     void closePcm()
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index cbfb731..4c54a7a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -60,6 +60,8 @@
+ #include <unordered_map>
+ #include <sstream>
+ #include "rlgl.h"
++#include "runtime/ga2_affinity.h"
++#include "runtime/ga2_movie.h"
+ 
+ namespace
+ {
+@@ -101,6 +103,7 @@ namespace
+                 CPU_SET(cpu, &fast);
+                 list += (list.empty() ? "" : ",") + std::to_string(cpu);
+             }
++        ga2_affinity::saveOriginal(allowed);
+         if (sched_setaffinity(0, sizeof(fast), &fast) == 0)
+             std::cerr << "[ga2] game thread pinned to the largest cores (" << list << ")" << std::endl;
+ #endif
+@@ -3594,6 +3597,17 @@ void PS2Runtime::run()
+             ga2_pgs::waitFreshFrame(16);
+         g_presentStats.waitMs += msSince(waitStart);
+         UploadFrame(frameTex, shownTex, this, presentWidth, presentHeight);
++        // A native movie (ga2_movie) is shown in place of the game's picture, on the screen and in the headset.
++        {
++            unsigned movieTexture = 0;
++            int movieWidth = 0, movieHeight = 0;
++            if (ga2_movie::frame(movieTexture, movieWidth, movieHeight))
++            {
++                shownTex = Texture2D{movieTexture, movieWidth, movieHeight, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                presentWidth = uint32_t(movieWidth);
++                presentHeight = uint32_t(movieHeight);
++            }
++        }
+         const auto drawStart = std::chrono::steady_clock::now();
+ 
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+-- 
+2.56.0
+

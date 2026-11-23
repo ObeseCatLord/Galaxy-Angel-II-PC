@@ -1,0 +1,63 @@
+From cc15f8a34663d0f893adba39bb5437a529bb6ce5 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:32:21 -0600
+Subject: [PATCH] VR battle table review fixes: the hologram column never
+ around the head, lone HUD slivers (off-screen map markers) are no panels,
+ widescreen detail's second renderer never rests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_vr.cpp    | 9 +++++++--
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp | 2 +-
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 9542b23..cb21aac 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1180,6 +1180,9 @@ void main()
+             for (int i = 0; i < st.hudCount; ++i)
+             {
+                 const ga2_battletable::State::HudArea &a = st.hud[i];
++                // A lone sliver (under 20 px across, under 30 px long: an off-screen marker of the map) is no panel.
++                if (std::min(a.x1 - a.x0, a.y1 - a.y0) < 20.0f && std::max(a.x1 - a.x0, a.y1 - a.y0) < 30.0f)
++                    continue;
+                 const int id = hudPanelId(a);
+                 const float big = id == kPanelMessage ? 1.45f : 1.0f;
+                 float w = (a.x1 - a.x0) * kMetresPerPixel * 0.5f * big, h = (a.y1 - a.y0) * kMetresPerPixel * 0.5f * big;
+@@ -2369,7 +2372,7 @@ void main()
+     float t = max(-dot(e, d) / dd, 0.0);
+     float r = length(e + d * t);
+     float y = eye.y + dir.y * t - centre.y;
+-    if (t <= 0.0 && length(e) > radius) discard;
++    if (t <= 0.0) discard; // looking away from the column (the eye is always outside it)
+     float side = 1.0 - smoothstep(radius * 0.82, radius, r);
+     float band = smoothstep(-0.03, 0.03, y) * (1.0 - smoothstep(height * 0.85, height, y));
+     float a = side * band;
+@@ -2409,7 +2412,9 @@ void main()
+             setMatrix(g_holoEyeProgram, "invViewProj", inverse(mul(proj, view)));
+             glUniform3f(glGetUniformLocation(g_holoEyeProgram, "eye"), eye.x, eye.y, eye.z);
+             glUniform3f(glGetUniformLocation(g_holoEyeProgram, "centre"), centre.x, centre.y, centre.z);
+-            glUniform1f(glGetUniformLocation(g_holoEyeProgram, "radius"), pose.halfWidth);
++            // Never around the head: the column stays narrower than the eye's distance from its axis.
++            const float axisDist = std::hypot(eye.x - centre.x, eye.z - centre.z);
++            glUniform1f(glGetUniformLocation(g_holoEyeProgram, "radius"), std::max(0.05f, std::min(pose.halfWidth, axisDist * 0.85f)));
+             glUniform1f(glGetUniformLocation(g_holoEyeProgram, "height"), 0.75f);
+             glUniform1f(glGetUniformLocation(g_holoEyeProgram, "time"), time);
+             glActiveTexture(GL_TEXTURE0);
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index a57c86a..0d4b1dd 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -1318,7 +1318,7 @@ namespace ga2_pgs
+         for (uint32_t e = 0; e < s.eyeCount; ++e)
+         {
+             Eye &eye = s.eyes[e];
+-            const bool drop = dropMono && e == 1 && s.eyeCount == 2 && !next.active && !s.hudDebug;
++            const bool drop = dropMono && e == 1 && s.eyeCount == 2 && !s.wideDetail && !next.active && !s.hudDebug; // (wide detail's second renderer always draws)
+             const ScanoutResult result = eye.gs.vsync(info);
+             if (result.image && !(eye.hacks.drop_draws && !shown.active))
+                 readbackLocked(s, eye, result, shown, s.uiLayer && eye.gs.displayed_frame_ui_split(),
+-- 
+2.56.0
+

@@ -1,0 +1,175 @@
+From 66166781a9b4252a1f7333b5a79d0d625ccd7446 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:24:16 -0600
+Subject: [PATCH 165/171] VR battle table: ships drawn opaque with their lights
+ glowing, the game's flat unit icons left off the plate, ship mesh test
+
+---
+ ps2xRuntime/src/lib/battlevr/bvr_ships.cpp | 22 ++++++++++++++++++
+ ps2xRuntime/src/lib/battlevr/bvr_ships.h   |  3 +++
+ ps2xRuntime/src/lib/ga2_vr.cpp             | 26 ++++++++++++++++++----
+ ps2xTest/src/bvr_assets_tests.cpp          | 14 ++++++++++++
+ 4 files changed, 61 insertions(+), 4 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+index c76a74d..5335703 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+@@ -5,6 +5,7 @@
+ #include <cmath>
+ #include <condition_variable>
+ #include <cstdio>
++#include <cstdlib>
+ #include <deque>
+ #include <map>
+ #include <mutex>
+@@ -102,6 +103,24 @@ namespace bvr_ships
+         return mesh;
+     }
+ 
++    bool writeObj(const Mesh &mesh, const std::string &path)
++    {
++        std::FILE *f = std::fopen(path.c_str(), "w");
++        if (!f)
++            return false;
++        size_t base = 1;
++        for (const Mesh::Part &part : mesh.parts)
++        {
++            for (size_t v = 0; v + 11 < part.vertices.size(); v += 12)
++                std::fprintf(f, "v %g %g %g\n", part.vertices[v], part.vertices[v + 1], part.vertices[v + 2]);
++            for (size_t t = 0; t + 2 < part.indices.size(); t += 3)
++                std::fprintf(f, "f %zu %zu %zu\n", base + part.indices[t], base + part.indices[t + 1], base + part.indices[t + 2]);
++            base += part.vertices.size() / 12;
++        }
++        std::fclose(f);
++        return true;
++    }
++
+     int matchStage(const std::vector<bvr_assets::Stage> &stages, const std::vector<SeenUnit> &units)
+     {
+         int best = -1, bestScore = 0;
+@@ -189,6 +208,9 @@ namespace bvr_ships
+                     mesh = buildMesh(l.archive, parts);
+                 std::fprintf(stderr, "[bvr] unit %d: %s -> %zu parts, %zu triangles\n", unitId, table.c_str(), parts.size(),
+                              mesh ? mesh->triangles() : size_t(0));
++                // GA2_BVR_DUMP_OBJ=<dir> (diagnostics): each ship as <dir>/unit<id>.obj (model space, no textures).
++                if (const char *dir = std::getenv("GA2_BVR_DUMP_OBJ"); dir && *dir && mesh)
++                    writeObj(*mesh, std::string(dir) + "/unit" + std::to_string(unitId) + ".obj");
+                 std::lock_guard<std::mutex> lock(l.mutex);
+                 if (generation == l.generation)
+                     l.ships[unitId] = mesh;
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.h b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+index c400639..1cd27ae 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_ships.h
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+@@ -28,6 +28,9 @@ namespace bvr_ships
+     // Builds a mesh from decoded models (each with its texture directory); textures are loaded by name.
+     std::shared_ptr<Mesh> buildMesh(const bvr_assets::Archive &archive, const std::vector<bvr_assets::ShipPart> &parts);
+ 
++    // Diagnostics: the mesh as a Wavefront OBJ (model space, positions and faces).
++    bool writeObj(const Mesh &mesh, const std::string &path);
++
+     struct SeenUnit
+     {
+         int id;       // the unit's stage section ID (unit type field)
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index a89c907..1cc1361 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -579,6 +579,8 @@ uniform float time;
+ uniform vec4 masks[8]; // the HUD's pieces in picture uv (x0, y0, x1, y1): shown as panels around the table, not on it
+ uniform sampler2D ui;  // the UI layer (premultiplied, alpha 0x80 = 1): the units' icons, zones, order lines and the HUD
+ uniform int hasUi;     // with it the scene is whole and only the HUD's pieces of the UI layer are left out
++uniform vec4 icons[64]; // the units' own icons in the UI layer (picture uv centre, radius x, y): the table draws them
++uniform int iconCount;
+ out vec4 o;
+ float box(vec2 p, vec4 r, float soft) {
+     vec2 a = smoothstep(r.xy - soft, r.xy, p) * (1.0 - smoothstep(r.zw, r.zw + soft, p));
+@@ -598,8 +600,11 @@ void main()
+     if (hasUi != 0)
+     {
+         vec4 u = texture(ui, clamp(v_uv, 0.0, 1.0));
+-        float ua = clamp(u.a * (255.0 / 128.0), 0.0, 1.0) * hud;
+-        map = map * (1.0 - ua) + u.rgb * hud;
++        float keep = hud;
++        for (int i = 0; i < iconCount; ++i)
++            keep *= smoothstep(0.85, 1.0, length((v_uv - icons[i].xy) / icons[i].zw));
++        float ua = clamp(u.a * (255.0 / 128.0), 0.0, 1.0) * keep;
++        map = map * (1.0 - ua) + u.rgb * keep;
+     }
+     else
+         pic *= hud;
+@@ -1039,8 +1044,8 @@ uniform float rimStrength;
+ out vec4 o;
+ void main()
+ {
++    // The models' textures are drawn opaque (their alpha is often 0: the GS ignores it for these models).
+     vec4 t = textured != 0 ? texture(tex, v_uv) : vec4(1.0);
+-    if (t.a < 0.2) discard;
+     vec3 base = t.rgb * min(v_col.rgb * (255.0 / 128.0), vec3(2.0));
+     vec3 n = normalize(v_n);
+     vec3 v = normalize(eye - v_w);
+@@ -1048,7 +1053,8 @@ void main()
+     vec3 l = normalize(vec3(0.3, 0.9, 0.35));
+     float diffuse = 0.42 + 0.58 * max(dot(n, l), 0.0);
+     float rim = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+-    o = vec4(base * diffuse + tint * rim * rimStrength, 1.0);
++    // The few texels with alpha (lights, engines) glow.
++    o = vec4(base * (diffuse + t.a * 0.8) + tint * rim * rimStrength, 1.0);
+ })";
+ 
+         struct GlShip
+@@ -1291,6 +1297,18 @@ void main()
+             float masks[32];
+             tableMasks(st, masks);
+             glUniform4fv(glGetUniformLocation(g_tableGl.table, "masks"), 8, masks);
++            {
++                // The game's flat unit icons are left off the plate (the units stand over it as ships and discs).
++                float icons[64 * 4];
++                int count = 0;
++                for (int n = 0; n < st.unitCount && count < 64; ++n, ++count)
++                {
++                    icons[4 * count + 0] = st.units[n].sx / 640.0f, icons[4 * count + 1] = st.units[n].sy / 480.0f;
++                    icons[4 * count + 2] = 30.0f / 640.0f, icons[4 * count + 3] = 30.0f / 480.0f;
++                }
++                glUniform4fv(glGetUniformLocation(g_tableGl.table, "icons"), count, icons);
++                glUniform1i(glGetUniformLocation(g_tableGl.table, "iconCount"), count);
++            }
+             drawArrays(g_tableGl.vao7, g_tableGl.vbo7, mesh, 7);
+             drawHudPanels(viewProj, eye, picture, extentX, extentY, st, pose);
+ 
+diff --git a/ps2xTest/src/bvr_assets_tests.cpp b/ps2xTest/src/bvr_assets_tests.cpp
+index 406cf07..0916451 100644
+--- a/ps2xTest/src/bvr_assets_tests.cpp
++++ b/ps2xTest/src/bvr_assets_tests.cpp
+@@ -4,6 +4,7 @@
+ #include "battlevr/bvr_ships.h"
+ 
+ #include <array>
++#include <algorithm>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdlib>
+@@ -150,6 +151,19 @@ void register_bvr_assets_tests()
+                          "the first part and its texture directory");
+                 bvr_assets::Texture tex;
+                 t.IsTrue(bvr_assets::loadTexture(archive, "slg/machines", "si_mon_000", tex) && tex.width == 256, "a texture from TEXDIR");
++                // Ship meshes as the table draws them: an angel and a 26-part enemy, sizes like the models'.
++                for (const char *table : {"slg/machines/si_mon_0000.tbl", "slg/machines/mes_1000/si_mes_1000info.tbl"})
++                {
++                    std::vector<bvr_assets::ShipPart> sp;
++                    const auto mesh = bvr_assets::shipParts(archive, table, sp) ? bvr_ships::buildMesh(archive, sp) : nullptr;
++                    t.IsTrue(mesh != nullptr, std::string(table) + " mesh");
++                    if (!mesh)
++                        continue;
++                    const float len = std::max({mesh->hi[0] - mesh->lo[0], mesh->hi[1] - mesh->lo[1], mesh->hi[2] - mesh->lo[2]});
++                    t.IsTrue(len > 10.0f && len < 2000.0f, std::string(table) + " size " + std::to_string(len));
++                    if (const char *dir = std::getenv("GA2_BVR_DUMP_OBJ"); dir && *dir)
++                        bvr_ships::writeObj(*mesh, std::string(dir) + "/" + (std::strstr(table, "mes_") ? "enemy" : "angel") + ".obj");
++                }
+             }
+             for (const Ref &r : refs)
+             {
+-- 
+2.56.0
+

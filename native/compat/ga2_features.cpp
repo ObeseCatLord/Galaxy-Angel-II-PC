@@ -740,7 +740,7 @@ namespace
     std::vector<ga2_hud::Area> g_captureItems;
     uint64_t g_captureFrame = 0;
     std::mutex g_areaMutex;
-    std::vector<ga2_hud::Area> g_lastAreas;
+    std::vector<ga2_hud::Area> g_lastAreas, g_lastItems;
 
     // Merges touching rectangles (within 6 px) into areas.
     std::vector<ga2_hud::Area> mergeAreas(std::vector<ga2_hud::Area> in)
@@ -777,11 +777,13 @@ namespace
         if (frame != g_captureFrame)
         {
             // A new frame: the items collected so far were the last one's.
+            std::vector<ga2_hud::Area> items = g_captureItems;
             std::vector<ga2_hud::Area> done = mergeAreas(std::move(g_captureItems));
             g_captureItems.clear();
             g_captureFrame = frame;
             std::lock_guard<std::mutex> lock(g_areaMutex);
             g_lastAreas = std::move(done);
+            g_lastItems = std::move(items);
         }
         if (kind == 4u)
         {
@@ -1079,6 +1081,16 @@ int ga2_hud::areas(Area *out, int max)
     std::lock_guard<std::mutex> lock(g_areaMutex);
     int n = 0;
     for (const Area &a : g_lastAreas)
+        if (n < max)
+            out[n++] = a;
+    return n;
+}
+
+int ga2_hud::items(Area *out, int max)
+{
+    std::lock_guard<std::mutex> lock(g_areaMutex);
+    int n = 0;
+    for (const Area &a : g_lastItems)
         if (n < max)
             out[n++] = a;
     return n;

@@ -1,0 +1,2244 @@
+From 7d6195cbcd5dc51e7cb564d8c0631c2103bce4e2 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 20:58:57 -0600
+Subject: [PATCH 173/174] VR battle table: markers from each unit's own icon
+ (upscaled, solid layers), ships by model length with bob and bank, panels
+ only the HUD items' pixels, palm menus, movable panels with a message panel,
+ chase and camera views in the table, 90 Hz request, loop timing
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_battletable.h |   10 +
+ ps2xRuntime/include/runtime/ga2_vrpointer.h   |    1 +
+ ps2xRuntime/src/lib/battlevr/bvr_assets.cpp   |   10 +
+ ps2xRuntime/src/lib/battlevr/bvr_assets.h     |    3 +
+ ps2xRuntime/src/lib/battlevr/bvr_hands.h      |  305 +++++
+ ps2xRuntime/src/lib/battlevr/bvr_ships.cpp    |   56 +
+ ps2xRuntime/src/lib/battlevr/bvr_ships.h      |    5 +
+ ps2xRuntime/src/lib/ga2_present.cpp           |  103 +-
+ ps2xRuntime/src/lib/ga2_present.h             |    7 +
+ ps2xRuntime/src/lib/ga2_vr.cpp                | 1001 +++++++++++++++--
+ ps2xRuntime/src/lib/ga2_vr_input.h            |    3 +
+ ps2xTest/CMakeLists.txt                       |    1 +
+ ps2xTest/src/bvr_hands_tests.cpp              |  114 ++
+ ps2xTest/src/main.cpp                         |    2 +
+ 14 files changed, 1486 insertions(+), 135 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/battlevr/bvr_hands.h
+ create mode 100644 ps2xTest/src/bvr_hands_tests.cpp
+
+diff --git a/ps2xRuntime/include/runtime/ga2_battletable.h b/ps2xRuntime/include/runtime/ga2_battletable.h
+index 2416dd9..a595942 100644
+--- a/ps2xRuntime/include/runtime/ga2_battletable.h
++++ b/ps2xRuntime/include/runtime/ga2_battletable.h
+@@ -22,6 +22,7 @@ namespace ga2_battletable
+         float x = 0.0f, z = 0.0f;   // map position (map units)
+         float y = 0.0f;             // height (map units, the game's Y: down)
+         int id = -1;                // the unit's stage section ID (0 the mothership, 1.. angels, 20.. enemies)
++        int hp = 0;                 // its shield (HP) now
+         float sx = 0.0f, sy = 0.0f; // its icon in the 2D layer's 640 x 480 space (centre)
+         bool hovered = false;       // under a hand
+         bool focused = false;       // the game's cursor unit (the one an order goes to)
+@@ -85,6 +86,11 @@ namespace ga2_battletable
+         static constexpr int kMaxHud = 8;
+         HudArea hud[kMaxHud];
+         int hudCount = 0;
++        // The HUD items themselves (an area merges touching ones): a panel shows only what lies inside them (the
++        // map's own 2D markers inside an area's box are not the HUD's).
++        static constexpr int kMaxHudItems = 48;
++        HudArea hudItems[kMaxHudItems];
++        int hudItemCount = 0;
+         uint32_t hapticMicro[2] = {0, 0}, hapticSmall[2] = {0, 0}, hapticBig[2] = {0, 0}; // pulse counters per hand
+         uint32_t presses = 0, orders = 0; // counters: an angel selected at the table, an order given
+         // The game's tutorial gates as actions (ga2_vrguide.h Gate bits; all set when nothing is gated).
+@@ -112,6 +118,10 @@ namespace ga2_battletable
+         Hand hands[2];           // left, right
+         float head[3] = {0, 0, 0};
+         float gaze[3] = {0, 0, -1};
++        // A unit chosen on a palm menu (its stage section ID), new when selectSerial changes: the game selects it as
++        // a trigger press on its disc would (and Circle on the angel already selected: stay).
++        int selectUnit = -1;
++        uint32_t selectSerial = 0;
+         uint64_t serial = 0;
+     };
+ 
+diff --git a/ps2xRuntime/include/runtime/ga2_vrpointer.h b/ps2xRuntime/include/runtime/ga2_vrpointer.h
+index a94493a..bdef6db 100644
+--- a/ps2xRuntime/include/runtime/ga2_vrpointer.h
++++ b/ps2xRuntime/include/runtime/ga2_vrpointer.h
+@@ -37,6 +37,7 @@ namespace ga2_vrpointer
+         TacticalMap, // as wantTrigger(true)
+         Cockpit,     // cockpit / attack view: the triggers fire (Cross)
+         UnitCamera,  // watching a unit through its camera: the triggers are L2 / R2 (zoom)
++        Rear,        // following a unit from behind (the battle's view mode 1): the trigger confirms (Circle)
+     };
+ 
+     // Game thread: the scene the game shows now; call every frame it is shown (a
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+index b3ebc48..a4a85f8 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+@@ -6,6 +6,7 @@
+ #include <array>
+ #include <cctype>
+ #include <cmath>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+@@ -447,6 +448,15 @@ namespace bvr_assets
+             u.start[1] = table.number(s.name, "START_POS_Y", 0.0f);
+             u.start[2] = table.number(s.name, "START_POS_Z", 0.0f);
+             u.startRot = table.number(s.name, "START_ROT", 0.0f);
++            for (int k = 0; k < 40; ++k)
++            {
++                char key[40];
++                std::snprintf(key, sizeof(key), "MAPVIEW_UNITBASE_FILENAME%02d", k);
++                const std::string *v = table.get(s.name, key);
++                if (!v)
++                    break;
++                u.icons.push_back(v->substr(0, v->find_first_of(" \t")));
++            }
+             stage.units.push_back(u);
+         }
+         return !stage.units.empty();
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.h b/ps2xRuntime/src/lib/battlevr/bvr_assets.h
+index 48c6445..1cd5abc 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_assets.h
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.h
+@@ -122,6 +122,9 @@ namespace bvr_assets
+         std::string modelTable;   // MODEL_FILENAME
+         std::string uniteTable;   // UNITE_MODEL_FILENAME (an angel's combined form), may be empty
+         float start[3] = {0, 0, 0}, startRot = 0.0f; // START_POS_X/Y/Z, START_ROT (degrees)
++        // MAPVIEW_UNITBASE_FILENAMEnn: the map icon per expression (angels: 00 normal, 01 smile, 02 sad, 04 damage,
++        // 05.. greyed; others one silhouette), .agi paths; empty when none.
++        std::vector<std::string> icons;
+     };
+     struct Stage
+     {
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_hands.h b/ps2xRuntime/src/lib/battlevr/bvr_hands.h
+new file mode 100644
+index 0000000..b54d952
+--- /dev/null
++++ b/ps2xRuntime/src/lib/battlevr/bvr_hands.h
+@@ -0,0 +1,305 @@
++// The VR battle table's hand furniture, as pure logic (no GL, no OpenXR; unit-tested in ps2xTest):
++//   - the palm menus (after BattleGroupVR's hand menus, behaviour only): a menu shows on a palm turned toward the face
++//     and is worked by the other hand's fingertip poking its keys;
++//   - floating panels the player places: a grip with the hand on a panel carries it, and its place is remembered.
++// Play space: metres, x right, y up, -z ahead (OpenXR).
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace bvr_hands
++{
++    struct V
++    {
++        float x = 0, y = 0, z = 0;
++    };
++    inline V operator+(V a, V b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
++    inline V operator-(V a, V b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
++    inline V operator*(V a, float k) { return {a.x * k, a.y * k, a.z * k}; }
++    inline float dot(V a, V b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
++    inline V cross(V a, V b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
++    inline float len(V a) { return std::sqrt(dot(a, a)); }
++    inline V unit(V a)
++    {
++        const float l = len(a);
++        return l > 1e-6f ? a * (1.0f / l) : V{0, 0, 0};
++    }
++
++    // ---- palm menus ----------------------------------------------------------------------------------------------
++    constexpr float kOpenDegrees = 35.0f;  // palm normal within this of the palm-to-head direction: opens
++    constexpr float kCloseDegrees = 50.0f; // beyond this: closes
++    constexpr double kOpenDwell = 0.15;    // seconds the palm must face the head before the menu shows
++    constexpr float kMaxReach = 0.7f;      // the hand within this of the head
++    constexpr float kMenuLift = 0.035f;    // the menu floats this far off the palm, toward the head
++
++    struct PalmInput
++    {
++        bool valid = false;
++        V palm;          // the palm's centre
++        V normal;        // out of the palm (unit)
++        V fingers;       // from the wrist toward the fingers (unit)
++        bool busy = false; // gripping, or dragging an order: no menu
++        V head;
++    };
++
++    // Where a menu is drawn: centre and axes (right, up in the menu's plane, facing the head; normal toward the head).
++    struct Frame
++    {
++        V centre, right, up, normal;
++    };
++
++    class Palm
++    {
++    public:
++        // One headset frame; true while the menu shows.
++        bool step(const PalmInput &in, double now)
++        {
++            if (!in.valid || in.busy)
++            {
++                open_ = false;
++                since_ = -1.0;
++                return false;
++            }
++            const V toHead = in.head - in.palm;
++            const float dist = len(toHead);
++            const float c = dist > 1e-4f ? dot(unit(toHead), in.normal) : -1.0f;
++            const float angle = std::acos(std::clamp(c, -1.0f, 1.0f)) * 57.29578f;
++            const bool facing = dist < kMaxReach && angle < (open_ ? kCloseDegrees : kOpenDegrees);
++            if (!facing)
++            {
++                open_ = false;
++                since_ = -1.0;
++            }
++            else if (!open_)
++            {
++                if (since_ < 0.0)
++                    since_ = now;
++                if (now - since_ >= kOpenDwell)
++                    open_ = true;
++            }
++            if (open_)
++            {
++                // Facing the head, upright along the fingers (seen from the head: the fingers point up the menu).
++                frame_.normal = unit(toHead);
++                frame_.centre = in.palm + in.normal * kMenuLift + in.fingers * 0.02f;
++                V up = in.fingers - frame_.normal * dot(in.fingers, frame_.normal);
++                if (len(up) < 1e-3f)
++                    up = V{0, 1, 0};
++                frame_.up = unit(up);
++                frame_.right = unit(cross(frame_.up, frame_.normal));
++            }
++            return open_;
++        }
++        bool open() const { return open_; }
++        const Frame &frame() const { return frame_; }
++        // Shown at a given frame regardless of the hand (screenshots and tests).
++        void force(const Frame &f)
++        {
++            open_ = true;
++            frame_ = f;
++        }
++
++    private:
++        bool open_ = false;
++        double since_ = -1.0;
++        Frame frame_;
++    };
++
++    // A pressable key on a menu: a rectangle in the menu's plane (metres from its centre, x right, y up).
++    struct Key
++    {
++        int id = 0;
++        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++        bool enabled = true;
++    };
++
++    // Poking: the fingertip enters a key from the front. The cap travels 8 mm (drawn by the renderer from depth());
++    // it fires at 6 mm and is let go above 3 mm; one key at a time; 150 ms between presses.
++    constexpr float kTravel = 0.008f, kFire = 0.006f, kRelease = 0.003f, kHover = 0.03f;
++    constexpr double kDebounce = 0.15;
++
++    class Keys
++    {
++    public:
++        // The fingertip of the other hand against the keys of a menu (tipValid false: no finger). Returns the id of a
++        // key pressed this frame, else 0. hovered(): the key under the finger (within 3 cm in front), else 0.
++        int step(const Frame &f, const std::vector<Key> &keys, bool tipValid, V tip, double now)
++        {
++            hovered_ = 0;
++            depth_ = 0.0f;
++            if (!tipValid)
++            {
++                down_ = 0;
++                return 0;
++            }
++            const V d = tip - f.centre;
++            const float x = dot(d, f.right), y = dot(d, f.up), h = dot(d, f.normal); // h > 0: in front
++            const Key *under = nullptr;
++            for (const Key &k : keys)
++                if (x >= k.x0 && x <= k.x1 && y >= k.y0 && y <= k.y1)
++                    under = &k;
++            if (down_)
++            {
++                // Held: let go when the finger backs out (or slides off the key).
++                if (!under || under->id != down_ || -h < kRelease)
++                    down_ = 0;
++                else
++                {
++                    hovered_ = down_;
++                    depth_ = std::clamp(-h, 0.0f, kTravel);
++                }
++                return 0;
++            }
++            if (!under || h > kHover || -h > 0.04f)
++                return 0;
++            hovered_ = under->id;
++            depth_ = std::clamp(-h, 0.0f, kTravel);
++            if (-h >= kFire && under->enabled && now - last_ >= kDebounce)
++            {
++                // Only a key entered from the front fires (not one the finger reached from behind the menu).
++                if (frontSeen_ == under->id)
++                {
++                    down_ = under->id;
++                    last_ = now;
++                    return under->id;
++                }
++            }
++            if (h > 0.0f)
++                frontSeen_ = under->id;
++            return 0;
++        }
++        int hovered() const { return hovered_; }
++        float depth() const { return depth_; }
++        int held() const { return down_; }
++
++    private:
++        int hovered_ = 0, down_ = 0, frontSeen_ = 0;
++        float depth_ = 0.0f;
++        double last_ = -10.0;
++    };
++
++    // ---- floating panels -----------------------------------------------------------------------------------------
++    // A panel's place relative to the table (the table's frame: u right, v away, h up from its centre; yaw radians
++    // added to its facing), and a size factor.
++    struct Place
++    {
++        float u = 0, v = 0, h = 0;
++        float scale = 1.0f;
++        bool set = false; // false: the panel's default place
++    };
++
++    struct PanelHit
++    {
++        int id = -1;
++        V centre, right, up; // half axes (metres)
++    };
++
++    // Grabbing: a hand's grip pressed while its palm (or fingertip) is on a panel (within 5 cm of its plane, inside it
++    // with a 2 cm margin) takes the panel; it follows the hand (the hand's offset kept) until the grip is let go.
++    class Grabber
++    {
++    public:
++        // grip: 0..1 per hand; points: the palm (and fingertip) per hand. Returns true when a hand holds a panel
++        // (that hand's grip is not the table's then). heldBy(id): the hand holding panel id, or -1.
++        struct HandIn
++        {
++            bool valid = false;
++            float grip = 0.0f;
++            V palm, tip;
++        };
++        void step(const HandIn hands[2], const std::vector<PanelHit> &panels)
++        {
++            for (int h = 0; h < 2; ++h)
++            {
++                const HandIn &in = hands[h];
++                const bool on = in.valid && in.grip > (held_[h] >= 0 ? 0.4f : 0.6f);
++                if (!on)
++                {
++                    held_[h] = -1;
++                    wasGrip_[h] = in.valid && in.grip > 0.6f;
++                    continue;
++                }
++                if (held_[h] < 0 && !wasGrip_[h])
++                {
++                    // A new grip: on a panel?
++                    float best = 1e9f;
++                    for (const PanelHit &p : panels)
++                        for (V q : {in.palm, in.tip})
++                        {
++                            const V d = q - p.centre;
++                            const float ru = len(p.right), rv = len(p.up);
++                            if (ru < 1e-4f || rv < 1e-4f)
++                                continue;
++                            const float x = dot(d, unit(p.right)), y = dot(d, unit(p.up));
++                            const V n = unit(cross(p.right, p.up));
++                            const float z = std::fabs(dot(d, n));
++                            if (std::fabs(x) <= ru + 0.02f && std::fabs(y) <= rv + 0.02f && z < 0.05f && z < best &&
++                                held_[h ^ 1] != p.id)
++                            {
++                                best = z;
++                                held_[h] = p.id;
++                                offset_[h] = p.centre - in.palm;
++                            }
++                        }
++                }
++                wasGrip_[h] = true;
++            }
++        }
++        int heldBy(int id) const
++        {
++            for (int h = 0; h < 2; ++h)
++                if (held_[h] == id)
++                    return h;
++            return -1;
++        }
++        int held(int hand) const { return held_[hand & 1]; }
++        // Where a held panel's centre goes for a hand's palm.
++        V target(int hand, V palm) const { return palm + offset_[hand & 1]; }
++
++    private:
++        int held_[2] = {-1, -1};
++        bool wasGrip_[2] = {false, false};
++        V offset_[2];
++    };
++
++    // Places as text (one panel a line: "id u v h scale"), for the layout file in the data folder.
++    inline std::string formatPlaces(const std::map<int, Place> &places)
++    {
++        std::string out;
++        char line[128];
++        for (const auto &[id, p] : places)
++            if (p.set)
++            {
++                std::snprintf(line, sizeof(line), "%d %.4f %.4f %.4f %.3f\n", id, p.u, p.v, p.h, p.scale);
++                out += line;
++            }
++        return out;
++    }
++    inline std::map<int, Place> parsePlaces(const std::string &text)
++    {
++        std::map<int, Place> out;
++        size_t at = 0;
++        while (at < text.size())
++        {
++            const size_t end = std::min(text.find('\n', at), text.size());
++            const std::string line = text.substr(at, end - at);
++            int id = 0;
++            Place p;
++            if (std::sscanf(line.c_str(), "%d %f %f %f %f", &id, &p.u, &p.v, &p.h, &p.scale) == 5 && std::isfinite(p.u) &&
++                std::isfinite(p.v) && std::isfinite(p.h) && p.scale > 0.2f && p.scale < 5.0f && std::fabs(p.u) < 5.0f &&
++                std::fabs(p.v) < 5.0f && std::fabs(p.h) < 5.0f)
++            {
++                p.set = true;
++                out[id] = p;
++            }
++            at = end + 1;
++        }
++        return out;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+index 4d22d23..3efe42a 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+@@ -147,6 +147,7 @@ namespace bvr_ships
+     namespace
+     {
+         constexpr int kSkyJob = -1000; // the loader's queue entry for the stage's sky
++        constexpr int kIconJob = 1 << 20; // + unit ID * 64 + expression: a unit's map icon
+         struct Loader
+         {
+             std::mutex mutex;
+@@ -159,6 +160,8 @@ namespace bvr_ships
+             std::map<int, bool> requested;
+             std::shared_ptr<const Mesh> sky;
+             bool skyRequested = false;
++            std::map<int, std::shared_ptr<const bvr_assets::Texture>> icons; // by unit ID * 64 + expression
++            std::map<int, bool> iconRequested;
+             std::deque<int> queue;
+             uint64_t generation = 0; // reset() bumps it: work for an old battle is dropped
+         };
+@@ -215,6 +218,23 @@ namespace bvr_ships
+                             l.sky = sky;
+                         continue;
+                     }
++                    if (unitId >= kIconJob)
++                    {
++                        const int key = unitId - kIconJob;
++                        std::string file;
++                        if (const bvr_assets::StageUnit *su = l.stages[size_t(l.stage)].unit(key / 64))
++                            if (!su->icons.empty())
++                                file = su->icons[size_t(std::min<int>(key % 64, int(su->icons.size()) - 1))];
++                        lock.unlock();
++                        auto texture = std::make_shared<bvr_assets::Texture>();
++                        std::vector<uint8_t> data;
++                        if (file.empty() || !l.archive.read(file, data) || !bvr_assets::decodeAgi(data.data(), data.size(), *texture))
++                            texture.reset();
++                        lock.lock();
++                        if (generation == l.generation)
++                            l.icons[key] = texture;
++                        continue;
++                    }
+                     if (const bvr_assets::StageUnit *su = l.stages[size_t(l.stage)].unit(unitId))
+                         table = su->modelTable;
+                 }
+@@ -266,6 +286,8 @@ namespace bvr_ships
+         l.requested.clear();
+         l.sky.reset();
+         l.skyRequested = false;
++        l.icons.clear();
++        l.iconRequested.clear();
+         l.queue.clear();
+         ++l.generation;
+     }
+@@ -331,3 +353,37 @@ namespace bvr_ships
+         return nullptr;
+     }
+ }
++
++namespace bvr_ships
++{
++    std::shared_ptr<const bvr_assets::Texture> unitIcon(int unitId, int expression)
++    {
++        Loader &l = loader();
++        std::lock_guard<std::mutex> lock(l.mutex);
++        if (l.stage < 0 || unitId < 0 || expression < 0 || expression >= 64)
++            return nullptr;
++        const bvr_assets::StageUnit *su = l.stages[size_t(l.stage)].unit(unitId);
++        if (!su || su->icons.empty())
++            return nullptr;
++        const int key = unitId * 64 + std::min<int>(expression, int(su->icons.size()) - 1);
++        if (const auto it = l.icons.find(key); it != l.icons.end())
++            return it->second;
++        if (!l.iconRequested[key])
++        {
++            l.iconRequested[key] = true;
++            l.queue.push_front(kIconJob + key);
++            l.wake.notify_one();
++        }
++        return nullptr;
++    }
++
++    float stageExtent()
++    {
++        Loader &l = loader();
++        std::lock_guard<std::mutex> lock(l.mutex);
++        if (l.stage < 0)
++            return 0.0f;
++        const bvr_assets::Stage &s = l.stages[size_t(l.stage)];
++        return std::max(s.size[0], s.size[2]);
++    }
++}
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.h b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+index 70b7756..6191477 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_ships.h
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+@@ -58,4 +58,9 @@ namespace bvr_ships
+     std::shared_ptr<const Mesh> stageSky();
+     // A unit's START_ROT in the identified stage (degrees), 0 when unknown.
+     float startRotation(int unitId);
++    // A unit's map icon (MAPVIEW_UNITBASE_FILENAMEnn of its section; the last one when the expression is beyond its
++    // list): null while it loads (queued on the first call) or when it has none.
++    std::shared_ptr<const bvr_assets::Texture> unitIcon(int unitId, int expression);
++    // The identified stage's larger side (SIZE_X / SIZE_Z: km, the map units of ga2_battletable), 0 when none.
++    float stageExtent();
+ }
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index 9b38594..5633c98 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -921,8 +921,7 @@ vec4 hook() {
+             }
+         }
+ 
+-        // A few queued textures per frame (about 6 ms), the GL context current.
+-        void processLayerJobs(bool hq)
++        bool ensureLayerChains(bool hq)
+         {
+             const int kind = hq ? 1 : 0;
+             if (g_layerChainKind != kind)
+@@ -931,46 +930,62 @@ vec4 hook() {
+                 g_layerChain[1] = layerChain(hq);
+                 g_layerChainKind = kind;
+             }
+-            if (!g_layerChain[0] || !g_layerChain[1])
++            return g_layerChain[0] && g_layerChain[1];
++        }
++
++        // One image through the layer chains (2x or 4x); empty when it could not be made. GL context current.
++        std::vector<uint32_t> upscaleImage(const std::vector<uint32_t> &rgba, uint32_t width, uint32_t height, int scale, int &outW,
++                                           int &outH)
++        {
++            std::vector<uint32_t> rgb = rgba;
++            bleed(rgb, width, height);
++            ::Image source{rgb.data(), int(width), int(height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++            Texture2D input = LoadTextureFromImage(source);
++            int w = int(width), h = int(height);
++            uint32_t result = input.id;
++            for (int step = 0; step < (scale >= 4 ? 2 : 1) && result; ++step)
++            {
++                int rw = 0, rh = 0;
++                result = g_layerChain[step]->run(result, w, h, w * 2, h * 2, rw, rh);
++                w = rw, h = rh;
++            }
++            std::vector<uint32_t> out;
++            if (result && w == int(width) * scale && h == int(height) * scale)
++            {
++                std::vector<float> texels(size_t(w) * size_t(h) * 4u);
++                glBindTexture(GL_TEXTURE_2D, result);
++                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, texels.data());
++                glBindTexture(GL_TEXTURE_2D, 0);
++                // The alpha channel scaled on its own (the network works on colour).
++                std::vector<uint32_t> alphaCopy = rgba;
++                ::Image alpha = ImageCopy(::Image{alphaCopy.data(), int(width), int(height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8});
++                ImageResize(&alpha, w, h);
++                const auto *a = static_cast<const uint32_t *>(alpha.data);
++                out.resize(size_t(w) * size_t(h));
++                for (size_t i = 0; i < out.size(); ++i)
++                {
++                    auto c = [&](int k) { return uint32_t(std::lround(std::clamp(texels[i * 4 + size_t(k)], 0.0f, 1.0f) * 255.0f)); };
++                    out[i] = c(0) | c(1) << 8 | c(2) << 16 | (a[i] & 0xFF000000u);
++                }
++                UnloadImage(alpha);
++            }
++            UnloadTexture(input);
++            outW = w, outH = h;
++            return out;
++        }
++
++        // A few queued textures per frame (about 6 ms), the GL context current.
++        void processLayerJobs(bool hq)
++        {
++            if (!ensureLayerChains(hq))
+                 return;
+             rlDrawRenderBatchActive();
+             const auto start = std::chrono::steady_clock::now();
+             ga2_layers::Job job;
+             while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(6) && ga2_layers::takeJob(job))
+             {
+-                const int scale = ga2_layers::scale();
+-                std::vector<uint32_t> rgb = job.rgba;
+-                bleed(rgb, job.w, job.h);
+-                ::Image source{rgb.data(), int(job.w), int(job.h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+-                Texture2D input = LoadTextureFromImage(source);
+-                int w = int(job.w), h = int(job.h);
+-                uint32_t result = input.id;
+-                for (int step = 0; step < (scale >= 4 ? 2 : 1) && result; ++step)
+-                {
+-                    int rw = 0, rh = 0;
+-                    result = g_layerChain[step]->run(result, w, h, w * 2, h * 2, rw, rh);
+-                    w = rw, h = rh;
+-                }
+-                std::vector<uint32_t> out;
+-                if (result && w == int(job.w) * scale && h == int(job.h) * scale)
+-                {
+-                    std::vector<float> texels(size_t(w) * size_t(h) * 4u);
+-                    glBindTexture(GL_TEXTURE_2D, result);
+-                    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, texels.data());
+-                    glBindTexture(GL_TEXTURE_2D, 0);
+-                    // The alpha channel scaled on its own (the network works on colour).
+-                    ::Image alpha = ImageCopy(::Image{job.rgba.data(), int(job.w), int(job.h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8});
+-                    ImageResize(&alpha, w, h);
+-                    const auto *a = static_cast<const uint32_t *>(alpha.data);
+-                    out.resize(size_t(w) * size_t(h));
+-                    for (size_t i = 0; i < out.size(); ++i)
+-                    {
+-                        auto c = [&](int k) { return uint32_t(std::lround(std::clamp(texels[i * 4 + size_t(k)], 0.0f, 1.0f) * 255.0f)); };
+-                        out[i] = c(0) | c(1) << 8 | c(2) << 16 | (a[i] & 0xFF000000u);
+-                    }
+-                    UnloadImage(alpha);
+-                }
+-                UnloadTexture(input);
++                int w = 0, h = 0;
++                std::vector<uint32_t> out = upscaleImage(job.rgba, job.w, job.h, ga2_layers::scale(), w, h);
+                 ga2_layers::finish(job.hash, uint32_t(w), uint32_t(h), std::move(out));
+             }
+             glViewport(0, 0, GetRenderWidth(), GetRenderHeight());
+@@ -1260,6 +1275,22 @@ namespace ga2_present
+         return g_ready && g_skyboxTried && g_skybox.id == 0;
+     }
+ 
++    bool upscaleArt(const uint32_t *rgba, int width, int height, int scale, std::vector<uint32_t> &out, int &outWidth, int &outHeight)
++    {
++        out.clear();
++        if (!rgba || width <= 0 || height <= 0 || !ensureLayerChains(g_layerChainKind == 1))
++            return false;
++        rlDrawRenderBatchActive();
++        GLint framebuffer = 0, viewport[4] = {0, 0, 0, 0};
++        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
++        glGetIntegerv(GL_VIEWPORT, viewport);
++        out = upscaleImage(std::vector<uint32_t>(rgba, rgba + size_t(width) * size_t(height)), uint32_t(width), uint32_t(height),
++                           scale >= 4 ? 4 : 2, outWidth, outHeight);
++        glBindFramebuffer(GL_FRAMEBUFFER, GLuint(framebuffer));
++        glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
++        return !out.empty();
++    }
++
+     void init(const std::string &program)
+     {
+         SetWindowTitle(title(program).c_str());
+diff --git a/ps2xRuntime/src/lib/ga2_present.h b/ps2xRuntime/src/lib/ga2_present.h
+index eba9191..836c455 100644
+--- a/ps2xRuntime/src/lib/ga2_present.h
++++ b/ps2xRuntime/src/lib/ga2_present.h
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
++#include <cstdint>
+ #include <string>
++#include <vector>
+ 
+ struct Texture;
+ 
+@@ -44,4 +46,9 @@ namespace ga2_present
+     // picture) and returns where the picture went, in window pixels.
+     Rect draw(const Texture &frame, float srcWidth, float srcHeight);
+ 
++    // A small picture (RGBA 0xAABBGGRR) upscaled 2x or 4x by the 2D filter's Anime4K networks (the ones the per-layer
++    // upscaling uses), its alpha resized on its own; false when the networks cannot run. GL context current; the
++    // framebuffer and viewport are kept.
++    bool upscaleArt(const uint32_t *rgba, int width, int height, int scale, std::vector<uint32_t> &out, int &outWidth, int &outHeight);
++
+ }
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index ce09ffc..9ac75c9 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -15,6 +15,7 @@
+ #include "runtime/ga2_framepace.h"
+ #include "runtime/gs/gs_pgs.h"
+ #include "battlevr/bvr_ships.h"
++#include "battlevr/bvr_hands.h"
+ 
+ #include "raylib.h"
+ #include "rlgl.h"
+@@ -33,10 +34,13 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <filesystem>
+ #include <map>
+ #include <mutex>
+ #include <sstream>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #if defined(_WIN32)
+@@ -490,6 +494,7 @@ void main() {
+             float halfWidth = 0, halfHeight = 0;
+         };
+ 
++        bool battleViewScreen(float halfHeight, float out[3]); // with the battle table below
+         ScreenGeometry screenGeometry(bool wide)
+         {
+             ScreenGeometry s;
+@@ -497,6 +502,14 @@ void main() {
+             const float wideAspect = std::max(ga2_display::parseAspect(ga2_settings::value(ga2_options::Aspect)), 4.0f / 3.0f);
+             s.halfWidth = s.halfHeight * (wide ? (wideAspect > 4.0f / 3.0f ? wideAspect : 16.0f / 9.0f) : 4.0f / 3.0f);
+             s.center = V3{0.0f, 0.0f, -kScreenDistance};
++            // In the battle's other views: standing in the table, its foot just above the plate, a little beyond the centre.
++            const float scale = 0.19f / s.halfHeight;
++            float p[3];
++            if (battleViewScreen(s.halfHeight * scale, p))
++            {
++                s.halfHeight *= scale, s.halfWidth *= scale;
++                s.center = V3{p[0], p[1], p[2]};
++            }
+             return s;
+         }
+ 
+@@ -581,6 +594,7 @@ uniform sampler2D ui;  // the UI layer (premultiplied, alpha 0x80 = 1): the unit
+ uniform int hasUi;     // with it the scene is whole and only the HUD's pieces of the UI layer are left out
+ uniform vec4 icons[64]; // the units' own icons in the UI layer (picture uv centre, radius x, y): the table draws them
+ uniform int iconCount;
++uniform int showMap;    // 0: the plate alone (the battle's other views)
+ out vec4 o;
+ float box(vec2 p, vec4 r, float soft) {
+     vec2 a = smoothstep(r.xy - soft, r.xy, p) * (1.0 - smoothstep(r.zw, r.zw + soft, p));
+@@ -593,7 +607,7 @@ void main()
+     if (edge > 1.0) discard;
+     // Inside the picture (soft border) and outside the HUD.
+     vec2 inPic = smoothstep(vec2(0.0), vec2(0.03), v_uv) * (1.0 - smoothstep(vec2(0.97), vec2(1.0), v_uv));
+-    float pic = inPic.x * inPic.y;
++    float pic = inPic.x * inPic.y * float(showMap);
+     float hud = 1.0;
+     for (int i = 0; i < 8; ++i)
+         hud *= 1.0 - box(v_uv, masks[i], 0.01);
+@@ -607,8 +621,8 @@ void main()
+         float keep = hud;
+         for (int i = 0; i < iconCount; ++i)
+             keep *= smoothstep(0.85, 1.0, length((v_uv - icons[i].xy) / icons[i].zw));
+-        float ua = clamp(u.a * (255.0 / 128.0), 0.0, 1.0) * keep;
+-        map = map * (1.0 - ua) + u.rgb * keep * 1.15;
++        float ua = clamp(u.a * (255.0 / 128.0), 0.0, 1.0) * keep * float(showMap);
++        map = map * (1.0 - ua) + u.rgb * keep * 1.15 * float(showMap);
+     }
+     else
+         pic *= hud;
+@@ -625,33 +639,57 @@ void main()
+     o = vec4(col, a);
+ })";
+ 
+-        // A unit's icon from the picture, as a round holographic disc (uv 0..1 over the disc).
++        // A unit's marker, drawn at any resolution (no texture for its shapes): a disc in the team's colour with the
++        // unit's own map icon (the game's art from the disc, upscaled), a ring whose bright part is its shield (HP),
++        // and a gold edge when selected. Opaque inside, its rim anti-aliased: each marker is a whole layer.
+         const char *kIconFs = R"(#version 330
+ in vec2 v_uv;
+-uniform sampler2D tex;
+-uniform vec2 extent;
+-uniform vec4 src; // picture uv: centre x, y, half size x, y
+-uniform vec3 tint;
+-uniform float glow;
+-uniform sampler2D ui;
+-uniform int hasUi;
++uniform sampler2D icon;
++uniform int hasIcon;
++uniform int portrait;  // the icon fills the disc (a face); else a silhouette drawn smaller over the disc
++uniform vec3 tint;     // team colour
++uniform float hp;      // 0..1 of its shield, < 0 unknown
++uniform float glow;    // hovered
++uniform float selected;
++uniform float time;
+ out vec4 o;
+ void main()
+ {
+-    vec2 d = v_uv - 0.5;
+-    float r = length(d) * 2.0;
+-    if (r > 1.0) discard;
+-    vec2 p = clamp(src.xy + d * 2.0 * src.zw, vec2(0.0), vec2(1.0));
+-    vec3 c = texture(tex, p * extent).rgb;
+-    if (hasUi != 0)
++    vec2 p = v_uv * 2.0 - 1.0;
++    p.y = -p.y;
++    float r = length(p);
++    float aa = max(fwidth(r), 1e-4) * 1.2;
++    float outer = 1.0 - smoothstep(1.0 - aa, 1.0, r);
++    if (outer <= 0.0) discard;
++    // Inside: a dark glass in the team colour, the icon over it.
++    vec3 col = tint * 0.16 + vec3(0.02, 0.03, 0.05);
++    float inner = 1.0 - smoothstep(0.80 - aa, 0.80, r);
++    if (hasIcon != 0)
+     {
+-        vec4 u = texture(ui, p);
+-        c = c * (1.0 - clamp(u.a * (255.0 / 128.0), 0.0, 1.0)) + u.rgb;
++        float k = portrait != 0 ? 0.80 : 0.62;
++        vec2 q = p / k * 0.5 + 0.5;
++        if (all(greaterThanEqual(q, vec2(0.0))) && all(lessThanEqual(q, vec2(1.0))))
++        {
++            vec4 t = texture(icon, vec2(q.x, 1.0 - q.y));
++            float a = smoothstep(0.30, 0.70, t.a);         // crisp edges at any size (the alpha was upscaled smoothly)
++            vec3 c = t.rgb; // straight alpha
++            col = mix(col, c * (1.0 + glow * 0.25), a * inner);
++        }
+     }
+-    float ring = smoothstep(0.80, 0.90, r) * (1.0 - smoothstep(0.95, 1.0, r));
+-    float a = 1.0 - smoothstep(0.92, 1.0, r);
+-    vec3 col = c * (1.0 + glow * 0.3) + tint * ring * (1.0 + glow);
+-    o = vec4(col * a, a);
++    // The ring: dim all round, bright over the shield's share (clockwise from the top), a thin dark gap inside it.
++    float ring = smoothstep(0.84 - aa, 0.84, r);
++    float ang = atan(p.x, p.y) / 6.2831853;
++    ang = ang < 0.0 ? ang + 1.0 : ang;
++    float lit = hp < 0.0 ? 1.0 : step(ang, hp);
++    vec3 hpCol = hp < 0.0 ? tint : mix(vec3(1.0, 0.25, 0.15), tint, smoothstep(0.25, 0.5, hp));
++    vec3 ringCol = mix(tint * 0.28, hpCol * (1.25 + glow * 0.5), lit);
++    float gap = smoothstep(0.80, 0.80 + aa, r) * (1.0 - smoothstep(0.84 - aa, 0.84, r));
++    col = mix(col, vec3(0.0), gap * 0.8);
++    col = mix(col, ringCol, ring);
++    // Selected: a gold edge that breathes.
++    float edge = smoothstep(0.93 - aa, 0.93, r);
++    col = mix(col, vec3(1.0, 0.8, 0.3) * (1.2 + 0.3 * sin(time * 5.0)), edge * selected);
++    o = vec4(col * outer, outer);
+ })";
+ 
+         // A solid additive colour (stalks, lines).
+@@ -671,12 +709,24 @@ uniform sampler2D ui;
+ uniform int hasUi;
+ uniform vec4 icons[64]; // the units' icons (as on the plate): a HUD piece never carries map icons along
+ uniform int iconCount;
++uniform vec4 items[48]; // the HUD items' own rectangles (uv x0, y0, x1, y1): only their pixels are the HUD's
++uniform int itemCount;  // 0: not known (the whole area shows)
+ out vec4 o;
+ float uiAlpha(vec2 q)
+ {
+     float keep = 1.0;
+     for (int i = 0; i < iconCount; ++i)
+         keep *= smoothstep(0.85, 1.0, length((q - icons[i].xy) / icons[i].zw));
++    if (itemCount > 0)
++    {
++        float inItem = 0.0;
++        for (int i = 0; i < itemCount; ++i)
++        {
++            vec2 a = step(items[i].xy, q) * step(q, items[i].zw);
++            inItem = max(inItem, a.x * a.y);
++        }
++        keep *= inItem;
++    }
+     return clamp(texture(ui, q).a * (255.0 / 128.0), 0.0, 1.0) * keep;
+ }
+ void main()
+@@ -947,7 +997,19 @@ void main()
+             float trigger[2] = {0, 0}, grip[2] = {0, 0};
+             bool grabbing[2] = {false, false};
+         } g_tableView;
++        // The battle's chase (rear) and unit camera views while the table is the battle's place: the game's picture
++        // of the view shows on a screen standing in the table (mono), the table stays around it. The cockpit view puts
++        // the player in the cockpit instead (stereo, all around, as before).
++        bool g_battleView = false;
++        ga2_battletable::State g_lastTable; // the table's last state (its ships stay on the plate during the views)
+         bool g_tableRecentred = false; // set by a recentre: the table faces ahead again
++        bool battleViewScreen(float halfHeight, float out[3])
++        {
++            if (!g_battleView || !g_tableView.pose.valid)
++                return false;
++            ga2_battletable::toPlay(g_tableView.pose, 0.0f, 0.10f, 0.04f + halfHeight, out);
++            return true;
++        }
+         bool g_handsStill = false;     // both palms holding still (the table's recentre gesture)
+         bool g_handOnly[2] = {false, false}; // a tracked hand without its controller (finger tracking below)
+ 
+@@ -1001,9 +1063,90 @@ void main()
+             glUniform1i(glGetUniformLocation(program, "iconCount"), count);
+         }
+ 
+-        // The HUD's pieces as panels around the table (instead of the whole picture on a flat screen): standing in a
+-        // row above its far edge as they sit on the screen (left ones on the left, higher ones higher), each leaning
+-        // back a little and turned to face the player.
++        // ---- floating panels the player places (battlevr/bvr_hands.h Grabber) -------------------------------------
++        // Every floating element (each HUD piece, the message panel, the guide) can be taken with a grip (the palm or
++        // fingertip on it) and put anywhere; places are kept relative to the table in the data folder
++        // (vr_table_layout.txt) and come back next time. "Reset layout" on the right palm puts them back.
++        enum PanelId : int
++        {
++            kPanelMessage = 1, // the talk window: what the characters say in battle (subtitles), on its own panel
++            kPanelGuide = 2,
++            kPanelHud = 10, // + the piece's cell on the screen (3 x 3: x third + 3 * y third)
++        };
++        struct Panels
++        {
++            std::map<int, bvr_hands::Place> places;
++            bool loaded = false;
++            std::vector<bvr_hands::PanelHit> hits, building; // the panels as drawn last frame (grab targets)
++            uint64_t buildingFrame = 0;
++            bvr_hands::Grabber grab;
++            int heldBefore[2] = {-1, -1};
++        } g_panels;
++
++        std::filesystem::path layoutFile() { return ga2_settings::dataDir() / "vr_table_layout.txt"; }
++        void loadPlaces()
++        {
++            if (g_panels.loaded)
++                return;
++            g_panels.loaded = true;
++            std::ifstream in(layoutFile());
++            std::stringstream text;
++            text << in.rdbuf();
++            g_panels.places = bvr_hands::parsePlaces(text.str());
++        }
++        void savePlaces()
++        {
++            std::error_code ec;
++            std::filesystem::create_directories(layoutFile().parent_path(), ec);
++            std::ofstream out(layoutFile(), std::ios::trunc);
++            out << bvr_hands::formatPlaces(g_panels.places);
++        }
++
++        // A panel drawn this frame: its place (the player's, else `def`), grab target registered once per frame.
++        V3 placePanel(int id, const ga2_battletable::Pose &pose, V3 def, float &scale)
++        {
++            loadPlaces();
++            const bvr_hands::Place &p = g_panels.places[id];
++            scale = p.set ? p.scale : 1.0f;
++            return p.set ? playPoint(pose, p.u, p.v, p.h) : def;
++        }
++        void notePanel(int id, V3 c, V3 right, V3 up)
++        {
++            if (g_panels.buildingFrame != g_layoutFrame)
++            {
++                g_panels.hits.swap(g_panels.building);
++                g_panels.building.clear();
++                g_panels.buildingFrame = g_layoutFrame;
++            }
++            for (const bvr_hands::PanelHit &h : g_panels.building)
++                if (h.id == id)
++                    return; // the other eye
++            g_panels.building.push_back({id, {c.x, c.y, c.z}, {right.x, right.y, right.z}, {up.x, up.y, up.z}});
++        }
++
++        // The HUD piece's panel identity: the talk window (wide, in the lower half) is the message panel; the others
++        // by where they sit on the screen.
++        int hudPanelId(const ga2_battletable::State::HudArea &a)
++        {
++            const float cx = 0.5f * (a.x0 + a.x1), cy = 0.5f * (a.y0 + a.y1);
++            if (a.x1 - a.x0 >= 280.0f && cy >= 260.0f)
++                return kPanelMessage;
++            return kPanelHud + std::clamp(int(cx / (640.0f / 3.0f)), 0, 2) + 3 * std::clamp(int(cy / 160.0f), 0, 2);
++        }
++
++        // Each panel faces the head about the vertical, leaning back a little.
++        void panelAxes(V3 c, V3 eye, float w, float h, V3 &right, V3 &up)
++        {
++            const V3 toEye = eye - c;
++            const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
++            right = normalize(cross(V3{0, 1, 0}, flat)) * w;
++            const float lean = 0.35f; // radians back from upright
++            up = (V3{0, std::cos(lean), 0} - flat * std::sin(lean)) * h;
++        }
++
++        // The HUD's pieces as panels around the table (instead of the whole picture on a flat screen): by default in
++        // a row above its far edge as they sit on the screen (left ones on the left, higher ones higher), the talk
++        // window (the message panel) larger, centred lower over the far rim; each where the player put it.
+         void drawHudPanels(const M4 &viewProj, V3 eye, GLuint picture, float extentX, float extentY,
+                            const ga2_battletable::State &st, const ga2_battletable::Pose &pose)
+         {
+@@ -1015,26 +1158,42 @@ void main()
+             glUniform2f(glGetUniformLocation(g_tableGl.panel, "extent"), extentX, extentY);
+             bindTableUi(g_tableGl.panel);
+             setUnitIcons(g_tableGl.panel, st);
++            {
++                // The items' rectangles, 2 px larger (a count at the limit may be cut short: then the whole areas show).
++                float items[ga2_battletable::State::kMaxHudItems * 4];
++                const int count = st.hudItemCount < ga2_battletable::State::kMaxHudItems ? st.hudItemCount : 0;
++                for (int k = 0; k < count; ++k)
++                {
++                    const ga2_battletable::State::HudArea &a = st.hudItems[k];
++                    items[4 * k + 0] = (a.x0 - 2.0f) / 640.0f, items[4 * k + 1] = (a.y0 - 2.0f) / 480.0f;
++                    items[4 * k + 2] = (a.x1 + 2.0f) / 640.0f, items[4 * k + 3] = (a.y1 + 2.0f) / 480.0f;
++                }
++                if (count)
++                    glUniform4fv(glGetUniformLocation(g_tableGl.panel, "items"), count, items);
++                glUniform1i(glGetUniformLocation(g_tableGl.panel, "itemCount"), count);
++            }
+             glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+             for (int i = 0; i < st.hudCount; ++i)
+             {
+                 const ga2_battletable::State::HudArea &a = st.hud[i];
+-                const float w = (a.x1 - a.x0) * kMetresPerPixel * 0.5f, h = (a.y1 - a.y0) * kMetresPerPixel * 0.5f;
+-                const float cy = 0.5f * (a.y0 + a.y1) / 480.0f; // 0 top .. 1 bottom
+-                // Above the table's far edge, where the piece sits on the screen: across by its x, higher for
+-                // higher on the screen (the radar and the clock top left and right, the unit panel and the talk
+-                // window lower), in front of the guide's card height.
+-                const float cx = 0.5f * (a.x0 + a.x1) / 640.0f; // 0 left .. 1 right
+-                const float u = (cx - 0.5f) * 2.0f * (pose.halfWidth + 0.05f);
+-                const V3 c = playPoint(pose, u, pose.halfWidth + 0.08f, 0.08f + h + (1.0f - cy) * 0.30f);
+-                const V3 toEye = eye - c;
+-                const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
+-                const V3 right = normalize(cross(V3{0, 1, 0}, flat));
+-                const float lean = 0.35f; // radians back from upright
+-                const V3 up = V3{0, std::cos(lean), 0} - flat * std::sin(lean);
++                const int id = hudPanelId(a);
++                const float big = id == kPanelMessage ? 1.45f : 1.0f;
++                float w = (a.x1 - a.x0) * kMetresPerPixel * 0.5f * big, h = (a.y1 - a.y0) * kMetresPerPixel * 0.5f * big;
++                const float cx = 0.5f * (a.x0 + a.x1) / 640.0f, cy = 0.5f * (a.y0 + a.y1) / 480.0f; // 0..1
++                V3 def;
++                if (id == kPanelMessage)
++                    def = playPoint(pose, 0.0f, pose.halfWidth + 0.02f, 0.10f + h);
++                else
++                    def = playPoint(pose, (cx - 0.5f) * 2.0f * (pose.halfWidth + 0.05f), pose.halfWidth + 0.08f, 0.08f + h + (1.0f - cy) * 0.30f);
++                float scale = 1.0f;
++                const V3 c = placePanel(id, pose, def, scale);
++                w *= scale, h *= scale;
++                V3 right, up;
++                panelAxes(c, eye, w, h, right, up);
++                notePanel(id, c, right, up);
+                 glUniform4f(glGetUniformLocation(g_tableGl.panel, "src"), 0.5f * (a.x0 + a.x1) / 640.0f, 0.5f * (a.y0 + a.y1) / 480.0f,
+                             0.5f * (a.x1 - a.x0) / 640.0f, 0.5f * (a.y1 - a.y0) / 480.0f);
+-                rect(c, right * w, up * h, false);
++                rect(c, right, up, false);
+             }
+         }
+ 
+@@ -1042,6 +1201,7 @@ void main()
+         constexpr int kGuideWidth = 1024, kGuideHeight = 448;
+         void drawGuide(const M4 &viewProj, V3 eye, V3 centre, V3 right, V3 up, float time);
+         V3 tableHelpPoint(const ga2_battletable::Pose &pose);
++        bool guideShowing(); // with the guide's code below
+         bool drawTrackedGlove(const M4 &viewProj, V3 eye, int hand, bool owner, float strength); // with the finger tracking below
+ 
+         // ---- the ships (battlevr/bvr_ships.h: the game's own models, read from the player's disc) ----
+@@ -1114,12 +1274,66 @@ void main()
+             {
+                 float x = 0, z = 0, angle = 0;
+                 bool valid = false;
++                float bank = 0.0f;    // roll into a turn (radians), eased
++                double at = -1.0;     // when the heading last changed
+             };
+             std::map<int, Heading> headings; // by unit ID
+             double lastActive = -1.0;
+             double lastMatchLog = -100.0;
+         } g_shipGl;
+ 
++        // The units' map icons (bvr_ships::unitIcon: the game's own art from the disc, 32 x 32), upscaled 4x by the
++        // 2D filter's Anime4K networks once each, kept as mipmapped GL textures by unit ID and expression.
++        struct IconArt
++        {
++            GLuint texture = 0;
++            bool portrait = false; // a face (fills the disc), else a silhouette
++        };
++        std::map<int, IconArt> g_iconArt;
++        std::map<int, int> g_maxHp; // the highest shield seen per unit ID this battle (its full shield)
++
++        const IconArt *iconArt(int unitId, int expression, int &budget)
++        {
++            const int key = unitId * 64 + expression;
++            if (const auto it = g_iconArt.find(key); it != g_iconArt.end())
++                return it->second.texture ? &it->second : nullptr;
++            const std::shared_ptr<const bvr_assets::Texture> t = bvr_ships::unitIcon(unitId, expression);
++            if (!t || t->width <= 0 || t->height <= 0 || budget <= 0)
++                return nullptr;
++            --budget;
++            IconArt art;
++            // A face is opaque to its round edge; a silhouette leaves the corners and much of its square clear.
++            size_t opaque = 0;
++            for (uint32_t c : t->rgba)
++                opaque += (c >> 24) >= 128u ? 1u : 0u;
++            art.portrait = opaque * 100 >= t->rgba.size() * 60;
++            std::vector<uint32_t> big;
++            int w = 0, h = 0;
++            if (!ga2_present::upscaleArt(t->rgba.data(), t->width, t->height, 4, big, w, h))
++                big = t->rgba, w = t->width, h = t->height;
++            glActiveTexture(GL_TEXTURE0);
++            glGenTextures(1, &art.texture);
++            glBindTexture(GL_TEXTURE_2D, art.texture);
++            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, big.data());
++            glGenerateMipmap(GL_TEXTURE_2D);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++            std::fprintf(stderr, "[bvr] unit %d icon %d: %dx%d -> %dx%d (%s)\n", unitId, expression, t->width, t->height, w, h,
++                         art.portrait ? "face" : "silhouette");
++            return &(g_iconArt[key] = art);
++        }
++
++        void dropIconArt()
++        {
++            for (auto &[key, art] : g_iconArt)
++                if (art.texture)
++                    glDeleteTextures(1, &art.texture);
++            g_iconArt.clear();
++            g_maxHp.clear();
++        }
++
+         GlShip &glShip(const std::shared_ptr<const bvr_ships::Mesh> &mesh)
+         {
+             auto it = g_shipGl.ships.find(mesh.get());
+@@ -1171,9 +1385,27 @@ void main()
+             return g;
+         }
+ 
++        // A ship's length on the table: by its model's length (the mothership and cruisers larger than the angels),
++        // an angel (38 model units) about 1.3 cm with the whole stage on the plate, growing as the map is zoomed in
++        // (BattleGroupVR); never under 8 mm or over 7 cm.
++        float shipSize(const ga2_battletable::State &st, const ga2_battletable::Pose &pose, float modelLength)
++        {
++            float zoom = 1.0f;
++            if (const float extent = bvr_ships::stageExtent(); extent > 0.0f && st.s > 1e-6f)
++            {
++                const float fit = extent / (2.0f * pose.halfWidth); // map units per metre with the stage across the plate
++                zoom = std::clamp(std::sqrt(fit / st.s), 0.7f, 3.5f);
++            }
++            static const float scale = [] {
++                const char *v = std::getenv("GA2_BVR_SHIP_SCALE");
++                return v && *v ? std::clamp(float(std::atof(v)), 0.1f, 10.0f) : 1.0f;
++            }();
++            // Larger ships stay larger, compressed (length^0.6) so a cruiser does not swamp the plate.
++            return std::clamp(0.013f * std::pow(std::max(modelLength, 1.0f) / 38.0f, 0.6f) * zoom * scale, 0.008f, 0.07f);
++        }
++
+         // The ships of the units on the plate, each the game's own model, standing over its unit and turned the way
+-        // it moves (its stage start heading until it does). Shown at a readable size, not the map's scale: an angel
+-        // about 4.5 cm long, bigger ships larger by the square root of their length.
++        // it moves (its stage start heading until it does).
+         void drawShips(const M4 &viewProj, V3 eye, const ga2_battletable::State &st, const ga2_battletable::Pose &pose,
+                        float time)
+         {
+@@ -1194,6 +1426,7 @@ void main()
+                 {
+                     bvr_ships::reset();
+                     g_shipGl.headings.clear();
++                    dropIconArt();
+                 }
+             }
+             g_shipGl.lastActive = time;
+@@ -1255,19 +1488,29 @@ void main()
+                             d += 6.2831853f;
+                         h.angle += d * 0.15f;
+                         h.x = unit.x, h.z = unit.z;
++                        // Bank into the turn (up to 25 degrees), as fast as the heading swings.
++                        const float bankTarget = std::clamp(-d * 0.9f, -0.44f, 0.44f);
++                        h.bank += (bankTarget - h.bank) * 0.2f;
+                     }
++                    else
++                        h.bank *= 0.95f;
+                 }
+                 // The heading's direction on the table (the map is turned and scaled on it).
+                 float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+                 ga2_battletable::mapToTable(st, unit.x, unit.z, u0, v0);
+                 ga2_battletable::mapToTable(st, unit.x + std::sin(h.angle), unit.z + std::cos(h.angle), u1, v1);
+-                const float lift = unit.hovered ? 0.03f : 0.024f;
++                // A slow bob (2 mm, each ship its own phase) over its stand height.
++                const float lift = (unit.hovered ? 0.03f : 0.024f) + 0.002f * std::sin(time * 1.3f + float(unit.id) * 1.7f);
+                 const V3 base = playPoint(pose, u0, v0, lift);
+                 V3 f = playPoint(pose, u1, v1, lift) - base;
+-                const V3 up = normalize(playPoint(pose, u0, v0, lift + 0.01f) - base);
+-                f = normalize(f - up * dot(f, up));
++                const V3 upTable = normalize(playPoint(pose, u0, v0, lift + 0.01f) - base);
++                f = normalize(f - upTable * dot(f, upTable));
++                // Banked: up and right turned about the heading.
++                const V3 rFlat = cross(f, upTable);
++                const float cb = std::cos(h.bank), sb = std::sin(h.bank);
++                const V3 up = upTable * cb + rFlat * sb;
+                 const V3 r = cross(f, up);
+-                const float size = 0.045f * std::clamp(std::sqrt(ship.length / 38.0f), 0.8f, 2.4f);
++                const float size = shipSize(st, pose, ship.length);
+                 const float k = size / ship.length;
+                 // Game model axes: X right, Y down, Z forward -> r, -up, f; centred on its bounds.
+                 M4 model;
+@@ -1295,20 +1538,222 @@ void main()
+             glEnable(GL_BLEND);
+         }
+ 
+-        void drawTable(const M4 &viewProj, V3 eye, GLuint picture, float extentX, float extentY, bool wide, float time)
++        // ---- palm menus (battlevr/bvr_hands.h; after BattleGroupVR's hand menus) -----------------------------------
++        // Turn a palm toward the face and its menu shows over it; the other hand's fingertip pokes its keys.
++        //   left palm, "Squadron": the angels (their own icons, shield bars, the selected one lit): a poke selects one
++        //     as a trigger press on its disc would; "All angels" (Square: orders to all), "Pause" (Start);
++        //   right palm, "Command": "Stay" (Circle on the selected angel), "H-Weapon" (Triangle), "Cancel" (Cross),
++        //     "Pilot view" (L3), "Camera" (R3), "Menu" (Select), "Recentre", "Guide", "Reset layout".
++        // Every key presses what the pad would: the game decides what it does (its tutorial gates included).
++        enum PalmKey : int
++        {
++            kKeyAll = 1, kKeyPause, kKeyStay, kKeyHWeapon, kKeyCancel, kKeyPilot, kKeyCamera, kKeyMenu, kKeyRecentre,
++            kKeyGuide, kKeyResetLayout,
++            kKeyRoster = 100, // + the angel's section ID
++        };
++        constexpr int kPalmTexW = 640, kPalmTexH = 480;
++        constexpr float kPalmW = 0.17f, kPalmH = kPalmW * float(kPalmTexH) / float(kPalmTexW); // metres
++        struct PalmCell
++        {
++            int id = 0;
++            float x0 = 0, y0 = 0, x1 = 0, y1 = 0; // texture pixels
++            const char *label = "";
++            bool enabled = true, lit = false;
++            int unitId = -1;
++            float hp = -1.0f;
++        };
++        struct PalmUi
++        {
++            bvr_hands::Palm palm[2];
++            bvr_hands::Keys keys[2];
++            std::vector<PalmCell> cells[2];
++            RenderTexture2D target[2]{};
++            bool open[2] = {false, false};
++            uint16_t buttons = 0;
++            double buttonsUntil = 0.0;
++            bool recentre = false;
++            int pressedKey[2] = {0, 0};
++            double pressedAt[2] = {-10.0, -10.0};
++        } g_palm;
++
++        std::vector<bvr_hands::Key> palmKeys(int side)
++        {
++            std::vector<bvr_hands::Key> keys;
++            for (const PalmCell &c : g_palm.cells[side])
++            {
++                bvr_hands::Key k;
++                k.id = c.id;
++                k.x0 = (c.x0 / kPalmTexW - 0.5f) * kPalmW, k.x1 = (c.x1 / kPalmTexW - 0.5f) * kPalmW;
++                k.y0 = (0.5f - c.y1 / kPalmTexH) * kPalmH, k.y1 = (0.5f - c.y0 / kPalmTexH) * kPalmH;
++                k.enabled = c.enabled;
++                keys.push_back(k);
++            }
++            return keys;
++        }
++
++        // The menus' keys for the battle as it is now.
++        void layoutPalms(const ga2_battletable::State &st, bool japanese)
++        {
++            std::vector<PalmCell> &left = g_palm.cells[0], &right = g_palm.cells[1];
++            left.clear();
++            right.clear();
++            int angels = 0, selectedId = -1;
++            for (int n = 0; n < st.unitCount; ++n)
++            {
++                const ga2_battletable::Unit &u = st.units[n];
++                if (u.selected)
++                    selectedId = u.id;
++                if (u.enemy || u.id <= 0 || angels >= 6)
++                    continue;
++                PalmCell c;
++                c.id = kKeyRoster + u.id;
++                c.x0 = 20.0f + float(angels % 3) * 205.0f, c.x1 = c.x0 + 190.0f;
++                c.y0 = 74.0f + float(angels / 3) * 160.0f, c.y1 = c.y0 + 148.0f;
++                c.unitId = u.id;
++                c.lit = u.selected;
++                const int maxHp = g_maxHp.count(u.id) ? g_maxHp[u.id] : 0;
++                c.hp = maxHp > 0 ? std::clamp(float(u.hp) / float(maxHp), 0.0f, 1.0f) : -1.0f;
++                left.push_back(c);
++                ++angels;
++            }
++            auto key = [](std::vector<PalmCell> &v, int id, float x0, float y0, float x1, float y1, const char *label, bool enabled) {
++                PalmCell c;
++                c.id = id, c.x0 = x0, c.y0 = y0, c.x1 = x1, c.y1 = y1, c.label = label, c.enabled = enabled;
++                v.push_back(c);
++            };
++            key(left, kKeyAll, 20, 404, 312, 466, japanese ? "全機" : "All angels", true);
++            key(left, kKeyPause, 328, 404, 620, 466, japanese ? "ポーズ" : "Pause", true);
++            const char *labels[9] = {japanese ? "待機" : "Stay",       japanese ? "必殺技" : "H-Weapon", japanese ? "キャンセル" : "Cancel",
++                                     g_battleView ? (japanese ? "マップへ" : "Back to table") : japanese ? "追尾視点" : "Pilot view", japanese ? "カメラ" : "Camera",  japanese ? "メニュー" : "Menu",
++                                     japanese ? "中央へ" : "Recentre",   japanese ? "ガイド" : "Guide",    japanese ? "配置リセット" : "Reset layout"};
++            const int ids[9] = {kKeyStay, kKeyHWeapon, kKeyCancel, kKeyPilot, kKeyCamera, kKeyMenu, kKeyRecentre, kKeyGuide, kKeyResetLayout};
++            for (int i = 0; i < 9; ++i)
++            {
++                const float x0 = 20.0f + float(i % 3) * 205.0f, y0 = 80.0f + float(i / 3) * 128.0f;
++                key(right, ids[i], x0, y0, x0 + 190.0f, y0 + 112.0f, labels[i], ids[i] != kKeyStay || selectedId > 0);
++            }
++            if (selectedId > 0)
++                for (PalmCell &c : right)
++                    c.unitId = c.id == kKeyStay ? selectedId : -1;
++        }
++
++        // Each open menu drawn into its texture (raylib, before the eyes are drawn).
++        void renderPalms(bool japanese)
++        {
++            int budget = 2;
++            for (int side = 0; side < 2; ++side)
++            {
++                if (!g_palm.open[side])
++                    continue;
++                RenderTexture2D &t = g_palm.target[side];
++                if (!t.id)
++                {
++                    t = LoadRenderTexture(kPalmTexW, kPalmTexH);
++                    SetTextureFilter(t.texture, TEXTURE_FILTER_BILINEAR);
++                }
++                // Icons first (an upscale may run; it keeps the framebuffer).
++                std::map<int, const IconArt *> icons;
++                for (const PalmCell &c : g_palm.cells[side])
++                    if (c.unitId >= 0 && c.id >= kKeyRoster)
++                        icons[c.unitId] = iconArt(c.unitId, c.hp >= 0.0f && c.hp < 0.34f ? 4 : 0, budget);
++                rlDrawRenderBatchActive();
++                BeginTextureMode(t);
++                rlEnableColorBlend();
++                ClearBackground(BLANK);
++                rlSetBlendFactorsSeparate(RL_SRC_ALPHA, RL_ONE_MINUS_SRC_ALPHA, RL_ONE, RL_ONE_MINUS_SRC_ALPHA, RL_FUNC_ADD, RL_FUNC_ADD);
++                BeginBlendMode(BLEND_CUSTOM_SEPARATE);
++                const Color cyan{120, 200, 255, 255}, white{235, 242, 255, 255}, dim{110, 130, 160, 255}, gold{255, 205, 90, 255};
++                const Rectangle panel{6, 6, float(kPalmTexW - 12), float(kPalmTexH - 12)};
++                DrawRectangleRounded(panel, 0.06f, 10, Color{6, 16, 36, 215});
++                DrawRectangleRoundedLinesEx(panel, 0.06f, 10, 3.0f, Color{90, 180, 255, 255});
++                ga2_ui_font::draw(side == 0 ? (japanese ? "部隊" : "SQUADRON") : (japanese ? "指揮" : "COMMAND"), 26.0f, 18.0f, 38.0f, cyan);
++                const int hovered = g_palm.keys[side].hovered(), held = g_palm.keys[side].held();
++                const bool flash = GetTime() - g_palm.pressedAt[side] < 0.25;
++                for (const PalmCell &c : g_palm.cells[side])
++                {
++                    const bool isHover = c.id == hovered, isHeld = c.id == held || (flash && c.id == g_palm.pressedKey[side]);
++                    const float sink = isHeld ? 4.0f : 0.0f;
++                    const Rectangle r{c.x0 + sink, c.y0 + sink, c.x1 - c.x0 - 2 * sink, c.y1 - c.y0 - 2 * sink};
++                    const Color fill = !c.enabled ? Color{20, 26, 36, 200} : isHeld ? Color{40, 110, 190, 240} : isHover ? Color{24, 70, 130, 235} : Color{14, 40, 78, 225};
++                    DrawRectangleRounded(r, 0.18f, 8, fill);
++                    DrawRectangleRoundedLinesEx(r, 0.18f, 8, c.lit ? 4.0f : 2.0f, c.lit ? gold : c.enabled ? cyan : dim);
++                    if (c.id >= kKeyRoster)
++                    {
++                        const IconArt *art = icons.count(c.unitId) ? icons[c.unitId] : nullptr;
++                        const float s = 104.0f, x = r.x + (r.width - s) * 0.5f, y = r.y + 8.0f;
++                        if (art)
++                        {
++                            Texture2D tex{art->texture, 128, 128, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                            DrawTexturePro(tex, Rectangle{0, 0, 128, 128}, Rectangle{x, y, s, s}, Vector2{0, 0}, 0.0f, WHITE);
++                        }
++                        // The shield bar.
++                        const Rectangle bar{r.x + 14, r.y + r.height - 26, r.width - 28, 12};
++                        DrawRectangleRec(bar, Color{30, 40, 55, 255});
++                        if (c.hp >= 0.0f)
++                        {
++                            const Color hc = c.hp < 0.25f ? Color{255, 80, 60, 255} : c.hp < 0.5f ? Color{255, 200, 70, 255} : Color{90, 220, 255, 255};
++                            DrawRectangleRec(Rectangle{bar.x, bar.y, bar.width * c.hp, bar.height}, hc);
++                        }
++                    }
++                    else
++                    {
++                        const float size = 34.0f, w = ga2_ui_font::measure(c.label, size);
++                        ga2_ui_font::draw(c.label, r.x + (r.width - w) * 0.5f, r.y + (r.height - size) * 0.5f - 2.0f, size, c.enabled ? white : dim);
++                    }
++                }
++                if (side == 0 && g_palm.cells[0].size() <= 2)
++                    ga2_ui_font::draw(japanese ? "出撃中のエンジェルなし" : "No angels on the map", 26.0f, 200.0f, 32.0f, dim);
++                EndBlendMode();
++                EndTextureMode();
++                rlDrawRenderBatchActive();
++            }
++        }
++
++        void drawPalms(const M4 &viewProj)
++        {
++            glEnable(GL_BLEND);
++            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++            glEnable(GL_DEPTH_TEST);
++            glDepthMask(GL_FALSE);
++            for (int side = 0; side < 2; ++side)
++            {
++                if (!g_palm.open[side] || !g_palm.target[side].id)
++                    continue;
++                const bvr_hands::Frame &f = g_palm.palm[side].frame();
++                glUseProgram(g_gl.menu);
++                setMatrix(g_gl.menu, "mvp", viewProj);
++                glActiveTexture(GL_TEXTURE0);
++                glBindTexture(GL_TEXTURE_2D, g_palm.target[side].texture.id);
++                glUniform1i(glGetUniformLocation(g_gl.menu, "tex"), 0);
++                const V3 c{f.centre.x, f.centre.y, f.centre.z}, r{f.right.x, f.right.y, f.right.z}, u{f.up.x, f.up.y, f.up.z};
++                rect(c, r * (kPalmW * 0.5f), u * (kPalmH * 0.5f), true);
++            }
++        }
++
++        // mapShown false: the battle's other views (g_battleView): the plate without the map (the picture is the view
++        // now, on its screen), the ships as last seen, no markers or HUD panels.
++        void drawTable(const M4 &viewProj, V3 eye, GLuint picture, float extentX, float extentY, bool wide, float time,
++                       bool mapShown = true)
+         {
+             initTableGl();
+             const TableView &tv = g_tableView;
+-            const ga2_battletable::State &st = tv.state;
++            const ga2_battletable::State &st = mapShown ? tv.state : g_lastTable;
+             const ga2_battletable::Pose &pose = tv.pose;
+ 
+             glBindTexture(GL_TEXTURE_2D, picture);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+ 
+-            // The table: a grid of vertices over it, each with its map point's place in the picture.
++            // The table: a grid of vertices over it, each with its map point's place in the picture (built once per
++            // headset frame, both eyes draw the same).
+             constexpr int kU = 48, kV = 32;
+-            std::vector<float> mesh;
++            static std::vector<float> mesh;
++            static uint64_t meshFrame = ~0ull;
++            static bool meshMap = false;
++            const bool rebuild = meshFrame != g_layoutFrame || meshMap != mapShown || !g_layoutFrame;
++            meshFrame = g_layoutFrame, meshMap = mapShown;
++            if (rebuild)
++                mesh.clear();
+             mesh.reserve(size_t(kU) * kV * 6 * 7);
+             auto vertex = [&](int i, int j) {
+                 const float a = -1.0f + 2.0f * float(i) / kU, b = -1.0f + 2.0f * float(j) / kV;
+@@ -1320,7 +1765,7 @@ void main()
+                     pu = pv = -1.0f;
+                 mesh.insert(mesh.end(), {p.x, p.y, p.z, pu, pv, a, b});
+             };
+-            for (int j = 0; j < kV; ++j)
++            for (int j = 0; j < kV && rebuild; ++j)
+                 for (int i = 0; i < kU; ++i)
+                 {
+                     vertex(i, j), vertex(i + 1, j), vertex(i + 1, j + 1);
+@@ -1336,19 +1781,25 @@ void main()
+             glUniform2f(glGetUniformLocation(g_tableGl.table, "extent"), extentX, extentY);
+             bindTableUi(g_tableGl.table);
+             glUniform1f(glGetUniformLocation(g_tableGl.table, "time"), time);
++            glUniform1i(glGetUniformLocation(g_tableGl.table, "showMap"), mapShown ? 1 : 0);
+             float masks[32];
+             tableMasks(st, masks);
+             glUniform4fv(glGetUniformLocation(g_tableGl.table, "masks"), 8, masks);
+             setUnitIcons(g_tableGl.table, st); // the game's flat unit icons are left off the plate
+             drawArrays(g_tableGl.vao7, g_tableGl.vbo7, mesh, 7);
+-            drawHudPanels(viewProj, eye, picture, extentX, extentY, st, pose);
++            if (mapShown)
++                drawHudPanels(viewProj, eye, picture, extentX, extentY, st, pose);
+ 
+             drawShips(viewProj, eye, st, pose, time);
+             glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+ 
+-            // The units: a ring on the table, a stalk and the icon as a disc over it (facing the player). The discs
+-            // never cut into each other: crowded ones are stacked (each sits clear above any neighbour it would touch),
+-            // and they are drawn with depth, far to near.
++            if (mapShown)
++            {
++            // The units: a ring on the table with a chevron for the heading, a stalk, and the unit's marker disc over
++            // its ship (facing the player): the game's own icon for the unit with its shield as a ring. Each marker is
++            // a solid layer: drawn far to near, stalk then disc, the disc writing depth, so a nearer one covers a
++            // farther one whole and nothing blends through. Crowded discs are lifted a little apart as seen from
++            // the head.
+             struct Marker
+             {
+                 int n;
+@@ -1366,15 +1817,14 @@ void main()
+                     continue;
+                 Marker &m = markers[markerCount++];
+                 m.n = n, m.u = u, m.v = v;
+-                m.size = unit.hovered ? 0.030f : 0.022f;
+-                m.lift = unit.hovered ? 0.085f : 0.07f; // over the ship
+-                m.tint = unit.selected ? V3{1.0f, 0.78f, 0.25f} : unit.enemy ? V3{1.0f, 0.35f, 0.2f} : V3{0.3f, 0.7f, 1.0f};
++                m.size = unit.hovered ? 0.019f : 0.014f;
++                m.lift = 0.045f; // over the ship
++                m.tint = unit.enemy ? V3{1.0f, 0.32f, 0.22f} : unit.id == 0 ? V3{0.35f, 0.75f, 1.0f} : V3{1.0f, 0.62f, 0.18f};
+                 m.dist = length(playPoint(pose, u, v, m.lift) - eye);
++                int &maxHp = g_maxHp[unit.id];
++                maxHp = std::max(maxHp, unit.hp);
+             }
+             const V3 eyeIn = eye;
+-            // Layout as the player sees it: nearest first keep their height; a disc whose circle would overlap one
+-            // already placed (their angular radii as seen from the eye) rises until it is clear, so every disc is its
+-            // own layer. Laid out once per frame (the first eye) and reused for the other, so both eyes agree.
+             std::sort(markers, markers + markerCount, [](const Marker &a, const Marker &b) { return a.dist < b.dist; });
+             {
+                 static uint64_t layoutFrame = ~0ull;
+@@ -1387,7 +1837,9 @@ void main()
+                     auto centre = [&](const Marker &m) { return playPoint(pose, m.u, m.v, m.lift) + V3{0, m.size, 0}; };
+                     for (int i = 0; i < markerCount; ++i)
+                     {
+-                        for (int pass = 0; pass < 40; ++pass)
++                        // Nearest first keep their height; one that would hide much of a nearer one rises (at most 9 cm):
++                        // a partly covered disc is fine (it is a layer under the other), a buried one is not.
++                        for (int pass = 0; pass < 24; ++pass)
+                         {
+                             const V3 ci = centre(markers[i]);
+                             const float di = length(ci - eye);
+@@ -1398,13 +1850,12 @@ void main()
+                                 const V3 cj = centre(markers[j]);
+                                 const float dj = length(cj - eye);
+                                 const float cosA = std::clamp(dot(ni, (cj - eye) * (1.0f / dj)), -1.0f, 1.0f);
+-                                // A margin for the other eye (laid out from one) and the hovered discs' growth.
+-                                const float need = (markers[i].size / di + markers[j].size / dj) * 1.3f;
++                                const float need = (markers[i].size / di + markers[j].size / dj) * 0.75f;
+                                 worst = std::max(worst, need - std::acos(cosA));
+                             }
+-                            if (worst <= 0.0f || markers[i].lift > 0.45f)
++                            if (worst <= 0.0f || markers[i].lift > 0.135f)
+                                 break;
+-                            markers[i].lift += std::max(0.004f, worst * di * 0.6f);
++                            markers[i].lift += std::max(0.003f, worst * di * 0.6f);
+                         }
+                         layoutLift[markers[i].n] = markers[i].lift;
+                     }
+@@ -1420,44 +1871,77 @@ void main()
+                     ids[i] = st.units[markers[i].n].id, heights[i] = markers[i].lift + markers[i].size;
+                 ga2_battletable::publishDiscHeights(ids, heights, markerCount);
+             }
+-            glBlendFunc(GL_ONE, GL_ONE);
+-            for (int i = 0; i < markerCount; ++i)
++            // The icons this frame needs (a new one is upscaled at most twice a frame; until then the disc is plain).
++            int iconBudget = 2;
++            const GLint locIconSrc = glGetUniformLocation(g_tableGl.icon, "icon");
++            const GLint locHasIcon = glGetUniformLocation(g_tableGl.icon, "hasIcon"), locPortrait = glGetUniformLocation(g_tableGl.icon, "portrait");
++            const GLint locTint = glGetUniformLocation(g_tableGl.icon, "tint"), locHp = glGetUniformLocation(g_tableGl.icon, "hp");
++            const GLint locGlow = glGetUniformLocation(g_tableGl.icon, "glow"), locSel = glGetUniformLocation(g_tableGl.icon, "selected");
++            const GLint locIconMvp = glGetUniformLocation(g_tableGl.icon, "mvp"), locIconTime = glGetUniformLocation(g_tableGl.icon, "time");
++            glEnable(GL_DEPTH_TEST);
++            glDepthFunc(GL_LEQUAL);
++            for (int i = markerCount - 1; i >= 0; --i)
+             {
+                 Marker &m = markers[i];
+                 const ga2_battletable::Unit &unit = st.units[m.n];
+                 m.head = playPoint(pose, m.u, m.v, m.lift);
+                 const V3 foot = playPoint(pose, m.u, m.v, 0.002f);
+-                // Team colours (BattleGroupVR): blue friends, red-orange enemies; the selected angel gold.
+-                drawLine(viewProj, eye, foot, m.head, unit.selected ? 0.005f : 0.003f, m.tint, unit.hovered || unit.selected ? 0.9f : 0.45f);
+-                drawTableRing(viewProj, pose, m.u, m.v, unit.hovered ? 0.028f : 0.018f, unit.hovered ? 1.0f : 0.5f, time);
++                // Stalk, ground ring and heading chevron: light, depth-tested, no depth written.
++                glDepthMask(GL_FALSE);
++                glBlendFunc(GL_ONE, GL_ONE);
++                drawLine(viewProj, eye, foot, m.head, unit.selected ? 0.0035f : 0.002f, m.tint, unit.hovered || unit.selected ? 0.9f : 0.45f);
++                drawTableRing(viewProj, pose, m.u, m.v, unit.hovered ? 0.022f : 0.015f, unit.hovered ? 1.0f : 0.5f, time);
+                 if (unit.selected) // a second, wider ring that marks the selection
+-                    drawTableRing(viewProj, pose, m.u, m.v, 0.036f + 0.003f * std::sin(time * 4.0f), 0.8f, time);
+-            }
+-            // The icon discs, billboards turned toward the eye about the vertical: far to near, with depth.
+-            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+-            glUseProgram(g_tableGl.icon);
+-            setMatrix(g_tableGl.icon, "mvp", viewProj);
+-            glUniform2f(glGetUniformLocation(g_tableGl.icon, "extent"), extentX, extentY);
+-            bindTableUi(g_tableGl.icon);
+-            // Depth-tested against the ships, but not written: the discs are layered far to near, each whole over the
+-            // ones behind it, never cutting through one another.
+-            glEnable(GL_DEPTH_TEST);
+-            glDepthMask(GL_FALSE);
+-            const GLint locSrc = glGetUniformLocation(g_tableGl.icon, "src"), locTint = glGetUniformLocation(g_tableGl.icon, "tint");
+-            const GLint locGlow = glGetUniformLocation(g_tableGl.icon, "glow");
+-            for (int i = markerCount - 1; i >= 0; --i)
+-            {
+-                const Marker &m = markers[i];
+-                const ga2_battletable::Unit &unit = st.units[m.n];
+-                const float iconHalf = 24.0f;
+-                glUniform4f(locSrc, unit.sx / 640.0f, unit.sy / 480.0f, iconHalf / 640.0f, iconHalf / 480.0f);
++                    drawTableRing(viewProj, pose, m.u, m.v, 0.03f + 0.003f * std::sin(time * 4.0f), 0.8f, time);
++                if (const auto h = g_shipGl.headings.find(unit.id); h != g_shipGl.headings.end() && h->second.valid)
++                {
++                    float u1 = 0, v1 = 0;
++                    ga2_battletable::mapToTable(st, unit.x + std::sin(h->second.angle), unit.z + std::cos(h->second.angle), u1, v1);
++                    const float du = u1 - m.u, dv = v1 - m.v, dl = std::sqrt(du * du + dv * dv);
++                    if (dl > 1e-6f)
++                    {
++                        const float fu = du / dl, fv = dv / dl, r = unit.hovered ? 0.022f : 0.015f;
++                        const V3 tip = playPoint(pose, m.u + fu * (r + 0.009f), m.v + fv * (r + 0.009f), 0.004f);
++                        const V3 w0 = playPoint(pose, m.u + fu * (r + 0.002f) - fv * 0.006f, m.v + fv * (r + 0.002f) + fu * 0.006f, 0.004f);
++                        const V3 w1 = playPoint(pose, m.u + fu * (r + 0.002f) + fv * 0.006f, m.v + fv * (r + 0.002f) - fu * 0.006f, 0.004f);
++                        drawLine(viewProj, eye, w0, tip, 0.0022f, m.tint, 0.9f);
++                        drawLine(viewProj, eye, w1, tip, 0.0022f, m.tint, 0.9f);
++                    }
++                }
++                // The disc: solid, depth written.
++                const int maxHp = g_maxHp[unit.id];
++                const float hp = maxHp > 0 ? std::clamp(float(unit.hp) / float(maxHp), 0.0f, 1.0f) : -1.0f;
++                // Angels look hurt below a third of their shield (the icon list's "damage" face, 04).
++                const int expression = !unit.enemy && unit.id != 0 && hp >= 0.0f && hp < 0.34f ? 4 : 0;
++                const IconArt *art = iconArt(unit.id, expression, iconBudget);
++                if (!art && expression)
++                    art = iconArt(unit.id, 0, iconBudget);
++                // (The upscale above may have changed any state: all of it is set here.)
++                glUseProgram(g_tableGl.icon);
++                glUniformMatrix4fv(locIconMvp, 1, GL_FALSE, viewProj.m);
++                glUniform1f(locIconTime, time);
++                glDepthMask(GL_TRUE);
++                glDepthFunc(GL_LEQUAL);
++                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++                glDisable(GL_CULL_FACE);
++                glDisable(GL_SCISSOR_TEST);
++                glActiveTexture(GL_TEXTURE0);
++                glBindTexture(GL_TEXTURE_2D, art ? art->texture : 0);
++                glUniform1i(locIconSrc, 0);
++                glUniform1i(locHasIcon, art ? 1 : 0);
++                glUniform1i(locPortrait, art && art->portrait ? 1 : 0);
+                 glUniform3f(locTint, m.tint.x, m.tint.y, m.tint.z);
++                glUniform1f(locHp, hp);
+                 glUniform1f(locGlow, unit.hovered ? 1.0f : 0.0f);
++                glUniform1f(locSel, unit.selected ? 1.0f : 0.0f);
++                glEnable(GL_BLEND);
++                glEnable(GL_DEPTH_TEST);
+                 const V3 toEye = eye - m.head;
+                 const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
+                 const V3 right = normalize(cross(V3{0, 1, 0}, flat));
+                 rect(m.head + V3{0, m.size, 0}, right * m.size, V3{0, m.size, 0}, false);
+             }
++            glDepthFunc(GL_LESS);
+             glDepthMask(GL_FALSE);
+             glBlendFunc(GL_ONE, GL_ONE);
+ 
+@@ -1519,6 +2003,8 @@ void main()
+                 }
+             }
+ 
++            }
++
+             // The "?" that replays the battle part of the guide.
+             {
+                 const V3 q = tableHelpPoint(pose);
+@@ -1544,16 +2030,21 @@ void main()
+                 drawLine(viewProj, eye, q - upv * 1.05f, q - upv * 1.3f, 0.003f, c, 1.0f);
+             }
+             {
+-                const V3 c = playPoint(pose, 0.0f, pose.halfWidth + 0.12f, 0.68f); // above the HUD panels' row
++                float scale = 1.0f;
++                const V3 c = placePanel(kPanelGuide, pose, playPoint(pose, 0.0f, pose.halfWidth + 0.12f, 0.68f), scale); // above the HUD panels' row
+                 const V3 toEye = eye - c;
+                 const V3 flat = normalize(V3{toEye.x, 0.0f, toEye.z});
+                 const V3 right = normalize(cross(V3{0, 1, 0}, flat));
+-                const float h = 0.16f, w = h * float(kGuideWidth) / float(kGuideHeight);
++                const float h = 0.16f * scale, w = h * float(kGuideWidth) / float(kGuideHeight);
++                if (guideShowing())
++                    notePanel(kPanelGuide, c, right * w, V3{0, h, 0});
+                 drawGuide(viewProj, eye, c, right * w, V3{0, h, 0}, time);
+                 glEnable(GL_BLEND);
+                 glBlendFunc(GL_ONE, GL_ONE);
+                 glDepthMask(GL_FALSE);
+             }
++            drawPalms(viewProj);
++            glBlendFunc(GL_ONE, GL_ONE);
+             // The gloves.
+             // Orange marks the hand that owns the selection (BattleGroupVR); a grabbing hand glows brighter.
+             for (int h = 0; h < 2; ++h)
+@@ -1570,6 +2061,7 @@ void main()
+         // ---- the VR guide (ga2_vrguide.h) -------------------------------------------------------
+         ga2_vrguide::Guide g_guide;
+         ga2_vrguide::Card g_guideCard;
++        bool guideShowing() { return g_guideCard.visible; }
+         struct GuideFrame
+         {
+             ga2_vr_input::Inputs in; // this frame's sampled controls
+@@ -1806,11 +2298,11 @@ void main()
+         // True when the stage's sky was drawn (the generic skybox is then left out).
+         bool drawStageSky(const M4 &rotationView, const M4 &proj)
+         {
+-            if (!g_tableView.active)
++            if (!g_tableView.active && !g_battleView)
+                 return false;
+             const std::shared_ptr<const bvr_ships::Mesh> mesh = bvr_ships::stageSky();
+             V3 rx, fz, up;
+-            if (!mesh || !mapAxes(g_tableView.state, g_tableView.pose, rx, fz, up))
++            if (!mesh || !mapAxes(g_tableView.active ? g_tableView.state : g_lastTable, g_tableView.pose, rx, fz, up))
+                 return false;
+             GlShip &sky = glShip(mesh);
+             if (!g_skyMeshProgram)
+@@ -1893,6 +2385,14 @@ void main()
+                 glBindVertexArray(0);
+                 return;
+             }
++            if (g_battleView && g_tableView.pose.valid)
++            {
++                glEnable(GL_DEPTH_TEST);
++                drawTable(viewProj, eye, picture, extentX, extentY, wide, time, false);
++                glEnable(GL_DEPTH_TEST);
++                glDepthMask(GL_TRUE);
++                glDisable(GL_BLEND);
++            }
+             const ScreenGeometry s = screenGeometry(wide);
+             // Screen.
+             glUseProgram(g_gl.quad);
+@@ -2434,6 +2934,55 @@ void main()
+             return true;
+         }
+ 
++        // XR_FB_display_refresh_rate: the rates the headset offers; ask for GA2_VR_REFRESH (Hz) if set, else 90 when
++        // offered (the battle table's target), else leave the runtime's choice.
++        void requestRefreshRate()
++        {
++            if (!extensionEnabled(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
++            {
++                std::fprintf(stderr, "[vr] refresh rate: the runtime's (no XR_FB_display_refresh_rate)\n");
++                return;
++            }
++            PFN_xrEnumerateDisplayRefreshRatesFB enumerate = nullptr;
++            PFN_xrRequestDisplayRefreshRateFB request = nullptr;
++            PFN_xrGetDisplayRefreshRateFB current = nullptr;
++            if (!load(g_xr.instance, "xrEnumerateDisplayRefreshRatesFB", enumerate) || !load(g_xr.instance, "xrRequestDisplayRefreshRateFB", request))
++                return;
++            load(g_xr.instance, "xrGetDisplayRefreshRateFB", current);
++            uint32_t count = 0;
++            if (XR_FAILED(enumerate(g_xr.session, 0, &count, nullptr)) || count == 0)
++                return;
++            std::vector<float> rates(count);
++            if (XR_FAILED(enumerate(g_xr.session, count, &count, rates.data())))
++                return;
++            std::string list;
++            for (float r : rates)
++                list += " " + std::to_string(int(std::lround(r)));
++            float want = 0.0f;
++            if (const char *v = std::getenv("GA2_VR_REFRESH"); v && *v)
++                want = float(std::atof(v));
++            else
++                for (float r : rates)
++                    if (std::fabs(r - 90.0f) < 1.0f)
++                        want = r;
++            float now = 0.0f;
++            if (current)
++                current(g_xr.session, &now);
++            if (want > 0.0f)
++            {
++                // The nearest offered rate.
++                float best = rates[0];
++                for (float r : rates)
++                    if (std::fabs(r - want) < std::fabs(best - want))
++                        best = r;
++                const XrResult res = request(g_xr.session, best);
++                std::fprintf(stderr, "[vr] refresh rates offered:%s Hz; was %.0f, asked for %.0f (%s)\n", list.c_str(), now, best,
++                             XR_SUCCEEDED(res) ? "ok" : "refused");
++            }
++            else
++                std::fprintf(stderr, "[vr] refresh rates offered:%s Hz; %.0f kept (no 90)\n", list.c_str(), now);
++        }
++
+         bool startXr()
+         {
+             if (!loadLoader())
+@@ -2450,13 +2999,23 @@ void main()
+                 "XR_FB_touch_controller_pro", "XR_META_touch_controller_plus", "XR_EXT_hp_mixed_reality_controller",
+                 "XR_EXT_samsung_odyssey_controller", "XR_BD_controller_interaction", "XR_VALVE_frame_controller_interaction",
+                 // Finger tracking: the joints of both hands (Index and Frame controllers, camera hand tracking).
+-                "XR_EXT_hand_tracking", "XR_EXT_hand_joints_motion_range"};
++                "XR_EXT_hand_tracking", "XR_EXT_hand_joints_motion_range",
++                // The headset's refresh rate (asked for 90 Hz when it offers more than one).
++                XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME};
+             if (xr.xrEnumerateInstanceExtensionProperties)
+             {
+                 uint32_t count = 0;
+                 xr.xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr);
+                 std::vector<XrExtensionProperties> available(count, {XR_TYPE_EXTENSION_PROPERTIES});
+                 if (count && XR_SUCCEEDED(xr.xrEnumerateInstanceExtensionProperties(nullptr, count, &count, available.data())))
++                {
++                    // The runtime's whole list once (what a headset offers: foveation, refresh rates, depth layers).
++                    std::string all;
++                    for (const XrExtensionProperties &e : available)
++                        all += std::string(all.empty() ? "" : " ") + e.extensionName;
++                    std::fprintf(stderr, "[vr] runtime extensions: %s\n", all.c_str());
++                }
++                if (count)
+                     for (const char *wanted : kControllerExtensions)
+                         for (const XrExtensionProperties &e : available)
+                             if (std::strcmp(e.extensionName, wanted) == 0)
+@@ -2531,6 +3090,7 @@ void main()
+             if (!check(xr.xrCreateReferenceSpace(g_xr.session, &spaceInfo, &g_xr.view), "view space"))
+                 return false;
+             createHandTrackers();
++            requestRefreshRate();
+             return createActions() && createSwapchains();
+         }
+ 
+@@ -2775,6 +3335,180 @@ void main()
+                 }
+                 g_handsStill = still && GetTime() - stillSince > 0.2;
+             }
++            // Placed panels: a grip on one carries it (that grip is then not the table's).
++            {
++                bvr_hands::Grabber::HandIn hin[2];
++                for (int h = 0; h < 2; ++h)
++                {
++                    const ga2_battletable::Hand &hand = table.hands[h];
++                    hin[h].valid = tv.active && hand.valid;
++                    hin[h].grip = tv.grip[h];
++                    hin[h].palm = {hand.palm[0], hand.palm[1], hand.palm[2]};
++                    hin[h].tip = {hand.tip[0], hand.tip[1], hand.tip[2]};
++                }
++                g_panels.grab.step(hin, g_panels.hits);
++                for (int h = 0; h < 2; ++h)
++                {
++                    const int id = g_panels.grab.held(h);
++                    if (id >= 0)
++                    {
++                        const bvr_hands::V t = g_panels.grab.target(h, hin[h].palm);
++                        const float p[3] = {t.x, t.y, t.z};
++                        bvr_hands::Place &place = g_panels.places[id];
++                        ga2_battletable::toTable(table, p, place.u, place.v, place.h);
++                        place.set = true;
++                        table.hands[h].grip = 0.0f; // not a map grab
++                        if (g_panels.heldBefore[h] != id)
++                            pulse(h, 0.05f, 0.3f);
++                    }
++                    else if (g_panels.heldBefore[h] >= 0)
++                    {
++                        pulse(h, 0.05f, 0.2f);
++                        savePlaces();
++                    }
++                    g_panels.heldBefore[h] = id;
++                }
++            }
++            // The palm menus.
++            {
++                const ga2_battletable::State &st = tv.state;
++                const bool japanese = std::strcmp(ga2_settings::value(ga2_options::Language), "ja") == 0;
++                const V3 head{table.head[0], table.head[1], table.head[2]};
++                for (int side = 0; side < 2; ++side)
++                {
++                    const ga2_battletable::Hand &hand = table.hands[side];
++                    bvr_hands::PalmInput pi;
++                    pi.valid = (tv.active || g_battleView) && hand.valid && tv.aimValid[side];
++                    pi.head = {head.x, head.y, head.z};
++                    pi.palm = {hand.palm[0], hand.palm[1], hand.palm[2]};
++                    pi.busy = tv.grip[side] > 0.6f || tv.trigger[side] > 0.6f || (st.drag && st.dragHand == side) ||
++                              g_panels.grab.held(side) >= 0;
++                    if (pi.valid)
++                    {
++                        V3 normal, fingers;
++                        if (g_tracked[side].valid)
++                        {
++                            const M4 &pj = g_tracked[side].joint[XR_HAND_JOINT_PALM_EXT];
++                            normal = normalize(V3{-pj.m[4], -pj.m[5], -pj.m[6]}); // the palm joint's +Y is the back of the hand
++                            fingers = normalize(V3{-pj.m[8], -pj.m[9], -pj.m[10]});
++                        }
++                        else
++                        {
++                            // A controller's grip: its +X leaves the left palm and enters the right one (OpenXR).
++                            const M4 &a = tv.aim[side];
++                            const V3 x = normalize(V3{a.m[0], a.m[1], a.m[2]});
++                            normal = side == 0 ? x : x * -1.0f;
++                            fingers = normalize(V3{-a.m[8], -a.m[9], -a.m[10]});
++                        }
++                        pi.normal = {normal.x, normal.y, normal.z};
++                        pi.fingers = {fingers.x, fingers.y, fingers.z};
++                    }
++                    g_palm.open[side] = g_palm.palm[side].step(pi, GetTime());
++                    // GA2_BVR_PALM_SHOW=1 (screenshots without a headset's hands): both menus shown at the table's near
++                    // corners, facing the head.
++                    static const bool show = std::getenv("GA2_BVR_PALM_SHOW") != nullptr;
++                    if (show && tv.active)
++                    {
++                        const V3 c = playPoint(table, side ? 0.30f : -0.30f, -0.30f, 0.22f);
++                        const V3 n = normalize(head - c);
++                        const V3 r = normalize(cross(V3{0, 1, 0}, n));
++                        const V3 u = cross(n, r);
++                        bvr_hands::Frame f;
++                        f.centre = {c.x, c.y, c.z}, f.normal = {n.x, n.y, n.z}, f.right = {r.x, r.y, r.z}, f.up = {u.x, u.y, u.z};
++                        g_palm.palm[side].force(f);
++                        g_palm.open[side] = true;
++                    }
++                }
++                auto act = [&](int id, int unitId) {
++                    auto padPress = [](uint16_t button) {
++                        g_palm.buttons |= button;
++                        g_palm.buttonsUntil = GetTime() + 0.15;
++                    };
++                    switch (id)
++                    {
++                    case kKeyAll: padPress(ga2_vr_input::kSquare); break;
++                    case kKeyPause: padPress(ga2_vr_input::kStart); break;
++                    case kKeyHWeapon: padPress(ga2_vr_input::kTriangle); break;
++                    case kKeyCancel: padPress(ga2_vr_input::kCross); break;
++                    case kKeyPilot: // in a view shown in the table: back to the table (L3 leaves the rear view, R3 the unit camera)
++                        padPress(g_battleView && ga2_vrpointer::scene() == ga2_vrpointer::Scene::UnitCamera ? ga2_vr_input::kR3 : ga2_vr_input::kL3);
++                        break;
++                    case kKeyCamera: padPress(ga2_vr_input::kR3); break;
++                    case kKeyMenu: padPress(ga2_vr_input::kSelect); break;
++                    case kKeyRecentre: g_palm.recentre = true; break;
++                    case kKeyGuide: g_guideFrame.replayBattle = true; break;
++                    case kKeyResetLayout:
++                        g_panels.places.clear();
++                        savePlaces();
++                        break;
++                    default: break;
++                    }
++                    if ((id == kKeyStay || id >= kKeyRoster) && unitId > 0)
++                    {
++                        table.selectUnit = unitId;
++                        ++table.selectSerial;
++                    }
++                };
++                // GA2_BVR_PALM_TEST="<s>:<key>[:<unit>],...": keys pressed as a poke would, that many seconds after the
++                // table first showed (tests without a headset's hands; key ids: PalmKey).
++                {
++                    static const std::vector<std::array<float, 3>> steps = [] {
++                        std::vector<std::array<float, 3>> v;
++                        const char *e = std::getenv("GA2_BVR_PALM_TEST");
++                        std::stringstream list(e ? e : "");
++                        for (std::string item; std::getline(list, item, ',');)
++                        {
++                            float at = 0, key = 0, unit = -1;
++                            if (std::sscanf(item.c_str(), "%f:%f:%f", &at, &key, &unit) >= 2)
++                                v.push_back({at, key, unit});
++                        }
++                        return v;
++                    }();
++                    static double firstTable = -1.0;
++                    static size_t next = 0;
++                    if (tv.active && firstTable < 0.0)
++                        firstTable = GetTime();
++                    if (firstTable >= 0.0 && next < steps.size() && GetTime() - firstTable >= steps[next][0])
++                    {
++                        const int id = int(steps[next][1]);
++                        int unitId = int(steps[next][2]);
++                        if (id == kKeyStay)
++                            for (int n = 0; n < st.unitCount; ++n)
++                                if (st.units[n].selected)
++                                    unitId = st.units[n].id;
++                        std::fprintf(stderr, "[bvr] palm test: key %d unit %d\n", id, unitId);
++                        act(id >= kKeyRoster ? kKeyRoster : id, id >= kKeyRoster ? id - kKeyRoster : unitId);
++                        ++next;
++                    }
++                }
++                if (g_palm.open[0] || g_palm.open[1])
++                    layoutPalms(st, japanese);
++                for (int side = 0; side < 2; ++side)
++                {
++                    if (!g_palm.open[side])
++                        continue;
++                    const ga2_battletable::Hand &other = table.hands[side ^ 1];
++                    const std::vector<bvr_hands::Key> keys = palmKeys(side);
++                    const int prevHover = g_palm.keys[side].hovered();
++                    const int id = g_palm.keys[side].step(g_palm.palm[side].frame(), keys, other.valid && !g_palm.open[side ^ 1],
++                                                          {other.tip[0], other.tip[1], other.tip[2]}, GetTime());
++                    if (g_palm.keys[side].hovered() && g_palm.keys[side].hovered() != prevHover)
++                        pulse(side ^ 1, 0.03f, 0.05f);
++                    if (!id)
++                        continue;
++                    pulse(side ^ 1, 0.05f, 0.35f);
++                    pulse(side, 0.04f, 0.2f);
++                    g_palm.pressedKey[side] = id;
++                    g_palm.pressedAt[side] = GetTime();
++                    int unitId = -1;
++                    for (const PalmCell &c : g_palm.cells[side])
++                        if (c.id == id)
++                            unitId = c.unitId;
++                    act(id, unitId);
++                    std::fprintf(stderr, "[bvr] palm %s key %d%s\n", side ? "right" : "left", id,
++                                 unitId > 0 ? (" unit " + std::to_string(unitId)).c_str() : "");
++                }
++            }
+             ga2_battletable::publishPose(table);
+             tv.pose = table;
+ 
+@@ -3248,6 +3982,24 @@ void main()
+                 }
+             }
+         }
++        // GA2_BVR_PERF=1: where a headset frame's time goes, one line per 5 s (CPU, this thread): the wait for the
++        // headset (xrWaitFrame), input and scene work, the eyes' drawing, xrEndFrame.
++        static const bool perf = std::getenv("GA2_BVR_PERF") != nullptr;
++        struct PerfAcc
++        {
++            double wait = 0, pre = 0, eyes = 0, end = 0;
++            int frames = 0, rendered = 0;
++            std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
++        };
++        static PerfAcc acc;
++        const auto msBetween = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
++            return std::chrono::duration<double, std::milli>(b - a).count();
++        };
++        static std::chrono::steady_clock::time_point waitStartedAt;
++        const auto afterWait = std::chrono::steady_clock::now();
++        if (perf && waitStartedAt.time_since_epoch().count())
++            acc.wait += msBetween(waitStartedAt, afterWait);
++        std::chrono::steady_clock::time_point eyesStart = afterWait, eyesEnd = afterWait;
+         XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
+         xr.xrBeginFrame(g_xr.session, &beginInfo);
+         if (!g_xr.recentered)
+@@ -3287,6 +4039,19 @@ void main()
+         // The battle table (ga2_battletable.h): the game says when the tactical map is shown in table mode.
+         g_tableView.state = ga2_battletable::latest();
+         g_tableView.active = g_tableView.state.active;
++        if (g_tableView.active)
++            g_lastTable = g_tableView.state;
++        {
++            const ga2_vrpointer::Scene sc = ga2_vrpointer::scene();
++            g_battleView = !g_tableView.active && std::strcmp(ga2_settings::value(ga2_options::VrBattleSelect), "hand") == 0 &&
++                           // (the cockpit view is not: it puts the player in the cockpit, the game's 3D all around in stereo)
++                           (sc == ga2_vrpointer::Scene::UnitCamera || sc == ga2_vrpointer::Scene::Rear) &&
++                           g_shipGl.lastActive >= 0.0 && GetTime() - g_shipGl.lastActive < 900.0;
++            static bool was = false;
++            if (g_battleView != was)
++                std::fprintf(stderr, "[bvr] %s\n", g_battleView ? "battle view shown inside the table" : "battle view ended");
++            was = g_battleView;
++        }
+         ga2_pgs::setTableSplit(g_tableView.active); // its HUD and units from the UI layer, the plate from the scene
+         g_tableView.aimValid[0] = g_tableView.aimValid[1] = false;
+         locateHands(frameState.predictedDisplayTime, world);
+@@ -3421,10 +4186,15 @@ void main()
+                 if (g_guide.consumesMenu())
+                     in.menu = false;
+             }
++            if (GetTime() < g_palm.buttonsUntil)
++                in.extraButtons = g_palm.buttons;
++            else
++                g_palm.buttons = 0;
+             const ga2_vr_input::Output out = g_xr.mapper.step(in, GetTime());
+-            if (out.recenter)
++            const bool palmRecentre = std::exchange(g_palm.recentre, false);
++            if (out.recenter || palmRecentre)
+                 recenter(frameState.predictedDisplayTime);
+-            g_guideFrame.recentered = out.recenter;
++            g_guideFrame.recentered = out.recenter || palmRecentre;
+             g_guideFrame.pointerHit = pointerHit;
+             PadState pad;
+             pad.buttons = out.buttons;
+@@ -3461,7 +4231,9 @@ void main()
+                 if (viewCount >= 2)
+                     publishTablePose(views, world);
+                 updateGuide(stereo);
+-                if (ga2_pgs::stereo() && viewCount >= 2 && ga2_activity::scene3d() && !g_tableView.active)
++                if (g_tableView.active || g_battleView)
++                    renderPalms(std::strcmp(ga2_settings::value(ga2_options::Language), "ja") == 0);
++                if (ga2_pgs::stereo() && viewCount >= 2 && ga2_activity::scene3d() && !g_tableView.active && !g_battleView)
+                 {
+                     ga2_stereo::Setup setup;
+                     setup.active = true;
+@@ -3508,6 +4280,7 @@ void main()
+                         g_layoutHead = sum * (1.0f / float(viewCount));
+                     ++g_layoutFrame;
+                 }
++                eyesStart = std::chrono::steady_clock::now();
+                 for (uint32_t v = 0; v < viewCount && v < g_xr.eyes.size(); ++v)
+                 {
+                     auto &eye = g_xr.eyes[v];
+@@ -3620,8 +4393,38 @@ void main()
+         end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+         end.layerCount = layerCount;
+         end.layers = layerCount ? layers : nullptr;
++        if (perf)
++        {
++            if (frameState.shouldRender)
++            {
++                glFinish(); // the eyes' GPU work counted with them (diagnostics only)
++                eyesEnd = std::chrono::steady_clock::now();
++                ++acc.rendered;
++            }
++            else
++                eyesEnd = eyesStart = std::chrono::steady_clock::now();
++        }
+         xr.xrEndFrame(g_xr.session, &end);
+         glViewport(0, 0, GetRenderWidth(), GetRenderHeight());
++        if (perf)
++        {
++            const auto now = std::chrono::steady_clock::now();
++            acc.pre += msBetween(afterWait, eyesStart);
++            acc.eyes += msBetween(eyesStart, eyesEnd);
++            acc.end += msBetween(eyesEnd, now);
++            ++acc.frames;
++            const double secs = std::chrono::duration<double>(now - acc.since).count();
++            if (secs >= 5.0)
++            {
++                const double n = std::max(acc.frames, 1);
++                std::fprintf(stderr, "[bvr perf] %.1f headset frames/s (%d drawn), ms per frame: window + headset wait %.2f, input+scene %.2f, "
++                                     "eyes %.2f (with glFinish), end %.2f; table %d, view %d, refresh %d Hz\n",
++                             acc.frames / secs, acc.rendered, acc.wait / n, acc.pre / n, acc.eyes / n, acc.end / n,
++                             g_tableView.active ? 1 : 0, g_battleView ? 1 : 0, g_xr.capHz);
++                acc = PerfAcc{};
++            }
++            waitStartedAt = std::chrono::steady_clock::now(); // the next xrWaitFrame starts after the caller's swap
++        }
+     }
+ 
+     void drawPreview(uint32_t texture, int texWidth, int texHeight, float srcWidth, float srcHeight, bool wide)
+diff --git a/ps2xRuntime/src/lib/ga2_vr_input.h b/ps2xRuntime/src/lib/ga2_vr_input.h
+index f0e42ac..9726e41 100644
+--- a/ps2xRuntime/src/lib/ga2_vr_input.h
++++ b/ps2xRuntime/src/lib/ga2_vr_input.h
+@@ -84,6 +84,8 @@ namespace ga2_vr_input
+         uint8_t tablePressKind[16] = {};
+         uint64_t tableSerial = 0;
+         bool handsStill = false;
++        // Buttons pressed on a palm menu's keys (the battle table): added to the pad as they are.
++        uint16_t extraButtons = 0;
+     };
+ 
+     struct Output
+@@ -131,6 +133,7 @@ namespace ga2_vr_input
+             }
+             if (in.l3) b |= kL3;
+             if (in.r3) b |= kR3;
++            b |= in.extraButtons;
+ 
+             // Start / Select: direct actions, and the menu action (tap, hold).
+             bool start = in.start, select = in.select;
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index c93a85d..2abe2c6 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -33,6 +33,7 @@ add_library(ps2_test_lib STATIC
+     src/ga2_vr_hand_tests.cpp
+     src/ga2_flatart_tests.cpp
+     src/bvr_assets_tests.cpp
++    src/bvr_hands_tests.cpp
+     src/ga2_settings_tests.cpp
+     src/ga2_text_icons_tests.cpp
+     src/ga2_hitext_tests.cpp
+diff --git a/ps2xTest/src/bvr_hands_tests.cpp b/ps2xTest/src/bvr_hands_tests.cpp
+new file mode 100644
+index 0000000..c9cddf0
+--- /dev/null
++++ b/ps2xTest/src/bvr_hands_tests.cpp
+@@ -0,0 +1,114 @@
++#include "MiniTest.h"
++
++#include "battlevr/bvr_hands.h"
++
++#include <cmath>
++#include <map>
++#include <string>
++#include <vector>
++
++using bvr_hands::V;
++
++void register_bvr_hands_tests()
++{
++    MiniTest::Case("BvrHands", [](TestCase &tc) {
++        tc.Run("a palm menu opens after facing the head for a moment and closes past the wider angle", [](TestCase &t) {
++            bvr_hands::Palm palm;
++            bvr_hands::PalmInput in;
++            in.valid = true;
++            in.head = {0, 0, 0};
++            in.palm = {0, -0.3f, -0.3f};
++            in.fingers = {0, 1, 0};
++            in.normal = bvr_hands::unit(in.head - in.palm); // straight at the face
++            t.IsFalse(palm.step(in, 0.0), "not at once");
++            t.IsFalse(palm.step(in, 0.1), "not before the dwell");
++            t.IsTrue(palm.step(in, 0.2), "open after the dwell");
++            const bvr_hands::Frame f = palm.frame();
++            t.IsTrue(bvr_hands::dot(f.normal, bvr_hands::unit(in.head - f.centre)) > 0.99f, "the menu faces the head");
++            t.IsTrue(bvr_hands::dot(f.centre - in.palm, in.normal) > 0.03f, "it floats off the palm");
++            // Turned 40 degrees away: still open (closes beyond 50); 60 degrees: closed.
++            auto turned = [&](float degrees) {
++                const float r = degrees * 0.0174533f;
++                const V n = in.normal, side{1, 0, 0};
++                return bvr_hands::unit(n * std::cos(r) + side * std::sin(r));
++            };
++            in.normal = turned(40.0f);
++            t.IsTrue(palm.step(in, 0.3), "40 degrees keeps it open");
++            in.normal = turned(60.0f);
++            t.IsFalse(palm.step(in, 0.4), "60 degrees closes it");
++            in.normal = turned(40.0f);
++            t.IsFalse(palm.step(in, 0.5), "40 degrees does not open it again");
++            in.normal = bvr_hands::unit(in.head - in.palm);
++            in.busy = true;
++            t.IsFalse(palm.step(in, 1.0), "a gripping hand has no menu");
++            in.busy = false;
++            in.palm = {0, -0.6f, -0.6f};
++            in.normal = bvr_hands::unit(in.head - in.palm);
++            palm.step(in, 2.0);
++            t.IsFalse(palm.step(in, 3.0), "out of reach (beyond 0.7 m): no menu");
++        });
++
++        tc.Run("a key fires once when poked from the front, after its travel, and not again until let go", [](TestCase &t) {
++            bvr_hands::Frame f;
++            f.centre = {0, 0, 0}, f.right = {1, 0, 0}, f.up = {0, 1, 0}, f.normal = {0, 0, 1};
++            std::vector<bvr_hands::Key> keys = {{7, -0.02f, -0.02f, 0.02f, 0.02f, true}, {8, 0.03f, -0.02f, 0.07f, 0.02f, false}};
++            bvr_hands::Keys k;
++            t.Equals(k.step(f, keys, true, {0, 0, 0.02f}, 0.0), 0, "hovering in front");
++            t.Equals(k.hovered(), 7, "the key under the finger");
++            t.Equals(k.step(f, keys, true, {0, 0, -0.004f}, 0.05), 0, "4 mm in: not yet");
++            t.Equals(k.step(f, keys, true, {0, 0, -0.007f}, 0.10), 7, "7 mm in: fires");
++            t.Equals(k.step(f, keys, true, {0, 0, -0.008f}, 0.20), 0, "held: no repeat");
++            t.Equals(k.held(), 7, "held");
++            k.step(f, keys, true, {0, 0, 0.01f}, 0.30);
++            t.Equals(k.held(), 0, "backed out: let go");
++            t.Equals(k.step(f, keys, true, {0, 0, -0.007f}, 0.35), 7, "a second poke fires");
++            bvr_hands::Keys fromBehind;
++            t.Equals(fromBehind.step(f, keys, true, {0, 0, -0.007f}, 0.0), 0, "a finger arriving from behind does not fire");
++            bvr_hands::Keys off;
++            off.step(f, keys, true, {0.05f, 0, 0.02f}, 0.0);
++            t.Equals(off.step(f, keys, true, {0.05f, 0, -0.007f}, 0.1), 0, "a disabled key does not fire");
++        });
++
++        tc.Run("a grip on a panel carries it with the hand's offset and lets go on release", [](TestCase &t) {
++            bvr_hands::Grabber g;
++            std::vector<bvr_hands::PanelHit> panels = {{5, {0, 1, -1}, {0.1f, 0, 0}, {0, 0.05f, 0}}};
++            bvr_hands::Grabber::HandIn hands[2];
++            hands[1].valid = true;
++            hands[1].palm = {0.05f, 1.02f, -0.98f};
++            hands[1].tip = hands[1].palm;
++            hands[1].grip = 0.0f;
++            g.step(hands, panels);
++            t.Equals(g.held(1), -1, "no grip, nothing held");
++            hands[1].grip = 1.0f;
++            g.step(hands, panels);
++            t.Equals(g.held(1), 5, "the grip takes the panel under the palm");
++            const V to = g.target(1, {0.25f, 1.12f, -0.9f});
++            t.IsTrue(std::fabs(to.x - 0.2f) < 1e-4f && std::fabs(to.y - 1.1f) < 1e-4f && std::fabs(to.z + 0.92f) < 1e-4f,
++                     "the panel keeps the hand's offset");
++            hands[1].grip = 0.0f;
++            g.step(hands, panels);
++            t.Equals(g.held(1), -1, "let go");
++            // A grip that starts away from any panel never picks one up by moving onto it.
++            hands[1].palm = {0.5f, 1.0f, -1.0f};
++            hands[1].tip = hands[1].palm;
++            hands[1].grip = 1.0f;
++            g.step(hands, panels);
++            hands[1].palm = {0.0f, 1.0f, -1.0f};
++            hands[1].tip = hands[1].palm;
++            g.step(hands, panels);
++            t.Equals(g.held(1), -1, "a held grip sweeping over a panel does not take it");
++        });
++
++        tc.Run("places round-trip through their text and bad lines are dropped", [](TestCase &t) {
++            std::map<int, bvr_hands::Place> places;
++            places[1] = {0.1f, 0.62f, 0.2f, 1.5f, true};
++            places[12] = {-0.4f, 0.7f, 0.35f, 1.0f, true};
++            places[3] = {0, 0, 0, 1.0f, false}; // default: not stored
++            const std::string text = bvr_hands::formatPlaces(places);
++            const auto back = bvr_hands::parsePlaces(text + "junk\n99 1e9 0 0 1\n");
++            t.Equals(int(back.size()), 2, "two stored places");
++            t.IsTrue(back.count(1) && std::fabs(back.at(1).scale - 1.5f) < 1e-3f && std::fabs(back.at(1).v - 0.62f) < 1e-3f, "values");
++            t.IsTrue(back.count(12) && back.at(12).set, "set");
++        });
++    });
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index aeb0cf8..be4d277 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -11,6 +11,7 @@ void register_ga2_vr_input_tests();
+ void register_ga2_vr_hand_tests();
+ void register_ga2_flatart_tests();
+ void register_bvr_assets_tests();
++void register_bvr_hands_tests();
+ void register_ga2_settings_tests();
+ void register_ga2_text_icons_tests();
+ void register_ga2_hitext_tests();
+@@ -54,6 +55,7 @@ int main()
+     register_ga2_vr_hand_tests();
+     register_ga2_flatart_tests();
+     register_bvr_assets_tests();
++    register_bvr_hands_tests();
+     register_ga2_settings_tests();
+     register_ga2_text_icons_tests();
+     register_ga2_hitext_tests();
+-- 
+2.56.0
+

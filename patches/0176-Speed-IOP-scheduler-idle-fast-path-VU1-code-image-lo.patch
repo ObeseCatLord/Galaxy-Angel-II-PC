@@ -1,0 +1,603 @@
+From 42c25ef22dd17e6509f5a2f22e3c0773862dc22b Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:37:28 -0600
+Subject: [PATCH] Speed: IOP scheduler idle fast path, VU1 code image lookup by
+ byte compare, game thread on the largest cores
+
+- IOP kernel: thread state is written only through IopKernel::setState (a plain assignment no longer compiles),
+  which keeps a ready count and a cached earliest Delay wake; beginNextReady returns at once when nothing is Ready
+  and no delay expired, nextWakeCycle reads the cache. Timer deadlines bump a change counter on every write so
+  nextEventCycle rescans only after one changed. GA2_IOP_CACHE_CHECK=1 checks every cached answer against a full
+  scan (all IOP suites and a whole Eigou 1 battle: no difference). reset() rebuilds the list (and the cache).
+- VU1: the last four code images are kept with their digests; a re-upload of one is matched by memcmp instead of
+  a byte-wise FNV of 16 KB (3.9 % of the battle's game thread).
+- The game thread pins itself to the cores with the highest kernel cpu_capacity on a mixed-core CPU (the Steam
+  Frame's X4: battles 20-30 % faster than on its A720s); equal cores: unchanged. GA2_PIN_GAME=0 turns it off.
+
+Desktop Eigou 1 battle: game thread 82 % -> 77 % at full speed; the heavy part holds 92-97 % speed (was 64-79 %).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/core/iop_kernel.cpp     | 117 ++++++++++++++++---
+ ps2xIOP/src/emulator/core/iop_kernel.h       |  28 ++++-
+ ps2xIOP/src/emulator/imports/iop_timrman.cpp |  30 ++++-
+ ps2xIOP/src/emulator/imports/iop_timrman.h   |  23 +++-
+ ps2xIOP/tests/iop_kernel_sched_tests.cpp     |   6 +-
+ ps2xRuntime/include/runtime/ps2_vu1.h        |  11 ++
+ ps2xRuntime/src/lib/ps2_runtime.cpp          |  50 ++++++++
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp      |  13 ++-
+ 8 files changed, 248 insertions(+), 30 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 162b0f4..3279f0a 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -4,6 +4,8 @@
+ #include "../iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -57,13 +59,56 @@ namespace ps2x::iop::detail
+     void IopKernel::rebuildThreadList()
+     {
+         m_threadList.clear();
++        m_readyCount = 0;
+         for (auto &[id, thread] : m_threads)
++        {
+             m_threadList.push_back(&thread);
++            m_readyCount += thread.state == IopThreadState::Ready ? 1u : 0u;
++        }
++        m_wakeDirty = true;
++    }
++
++    void IopKernel::setState(IopThread &thread, IopThreadState state) noexcept
++    {
++        const IopThreadState old = thread.state;
++        if (old == state)
++            return;
++        // Only threads in the list are counted (a thread is listed from its creation; see rebuildThreadList).
++        const bool listed = m_threads.count(thread.id) && &m_threads.at(thread.id) == &thread;
++        if (listed)
++        {
++            if (old == IopThreadState::Ready)
++                --m_readyCount;
++            if (state == IopThreadState::Ready)
++                ++m_readyCount;
++        }
++        if (old == IopThreadState::Delay || state == IopThreadState::Delay)
++            m_wakeDirty = true;
++        thread.state.m_value = state;
++    }
++
++    uint64_t IopKernel::earliestWakeScan() const noexcept
++    {
++        uint64_t wake = UINT64_MAX;
++        for (const IopThread *thread : m_threadList)
++            if (thread->state == IopThreadState::Delay)
++                wake = std::min(wake, thread->wakeCycle);
++        return wake;
++    }
++
++    uint64_t IopKernel::earliestWake() const noexcept
++    {
++        if (m_wakeDirty)
++        {
++            m_earliestWake = earliestWakeScan();
++            m_wakeDirty = false;
++        }
++        return m_earliestWake;
+     }
+ 
+     void IopKernel::makeReady(IopThread &thread)
+     {
+-        thread.state = IopThreadState::Ready;
++        setState(thread, IopThreadState::Ready);
+         thread.readySerial = m_nextReadySerial++;
+         if (!m_dispatchDisabled && m_currentThread != nullptr && m_currentThread != &thread &&
+             thread.priority < m_currentThread->priority)
+@@ -85,7 +130,7 @@ namespace ps2x::iop::detail
+     void IopKernel::reset()
+     {
+         m_threads.clear();
+-        m_threadList.clear();
++        rebuildThreadList(); // empty; also resets the scheduler's ready count and wake cache
+         m_semaphores.clear();
+         m_eventFlags.clear();
+         m_nextThreadId = 1;
+@@ -192,7 +237,7 @@ namespace ps2x::iop::detail
+             if (m_currentThread != nullptr)
+             {
+                 invalidateRpcWait(*m_currentThread);
+-                m_currentThread->state = ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant;
++                setState(*m_currentThread, ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant);
+                 cpu.stopped = true;
+                 cpu.yielded = true;
+             }
+@@ -214,7 +259,7 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             invalidateRpcWait(it->second);
+-            it->second.state = IopThreadState::Dormant;
++            setState(it->second, IopThreadState::Dormant);
+             setV0(0);
+             return true;
+         }
+@@ -362,7 +407,7 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
+-            it->second.state = IopThreadState::Suspended;
++            setState(it->second, IopThreadState::Suspended);
+             if (m_currentThread == &it->second && !hasRpcWait(it->second))
+                 cpu.yielded = true;
+             setV0(0);
+@@ -390,7 +435,7 @@ namespace ps2x::iop::detail
+                     }
+                     else
+                     {
+-                        it->second.state = IopThreadState::RpcWait;
++                        setState(it->second, IopThreadState::RpcWait);
+                     }
+                 }
+                 else
+@@ -612,7 +657,7 @@ namespace ps2x::iop::detail
+                 setV0(-419);
+             else if (m_currentThread != nullptr && &m_currentThread->cpu == &cpu)
+             {
+-                m_currentThread->state = IopThreadState::Semaphore;
++                setState(*m_currentThread, IopThreadState::Semaphore);
+                 m_currentThread->waitId = id;
+                 m_currentThread->waitSerial = m_nextWaitSerial++;
+                 cpu.yielded = true;
+@@ -835,7 +880,7 @@ namespace ps2x::iop::detail
+                 setV0(-418);
+             else if (m_currentThread != nullptr)
+             {
+-                m_currentThread->state = IopThreadState::EventFlag;
++                setState(*m_currentThread, IopThreadState::EventFlag);
+                 m_currentThread->waitId = event->second.id;
+                 m_currentThread->waitBits = bits;
+                 m_currentThread->waitMode = mode;
+@@ -882,7 +927,7 @@ namespace ps2x::iop::detail
+     {
+         if (m_currentThread == nullptr)
+             return;
+-        m_currentThread->state = IopThreadState::Sleep;
++        setState(*m_currentThread, IopThreadState::Sleep);
+         cpu.yielded = true;
+     }
+ 
+@@ -891,7 +936,7 @@ namespace ps2x::iop::detail
+         if (m_currentThread == nullptr)
+             return;
+         m_currentThread->wakeCycle = wakeCycle;
+-        m_currentThread->state = IopThreadState::Delay;
++        setState(*m_currentThread, IopThreadState::Delay);
+         cpu.yielded = true;
+     }
+ 
+@@ -908,7 +953,7 @@ namespace ps2x::iop::detail
+         m_currentThread->rpcWaitGeneration = waitGeneration;
+         m_currentThread->rpcWaitNonce = transactionNonce;
+         m_currentThread->rpcWaitResultReady = false;
+-        m_currentThread->state = IopThreadState::RpcWait;
++        setState(*m_currentThread, IopThreadState::RpcWait);
+         cpu.yielded = true;
+         return RpcWaitOwner{m_currentThread->rpcLifetimeGeneration, waitGeneration, m_currentThread->id, transactionNonce};
+     }
+@@ -948,6 +993,13 @@ namespace ps2x::iop::detail
+ 
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
++        // Idle: nothing Ready and no delay expired. The full pass below would find nothing and change nothing.
++        if (m_readyCount == 0 && earliestWake() > currentCycle)
++        {
++            if (cacheCheck())
++                checkSchedulerCache(currentCycle);
++            return nullptr;
++        }
+         // Expired delays become ready in (wake time, id) order, behind the
+         // threads that are already queued. The next thread is the head of the
+         // best priority's FIFO queue: lowest (priority, readySerial).
+@@ -984,7 +1036,7 @@ namespace ps2x::iop::detail
+             return nullptr;
+ 
+         m_currentThread = next;
+-        next->state = IopThreadState::Running;
++        setState(*next, IopThreadState::Running);
+         next->cpu.stopped = false;
+         next->cpu.yielded = false;
+         return next;
+@@ -992,13 +1044,40 @@ namespace ps2x::iop::detail
+ 
+     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
+     {
+-        uint64_t nextWake = fallback;
++        if (cacheCheck() && earliestWake() != earliestWakeScan())
++        {
++            std::fprintf(stderr, "[IOP] scheduler cache: earliest wake %llu, scan %llu\n",
++                         static_cast<unsigned long long>(earliestWake()), static_cast<unsigned long long>(earliestWakeScan()));
++            std::abort();
++        }
++        return std::min(fallback, earliestWake());
++    }
++
++    bool IopKernel::cacheCheck() noexcept
++    {
++        static const bool check = [] {
++            const char *v = std::getenv("GA2_IOP_CACHE_CHECK");
++            return v && *v && *v != '0';
++        }();
++        return check;
++    }
++
++    void IopKernel::checkSchedulerCache(uint64_t currentCycle) const
++    {
++        size_t ready = 0;
++        bool expired = false;
+         for (const IopThread *thread : m_threadList)
+         {
+-            if (thread->state == IopThreadState::Delay)
+-                nextWake = std::min(nextWake, thread->wakeCycle);
++            ready += thread->state == IopThreadState::Ready ? 1u : 0u;
++            expired = expired || (thread->state == IopThreadState::Delay && thread->wakeCycle <= currentCycle);
++        }
++        if (ready != m_readyCount || expired || earliestWake() != earliestWakeScan())
++        {
++            std::fprintf(stderr, "[IOP] scheduler cache mismatch: ready %zu (cached %zu), expired delay %d, wake %llu (scan %llu)\n",
++                         ready, m_readyCount, int(expired), static_cast<unsigned long long>(earliestWake()),
++                         static_cast<unsigned long long>(earliestWakeScan()));
++            std::abort();
+         }
+-        return nextWake;
+     }
+ 
+     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
+@@ -1009,8 +1088,8 @@ namespace ps2x::iop::detail
+         // finishes when it is woken and resumes at the sentinel.
+         if (thread.state == IopThreadState::Running)
+         {
+-            thread.state = (thread.cpu.pc == returnSentinel || thread.cpu.stopped) ? IopThreadState::Dormant
+-                                                                                     : IopThreadState::Ready;
++            setState(thread, (thread.cpu.pc == returnSentinel || thread.cpu.stopped) ? IopThreadState::Dormant
++                                                                                     : IopThreadState::Ready);
+             // A slice that merely ran out (or a preemption) keeps the thread at
+             // the front of its priority queue; only an explicit rotate sends it
+             // to the back.
+@@ -1050,7 +1129,7 @@ namespace ps2x::iop::detail
+             if ((pc >= base && pc < base + size) || (entry >= base && entry < base + size))
+             {
+                 invalidateRpcWait(thread);
+-                thread.state = IopThreadState::Dead;
++                setState(thread, IopThreadState::Dead);
+             }
+         }
+     }
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index f498df5..40c6129 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -26,10 +26,25 @@ namespace ps2x::iop::detail
+         Dead,
+     };
+ 
++    class IopKernel;
++
++    // A thread's state: read like the enum, written only by IopKernel::setState, which keeps the scheduler's ready
++    // count and earliest-wake cache exact (a plain assignment does not compile).
++    class IopThreadStateField
++    {
++    public:
++        constexpr operator IopThreadState() const noexcept { return m_value; }
++        IopThreadStateField &operator=(IopThreadState) = delete;
++
++    private:
++        friend class IopKernel;
++        IopThreadState m_value = IopThreadState::Dormant;
++    };
++
+     struct IopThread
+     {
+         int id = 0;
+-        IopThreadState state = IopThreadState::Dormant;
++        IopThreadStateField state;
+         IopCpuState cpu;
+         uint32_t entry = 0;
+         uint32_t stackBase = 0;
+@@ -115,6 +130,10 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool isRpcWaitCurrent(const RpcWaitOwner &owner) const noexcept;
+         [[nodiscard]] bool completeRpcWait(const RpcWaitOwner &owner, int32_t result) noexcept;
+ 
++        void setState(IopThread &thread, IopThreadState state) noexcept;
++        // GA2_IOP_CACHE_CHECK=1: every idle fast-path answer is checked against a full scan (abort on a difference).
++        [[nodiscard]] static bool cacheCheck() noexcept;
++        void checkSchedulerCache(uint64_t currentCycle) const;
+         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
+         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
+@@ -165,6 +184,13 @@ namespace ps2x::iop::detail
+         // node pointers are stable); rebuilt whenever a thread is added/removed.
+         std::vector<IopThread *> m_threadList;
+         void rebuildThreadList();
++        // The scheduler's idle fast path: how many threads are Ready, and the earliest wake cycle of the Delay
++        // threads (recomputed when a thread entered or left Delay). Kept by setState and rebuildThreadList.
++        size_t m_readyCount = 0;
++        mutable bool m_wakeDirty = true;
++        mutable uint64_t m_earliestWake = UINT64_MAX;
++        [[nodiscard]] uint64_t earliestWake() const noexcept;
++        [[nodiscard]] uint64_t earliestWakeScan() const noexcept;
+         std::map<int, Semaphore> m_semaphores;
+         std::map<int, EventFlag> m_eventFlags;
+         uint32_t m_nextThreadId = 1;
+diff --git a/ps2xIOP/src/emulator/imports/iop_timrman.cpp b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+index a23cfe8..fb5cb8e 100644
+--- a/ps2xIOP/src/emulator/imports/iop_timrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+@@ -6,6 +6,8 @@
+ #include "../services/iop_rpc.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ #include <array>
+ #include <limits>
+ 
+@@ -487,14 +489,34 @@ namespace ps2x::iop::detail
+         return count;
+     }
+ 
+-    uint64_t IopTimrman::nextEventCycle(uint64_t fallback) const noexcept
++    uint64_t IopTimrman::nextEventScan() const noexcept
+     {
+-        uint64_t next = fallback;
++        uint64_t next = UINT64_MAX;
+         for (const Timer &timer : m_timers)
+         {
+-            next = std::min(next, timer.compareCycle);
+-            next = std::min(next, timer.overflowCycle);
++            next = std::min<uint64_t>(next, timer.compareCycle);
++            next = std::min<uint64_t>(next, timer.overflowCycle);
+         }
+         return next;
+     }
++
++    uint64_t IopTimrman::nextEventCycle(uint64_t fallback) const noexcept
++    {
++        if (m_nextEventSeen != Deadline::s_changes)
++        {
++            m_nextEvent = nextEventScan();
++            m_nextEventSeen = Deadline::s_changes;
++        }
++        static const bool check = [] {
++            const char *v = std::getenv("GA2_IOP_CACHE_CHECK");
++            return v && *v && *v != '0';
++        }();
++        if (check && m_nextEvent != nextEventScan())
++        {
++            std::fprintf(stderr, "[IOP] timer cache: next event %llu, scan %llu\n", static_cast<unsigned long long>(m_nextEvent),
++                         static_cast<unsigned long long>(nextEventScan()));
++            std::abort();
++        }
++        return std::min(fallback, m_nextEvent);
++    }
+ }
+diff --git a/ps2xIOP/src/emulator/imports/iop_timrman.h b/ps2xIOP/src/emulator/imports/iop_timrman.h
+index 3534ca3..1f1b14c 100644
+--- a/ps2xIOP/src/emulator/imports/iop_timrman.h
++++ b/ps2xIOP/src/emulator/imports/iop_timrman.h
+@@ -28,6 +28,22 @@ namespace ps2x::iop::detail
+             uint32_t gp = 0u;
+         };
+ 
++        // A timer deadline: every write (copies included) moves s_changes, so nextEventCycle's cached minimum is
++        // recomputed only after a deadline changed.
++        class Deadline
++        {
++        public:
++            Deadline() = default;
++            Deadline(const Deadline &other) noexcept : m_value(other.m_value) { ++s_changes; }
++            Deadline &operator=(const Deadline &other) noexcept { m_value = other.m_value; ++s_changes; return *this; }
++            Deadline &operator=(uint64_t value) noexcept { m_value = value; ++s_changes; return *this; }
++            operator uint64_t() const noexcept { return m_value; }
++            static inline uint64_t s_changes = 1;
++
++        private:
++            uint64_t m_value = UINT64_MAX;
++        };
++
+         struct Timer
+         {
+             uint32_t address = 0u;
+@@ -44,8 +60,8 @@ namespace ps2x::iop::detail
+             uint32_t counterBase = 0u;
+             uint32_t compare = 0u;
+             uint64_t counterBaseCycle = 0u;
+-            uint64_t compareCycle = UINT64_MAX;
+-            uint64_t overflowCycle = UINT64_MAX;
++            Deadline compareCycle;
++            Deadline overflowCycle;
+             bool configured = false;
+             bool running = false;
+ 
+@@ -65,5 +81,8 @@ namespace ps2x::iop::detail
+         std::array<Timer, 6> m_timers{};
+         uint32_t m_holdMode = 0u;
+         bool m_servicing = false;
++        mutable uint64_t m_nextEventSeen = 0; // Deadline::s_changes when m_nextEvent was computed
++        mutable uint64_t m_nextEvent = UINT64_MAX;
++        [[nodiscard]] uint64_t nextEventScan() const noexcept;
+     };
+ }
+diff --git a/ps2xIOP/tests/iop_kernel_sched_tests.cpp b/ps2xIOP/tests/iop_kernel_sched_tests.cpp
+index 16f0b32..9d0d565 100644
+--- a/ps2xIOP/tests/iop_kernel_sched_tests.cpp
++++ b/ps2xIOP/tests/iop_kernel_sched_tests.cpp
+@@ -114,7 +114,7 @@ namespace
+         require(t && t->id == hi, "highest priority runs");
+         // The running thread rotates priority 20: x (front) goes behind y.
+         require(f.call(t->cpu, 16u, 20u) == 0 && !t->rotateRequested, "rotate of another priority");
+-        t->state = IopThreadState::Sleep; // hi sleeps
++        f.kernel.setState(*t, IopThreadState::Sleep); // hi sleeps
+         f.end(*t);
+         require(f.sliceOwner() == y, "front of the rotated queue moved behind its peer");
+     }
+@@ -135,7 +135,7 @@ namespace
+         require(running->state == IopThreadState::Ready, "preempted thread stays ready");
+         IopThread *next = f.begin();
+         require(next && next->id == high, "the higher priority thread runs next");
+-        next->state = IopThreadState::Sleep;
++        f.kernel.setState(*next, IopThreadState::Sleep);
+         f.end(*next);
+         require(f.sliceOwner() == low1, "a preempted thread resumes before its equal-priority peer");
+     }
+@@ -151,7 +151,7 @@ namespace
+         {
+             IopThread *t = f.begin();
+             require(t, "sleeper ready");
+-            t->state = IopThreadState::Sleep;
++            f.kernel.setState(*t, IopThreadState::Sleep);
+             f.end(*t);
+         }
+         require(f.start(runner, boot) == 0, "start runner");
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index dd8316d..6384285 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <memory>
++#include <vector>
+ 
+ class GS;
+ class PS2Memory;
+@@ -450,6 +451,16 @@ private:
+     bool m_jitElidesFlags = false;
+     bool m_elidedFlagsRan = false;
+     uint64_t m_jitHash = 0;
++    // The last few VU1 code images seen and their digests: a game re-uploading microcode it ran before (every
++    // battle frame) is recognised by a byte compare instead of re-hashing the whole image (lookupJitProgram).
++    struct RecentImage
++    {
++        std::vector<uint8_t> bytes;
++        uint64_t hash = 0;
++    };
++    std::array<RecentImage, 4> m_recentImages;
++    uint32_t m_recentNext = 0;
++    uint64_t imageDigest(const uint8_t *vuCode, uint32_t codeSize);
+     // Entry programs merged per code image (ps2_vu1_core.cpp).
+     struct JitEntryCache;
+     std::shared_ptr<JitEntryCache> m_jitEntryCache;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 697e041..0763e65 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -46,6 +46,9 @@
+ #include <unistd.h>
+ #endif
+ #include <fstream>
++#if defined(__linux__)
++#include <sched.h>
++#endif
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
+@@ -57,6 +60,52 @@
+ #include <sstream>
+ #include "rlgl.h"
+ 
++namespace
++{
++    // On a CPU with cores of different sizes (ARM big.LITTLE, such as the Steam Frame's one Cortex-X4 among A720s
++    // and A520s), the game thread is pinned to the largest cores (kernel cpu_capacity within 5 % of the highest):
++    // the scheduler otherwise moves it among the medium cores, and the emulated machine runs 20-30 % slower there
++    // (measured in a Frame battle, 2026-11-19). Equal cores or no capacity data: nothing changes. GA2_PIN_GAME=0 off.
++    void pinToFastestCores()
++    {
++#if defined(__linux__)
++        if (const char *v = std::getenv("GA2_PIN_GAME"); v && std::strcmp(v, "0") == 0)
++            return;
++        cpu_set_t allowed;
++        CPU_ZERO(&allowed);
++        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
++            return;
++        std::vector<std::pair<int, int>> capacity; // cpu, capacity
++        int best = 0, least = 1 << 30;
++        for (int cpu = 0; cpu < CPU_SETSIZE && cpu < 256; ++cpu)
++        {
++            if (!CPU_ISSET(cpu, &allowed))
++                continue;
++            std::ifstream in("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpu_capacity");
++            int c = 0;
++            if (!(in >> c) || c <= 0)
++                return;
++            capacity.emplace_back(cpu, c);
++            best = std::max(best, c);
++            least = std::min(least, c);
++        }
++        if (capacity.size() < 2 || least * 100 >= best * 95)
++            return;
++        cpu_set_t fast;
++        CPU_ZERO(&fast);
++        std::string list;
++        for (const auto &[cpu, c] : capacity)
++            if (c * 100 >= best * 95)
++            {
++                CPU_SET(cpu, &fast);
++                list += (list.empty() ? "" : ",") + std::to_string(cpu);
++            }
++        if (sched_setaffinity(0, sizeof(fast), &fast) == 0)
++            std::cerr << "[ga2] game thread pinned to the largest cores (" << list << ")" << std::endl;
++#endif
++    }
++}
++
+ namespace ps2_stubs
+ {
+     void resetSifState();
+@@ -3447,6 +3496,7 @@ void PS2Runtime::run()
+     std::thread gameThread([&]()
+                            {
+         ThreadNaming::SetCurrentThreadName("GameThread");
++        pinToFastestCores();
+         try
+         {
+             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 02cb567..ae9d966 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1523,6 +1523,17 @@ VU1Interpreter::StepResult VU1Interpreter::stepGeneric(const StepArgs &args)
+     return stepPair(getDecodedInstructionPairForPc(args.vuCode, args.codeSize, args.memory, m_state.pc), args);
+ }
+ 
++uint64_t VU1Interpreter::imageDigest(const uint8_t *vuCode, uint32_t codeSize)
++{
++    for (const RecentImage &r : m_recentImages)
++        if (r.bytes.size() == codeSize && std::memcmp(r.bytes.data(), vuCode, codeSize) == 0)
++            return r.hash;
++    RecentImage &slot = m_recentImages[m_recentNext++ % m_recentImages.size()];
++    slot.bytes.assign(vuCode, vuCode + codeSize);
++    slot.hash = digestBytes(vuCode, codeSize);
++    return slot.hash;
++}
++
+ VU1Interpreter::JitProgram VU1Interpreter::lookupJitProgram(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory)
+ {
+     static const bool disabled = [] {
+@@ -1540,7 +1551,7 @@ VU1Interpreter::JitProgram VU1Interpreter::lookupJitProgram(const uint8_t *vuCod
+         const char *v = std::getenv("GA2_VU1JIT");
+         return v && std::strcmp(v, "entries") == 0;
+     }();
+-    const uint64_t hash = digestBytes(vuCode, codeSize);
++    const uint64_t hash = imageDigest(vuCode, codeSize);
+     static const std::unordered_map<uint64_t, RegisteredProgram> none;
+     const auto &registry = entriesOnly ? none : jitRegistry();
+     const auto it = registry.find(hash);
+-- 
+2.56.0
+

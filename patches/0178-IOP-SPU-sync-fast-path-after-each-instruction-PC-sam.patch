@@ -1,0 +1,150 @@
+From 23ad21ffe12277e824dbfa26b131c9a14a0f3820 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:59:20 -0600
+Subject: [PATCH] IOP: SPU sync fast path after each instruction, PC sampler
+ (GA2_IOP_PC_SAMPLE)
+
+- synchronizeSpu, called after every interpreted IOP instruction, returns at once while no SPU sample is due (the
+  cached next sample cycle, reset with the SPU and the IOP clock) and no AutoDMA completion is waiting
+  (ga2::spu::autoDmaCompletionPending, the device's completion bits): the full path then neither advances the SPU
+  nor takes a completion, so the result is the same. All IOP suites pass.
+- GA2_IOP_PC_SAMPLE=1: every 1024th interpreted instruction's 64-byte block counted, the hottest logged every 5 s
+  (Eigou 1's opening movie: ~2M IOP instructions/s, about half in STREAM.IRX's tick handler at .text+0x1588c).
+
+Movies on the GPU path: 81-91 % speed -> 85-95 %.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/spu2core/include/ga2/spu_device.h |  8 +++++
+ ps2xIOP/src/emulator/iop_emulator.cpp     | 42 +++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/ps2xIOP/spu2core/include/ga2/spu_device.h b/ps2xIOP/spu2core/include/ga2/spu_device.h
+index fdb6997..064bd84 100644
+--- a/ps2xIOP/spu2core/include/ga2/spu_device.h
++++ b/ps2xIOP/spu2core/include/ga2/spu_device.h
+@@ -5,8 +5,16 @@
+ #include <memory>
+ #include <span>
+ 
++// AutoDMA completions not yet taken (bit per core; spu_device.cpp): set only while the mixer runs (advanceTo) or a
++// register write is handled, cleared by Device::takeAutoDmaCompletions.
++extern std::uint8_t g_adma_completed;
++
+ namespace ga2::spu {
+ 
++// Whether takeAutoDmaCompletions would report anything now (a cheap inline check for the IOP's per-step sync).
++inline bool autoDmaCompletionPending() noexcept { return ::g_adma_completed != 0; }
++
++
+ inline constexpr std::uint32_t kSampleRamWords = 0x100000;
+ inline constexpr std::uint32_t kSampleRamMask = kSampleRamWords - 1;
+ inline constexpr std::uint64_t kIopCyclesPerSample = 768;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 2450bcb..1db1d02 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -19,6 +19,8 @@
+ #include "iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <unordered_map>
+ #include <cctype>
+ #include <map>
+ #include <optional>
+@@ -163,6 +165,7 @@ namespace ps2x::iop::detail
+                     if (!host.resetSpuPcm()) throw std::runtime_error("SPU PCM reset failed");
+                 } catch (...) { markResetRequired(__LINE__); throw; }
+                 spu.reset();
++                spuNextSample = 0;
+                 bindSpuBus();
+             }
+             // CDVD owns a dynamically allocated transfer workspace. Retire it
+@@ -181,6 +184,7 @@ namespace ps2x::iop::detail
+             pendingGuestCallbacks.clear();
+             nextModuleId = 1;
+             totalCycles = 0;
++            spuNextSample = 0;
+             totalInstructions = 0;
+             eeCycleCarry = 0;
+             eeIopClock = 0;
+@@ -297,6 +301,10 @@ namespace ps2x::iop::detail
+         void synchronizeSpu(bool access = false)
+         {
+             if (!access && !spu) return;
++            // Between samples with no AutoDMA completion waiting, the full path below would neither advance the SPU nor
++            // take a completion: return at once (this runs after every interpreted IOP instruction).
++            if (!access && totalCycles < spuNextSample && !ga2::spu::autoDmaCompletionPending() && !resetRequired && !syncingSpu)
++                return;
+             if (resetRequired || syncingSpu)
+             { markResetRequired(__LINE__); throw std::runtime_error("SPU access outside quiescent IOP execution"); }
+             syncingSpu = true;
+@@ -306,6 +314,7 @@ namespace ps2x::iop::detail
+                 if (!spu)
+                 {
+                     spu = std::make_unique<ga2::spu::Device>();
++                    spuNextSample = 0;
+                     memory.setSpuDevice(spu.get());
+                     if (!host.resetSpuPcm()) throw std::runtime_error("SPU owner acquisition PCM drain failed");
+                     if (resetRequired) throw std::runtime_error("SPU owner acquisition callback faulted IOP");
+@@ -331,6 +340,7 @@ namespace ps2x::iop::detail
+                 }
+                 if (access || totalCycles - spu->lastIopCycle() >= ga2::spu::kIopCyclesPerSample)
+                     spu->advanceTo(totalCycles);
++                spuNextSample = spu->lastIopCycle() + ga2::spu::kIopCyclesPerSample;
+                 if (const uint8_t done = spu->takeAutoDmaCompletions())
+                 {
+                     // An AutoDMA block was consumed: end the IOP DMA and raise its interrupt.
+@@ -702,9 +712,40 @@ namespace ps2x::iop::detail
+             schedulePendingDma();
+             ++totalInstructions;
+             advanceIopTime(1u);
++            samplePc(cpu.pc);
+             return running;
+         }
+ 
++        // GA2_IOP_PC_SAMPLE=1 (diagnostics): every 1024th interpreted instruction's address is counted (in 64-byte
++        // blocks) and the hottest blocks are logged every 5 s of host time.
++        void samplePc(uint32_t pc)
++        {
++            static const bool on = [] {
++                const char *v = std::getenv("GA2_IOP_PC_SAMPLE");
++                return v && *v == '1';
++            }();
++            if (!on || (totalInstructions & 1023u) != 0u)
++                return;
++            static std::unordered_map<uint32_t, uint32_t> blocks;
++            static auto last = std::chrono::steady_clock::now();
++            static uint64_t lastInstructions = 0;
++            ++blocks[pc & ~63u];
++            const auto now = std::chrono::steady_clock::now();
++            if (now - last < std::chrono::seconds(5))
++                return;
++            const double seconds = std::chrono::duration<double>(now - last).count();
++            std::vector<std::pair<uint32_t, uint32_t>> top(blocks.begin(), blocks.end());
++            std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++            std::ostringstream out;
++            out << "[IOP pc] " << uint64_t(double(totalInstructions - lastInstructions) / seconds) << " instructions/s; hot:";
++            for (size_t i = 0; i < std::min<size_t>(top.size(), 12u); ++i)
++                out << ' ' << std::hex << top[i].first << std::dec << ':' << top[i].second;
++            log(LogLevel::Info, out.str());
++            blocks.clear();
++            last = now;
++            lastInstructions = totalInstructions;
++        }
++
+         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
+         {
+             CpuState *previous = activeCpu;
+@@ -1494,6 +1535,7 @@ namespace ps2x::iop::detail
+         IopMemory memory;
+         std::unique_ptr<ga2::spu::Device> spu;
+         bool syncingSpu = false;
++        uint64_t spuNextSample = 0; // the IOP cycle of the SPU's next sample (synchronizeSpu's fast path); 0: unknown
+         IopSysmem sysmem;
+         IopKernel kernel;
+         IopCdvd cdvd;
+-- 
+2.56.0
+

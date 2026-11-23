@@ -1,0 +1,174 @@
+From bb091b5a18d89fcc9c9a6a2911eae8d79ab24b15 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:26:02 -0600
+Subject: [PATCH] Frame rate ceiling 500: presets 300, 360 and 480
+
+- The frame rate setting's top is 500 (was 240): presets 300, 360 and 480 join the list, Custom takes 61-500 and
+  Monitor follows displays up to 500 Hz, so fast monitors run the game natively at their own rate.
+- Tests: the new presets, the 500 clamp, a 360 Hz monitor kept at 360 and a 600 Hz one clamped.
+
+Verified: unit tests (the settings suites pass); a desktop run on the GPU path at GA2_FPS=360 on a 360 Hz display:
+the governor climbs to 300 and 360 where there is headroom (370-390 iterations/s) and steps down in heavier scenes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_framepace.h |  4 ++--
+ ps2xRuntime/include/runtime/ga2_options.h   |  8 ++++----
+ ps2xRuntime/src/lib/ga2_framepace.cpp       |  8 ++++----
+ ps2xRuntime/src/lib/ga2_settings.cpp        |  2 +-
+ ps2xTest/src/ga2_settings_tests.cpp         | 16 +++++++++-------
+ 5 files changed, 20 insertions(+), 18 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_framepace.h b/ps2xRuntime/include/runtime/ga2_framepace.h
+index ffc92b2..ecd5b41 100644
+--- a/ps2xRuntime/include/runtime/ga2_framepace.h
++++ b/ps2xRuntime/include/runtime/ga2_framepace.h
+@@ -1,4 +1,4 @@
+-// High frame rate (GA2_FPS=<61..240>) and the frame-timing oracle trace
++// High frame rate (GA2_FPS=<61..500>) and the frame-timing oracle trace
+ // (GA2_FRAMETRACE=<file>); docs/rendering/horplus-and-framerate.md.
+ //
+ // The games run one Update(dt) + Render per loop iteration and wait for the
+@@ -22,7 +22,7 @@ class PS2Runtime;
+ 
+ namespace ga2_framepace
+ {
+-    // The highest rate this run can reach: 240 whenever the hooks can run (the settings menu raises the cap live),
++    // The highest rate this run can reach: 500 whenever the hooks can run (the settings menu raises the cap live),
+     // 0 = native only (VR, software GS; GA2_FPS_LIVE=0 limits it to GA2_FPS as before). Read once.
+     int fps();
+     // GA2_FPS: the cap the run starts with, 61..fps(); 60 = the native cadence (unset, 60, invalid, or "monitor":
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index b55fdd6..f838b2d 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -107,9 +107,9 @@ namespace ga2_options
+              "Monitor follows the screen the window is on; VR uses the headset's rate.",
+              "GA2_FPS", Apply::Live,
+              {{"60", "60 (PS2)"}, {"75", "75"}, {"90", "90"}, {"100", "100"}, {"120", "120"}, {"144", "144"}, {"165", "165"},
+-              {"170", "170"}, {"175", "175"}, {"180", "180"}, {"200", "200"}, {"240", "240"},
+-              {"monitor", "Monitor refresh rate"}, {"custom", "Custom"}},
+-             13, 61, 240, 120},
++              {"170", "170"}, {"175", "175"}, {"180", "180"}, {"200", "200"}, {"240", "240"}, {"300", "300"},
++              {"360", "360"}, {"480", "480"}, {"monitor", "Monitor refresh rate"}, {"custom", "Custom"}},
++             16, 61, 500, 120},
+             {"dither", "PS2 dithering", "The PS2's checkerboard dither when it reduces colours to 16 bits.", "GA2_PGS_DITHER",
+              Apply::Live, {{"0", "Off"}, {"1", "On (original look)"}}},
+             {"deband", "Debanding",
+@@ -278,7 +278,7 @@ namespace ga2_options
+             break;
+         case Fps:
+         {
+-            // GA2_FPS: "monitor", or a rate (the engine rounds it): 60 or less is the PS2 rate, 61..240 a choice or the
++            // GA2_FPS: "monitor", or a rate (the engine rounds it): 60 or less is the PS2 rate, 61..500 a choice or the
+             // custom number, anything else is not a rate (the engine falls back to the PS2 rate).
+             if (text == "monitor")
+                 break;
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+index ee33c52..d45c679 100644
+--- a/ps2xRuntime/src/lib/ga2_framepace.cpp
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -22,7 +22,7 @@ namespace ga2_framepace
+ {
+     namespace
+     {
+-        // GA2_FPS: the frame rate cap the run starts with (61..240), 60 = the native cadence (also unset/invalid).
++        // GA2_FPS: the frame rate cap the run starts with (61..500), 60 = the native cadence (also unset/invalid).
+         // "monitor" (the player's "Monitor refresh rate"): the window's monitor sets the cap, which is known only
+         // once the window exists, so the run starts native and the main loop raises the cap
+         // (ga2_settings_menu::followMonitor).
+@@ -34,9 +34,9 @@ namespace ga2_framepace
+             const int n = int(std::lround(std::atof(v)));
+             if (n == 60 || n == 0)
+                 return 60;
+-            if (n < 61 || n > 240)
++            if (n < 61 || n > 500)
+             {
+-                std::fprintf(stderr, "[ga2 fps] GA2_FPS=%s is outside 60..240; native timing\n", v);
++                std::fprintf(stderr, "[ga2 fps] GA2_FPS=%s is outside 60..500; native timing\n", v);
+                 return 60;
+             }
+             return n;
+@@ -64,7 +64,7 @@ namespace ga2_framepace
+                 return 0;
+             }
+             const char *live = std::getenv("GA2_FPS_LIVE");
+-            const int top = live && std::strcmp(live, "0") == 0 ? (asked > 60 ? asked : 0) : 240;
++            const int top = live && std::strcmp(live, "0") == 0 ? (asked > 60 ? asked : 0) : 500;
+             if (top > 0)
+             {
+                 if (asked > 60)
+diff --git a/ps2xRuntime/src/lib/ga2_settings.cpp b/ps2xRuntime/src/lib/ga2_settings.cpp
+index 8fdbdc3..d42a2df 100644
+--- a/ps2xRuntime/src/lib/ga2_settings.cpp
++++ b/ps2xRuntime/src/lib/ga2_settings.cpp
+@@ -251,7 +251,7 @@ namespace ga2_settings
+         }
+         if (key == ga2_options::Fps)
+         {
+-            // The frame rate hooks run in every run that can use them (ga2_framepace::fps(): up to 240), so the cap
++            // The frame rate hooks run in every run that can use them (ga2_framepace::fps(): up to 500), so the cap
+             // moves live; VR and the software GS keep the PS2 rate (fps() == 0) and GA2_FPS_LIVE=0 limits it to the
+             // rate the run started with.
+             const int wanted = fpsCapFor(choice, customNumber);
+diff --git a/ps2xTest/src/ga2_settings_tests.cpp b/ps2xTest/src/ga2_settings_tests.cpp
+index 26794b1..808efc5 100644
+--- a/ps2xTest/src/ga2_settings_tests.cpp
++++ b/ps2xTest/src/ga2_settings_tests.cpp
+@@ -72,7 +72,7 @@ void register_ga2_settings_tests()
+             t.Equals(choiceFromEnv(Fps, "120"), choiceIndex(Fps, "120"), "a preset's rate is the preset");
+             t.Equals(choiceFromEnv(Fps, "monitor"), choiceIndex(Fps, "monitor"), "monitor");
+             t.Equals(choiceFromEnv(Fps, "30"), 0, "60 or below is the PS2 rate");
+-            t.Equals(choiceFromEnv(Fps, "300"), -1, "above 240 is no rate (the engine falls back to the PS2 rate)");
++            t.Equals(choiceFromEnv(Fps, "600"), -1, "above 500 is no rate (the engine falls back to the PS2 rate)");
+             t.Equals(choiceFromEnv(Fps, "abc"), -1, "text is no rate");
+             t.Equals(choiceFromEnv(Aspect, "bogus"), -1, "unknown text");
+         });
+@@ -81,8 +81,8 @@ void register_ga2_settings_tests()
+             const Option &fps = options()[Fps];
+             t.IsTrue(hasCustom(fps), "the frame rate has an editable number");
+             t.Equals(fps.customMin, 61, "lowest custom rate");
+-            t.Equals(fps.customMax, 240, "highest custom rate");
+-            for (const char *preset : {"60", "75", "90", "100", "120", "144", "165", "170", "175", "180", "200", "240", "monitor"})
++            t.Equals(fps.customMax, 500, "highest custom rate");
++            for (const char *preset : {"60", "75", "90", "100", "120", "144", "165", "170", "175", "180", "200", "240", "300", "360", "480", "monitor"})
+                 t.IsTrue(choiceIndex(Fps, preset) >= 0, std::string("choice ") + preset);
+             // Stored values.
+             int choice = -1, number = 0;
+@@ -94,11 +94,11 @@ void register_ga2_settings_tests()
+             t.IsTrue(parseStored(Fps, "61", choice, number) && number == 61, "lowest");
+             t.IsTrue(parseStored(Fps, "240", choice, number) && choice == choiceIndex(Fps, "240"), "240 is its preset");
+             choice = 7;
+-            for (const char *bad : {"", "custom", "60.5", "-90", "50", "0", "241", "9999", "12345678", "fast", "1e2", " 90"})
++            for (const char *bad : {"", "custom", "60.5", "-90", "50", "0", "501", "9999", "12345678", "fast", "1e2", " 90"})
+                 t.IsFalse(parseStored(Fps, bad, choice, number), std::string("not a frame rate: '") + bad + "'");
+             t.Equals(choice, 7, "a refused value leaves the state alone");
+             t.Equals(storedValue(Fps, fps.customChoice, 173), std::string("173"), "custom stores its number");
+-            t.Equals(storedValue(Fps, fps.customChoice, 500), std::string("240"), "clamped");
++            t.Equals(storedValue(Fps, fps.customChoice, 1000), std::string("500"), "clamped");
+             t.Equals(storedValue(Fps, fps.customChoice, 3), std::string("61"), "clamped up");
+             t.Equals(storedValue(Fps, choiceIndex(Fps, "monitor"), 173), std::string("monitor"), "monitor stores its word");
+             t.Equals(storedValue(Fps, choiceIndex(Fps, "144"), 173), std::string("144"), "a preset stores its value");
+@@ -200,7 +200,7 @@ void register_ga2_settings_tests()
+             // The frame rate: custom numbers, monitor, what is saved.
+             t.Equals(std::string(std::getenv("GA2_FPS") ? std::getenv("GA2_FPS") : ""), std::string("144"), "handed on as GA2_FPS=144");
+             ga2_settings::setCustom(Fps, 1000);
+-            t.Equals(ga2_settings::number(Fps), 240, "custom clamped to the top");
++            t.Equals(ga2_settings::number(Fps), 500, "custom clamped to the top");
+             ga2_settings::setCustom(Fps, 2);
+             t.Equals(ga2_settings::number(Fps), 61, "custom clamped to the bottom");
+             ga2_settings::setCustom(Fps, 173);
+@@ -219,7 +219,9 @@ void register_ga2_settings_tests()
+             ga2_settings::setMonitorRate(144);
+             t.Equals(ga2_settings::fpsCap(), 144, "a 144 Hz monitor");
+             ga2_settings::setMonitorRate(360);
+-            t.Equals(ga2_settings::fpsCap(), 240, "a 360 Hz monitor is clamped to 240");
++            t.Equals(ga2_settings::fpsCap(), 360, "a 360 Hz monitor");
++            ga2_settings::setMonitorRate(600);
++            t.Equals(ga2_settings::fpsCap(), 500, "a 600 Hz monitor is clamped to 500");
+             ga2_settings::set(Fps, options()[Fps].customChoice);
+             t.Equals(ga2_settings::number(Fps), 173, "Custom after monitor keeps the number");
+             ga2_settings::set(Fps, choiceIndex(Fps, "165"));
+-- 
+2.56.0
+

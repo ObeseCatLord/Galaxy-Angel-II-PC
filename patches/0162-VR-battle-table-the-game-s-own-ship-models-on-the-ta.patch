@@ -1,0 +1,701 @@
+From 500708b84e5b79f4997be0fb3354c5dea8f41570 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:57:23 -0600
+Subject: [PATCH 162/171] VR battle table: the game's own ship models on the
+ table (stage identified from the units, models from the disc)
+
+---
+ ps2xRuntime/CMakeLists.txt                    |   1 +
+ ps2xRuntime/include/runtime/ga2_battletable.h |   2 +
+ ps2xRuntime/src/lib/battlevr/bvr_ships.cpp    | 266 ++++++++++++++++++
+ ps2xRuntime/src/lib/battlevr/bvr_ships.h      |  53 ++++
+ ps2xRuntime/src/lib/ga2_vr.cpp                | 248 ++++++++++++++++
+ ps2xTest/src/bvr_assets_tests.cpp             |  26 ++
+ 6 files changed, 596 insertions(+)
+ create mode 100644 ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+ create mode 100644 ps2xRuntime/src/lib/battlevr/bvr_ships.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 08f72f6..e044af8 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -406,6 +406,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ga2_mpv_shader.cpp
+     src/lib/ga2_vr.cpp
+     src/lib/battlevr/bvr_assets.cpp
++    src/lib/battlevr/bvr_ships.cpp
+     src/lib/ga2_vr_platform.cpp
+     src/lib/ga2_cheat_menu.cpp
+     src/lib/ga2_settings.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_battletable.h b/ps2xRuntime/include/runtime/ga2_battletable.h
+index 07df52f..09af54c 100644
+--- a/ps2xRuntime/include/runtime/ga2_battletable.h
++++ b/ps2xRuntime/include/runtime/ga2_battletable.h
+@@ -20,6 +20,8 @@ namespace ga2_battletable
+     struct Unit
+     {
+         float x = 0.0f, z = 0.0f;   // map position (map units)
++        float y = 0.0f;             // height (map units, the game's Y: down)
++        int id = -1;                // the unit's stage section ID (0 the mothership, 1.. angels, 20.. enemies)
+         float sx = 0.0f, sy = 0.0f; // its icon in the 2D layer's 640 x 480 space (centre)
+         bool hovered = false;       // under a hand
+         bool focused = false;       // the game's cursor unit (the one an order goes to)
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+new file mode 100644
+index 0000000..c76a74d
+--- /dev/null
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+@@ -0,0 +1,266 @@
++#include "bvr_ships.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <condition_variable>
++#include <cstdio>
++#include <deque>
++#include <map>
++#include <mutex>
++#include <thread>
++
++namespace bvr_ships
++{
++    size_t Mesh::triangles() const
++    {
++        size_t n = 0;
++        for (const Part &p : parts)
++            n += p.indices.size() / 3;
++        return n;
++    }
++
++    std::shared_ptr<Mesh> buildMesh(const bvr_assets::Archive &archive, const std::vector<bvr_assets::ShipPart> &parts)
++    {
++        auto mesh = std::make_shared<Mesh>();
++        for (int k = 0; k < 3; ++k)
++            mesh->lo[k] = 1e30f, mesh->hi[k] = -1e30f;
++        std::map<std::string, int> textureIndex; // texDir/name -> index
++        for (const bvr_assets::ShipPart &sp : parts)
++        {
++            std::vector<uint8_t> data;
++            bvr_assets::Model model;
++            if (!archive.read(sp.model, data) || !bvr_assets::decodeAxo(data.data(), data.size(), model))
++                continue;
++            for (const bvr_assets::Part &p : model.parts)
++            {
++                float m[12];
++                bvr_assets::frameTransform(model, p.frame, m);
++                Mesh::Part out;
++                if (p.texture >= 0)
++                {
++                    const std::string &name = model.textures[size_t(p.texture)];
++                    const std::string key = sp.texDir + "/" + name;
++                    auto it = textureIndex.find(key);
++                    if (it == textureIndex.end())
++                    {
++                        bvr_assets::Texture tex;
++                        int index = -1;
++                        if (bvr_assets::loadTexture(archive, sp.texDir, name, tex))
++                        {
++                            index = int(mesh->textures.size());
++                            mesh->textures.push_back(std::move(tex));
++                        }
++                        it = textureIndex.emplace(key, index).first;
++                    }
++                    out.texture = it->second;
++                }
++                // Positions into model space; smooth normals from the faces sharing each vertex.
++                std::vector<float> pos(p.vertices.size() * 3), nrm(p.vertices.size() * 3, 0.0f);
++                for (size_t i = 0; i < p.vertices.size(); ++i)
++                {
++                    const float *v = p.vertices[i].pos;
++                    for (int k = 0; k < 3; ++k)
++                    {
++                        pos[3 * i + size_t(k)] = m[3 * k] * v[0] + m[3 * k + 1] * v[1] + m[3 * k + 2] * v[2] + m[9 + k];
++                        if (std::isfinite(pos[3 * i + size_t(k)]))
++                        {
++                            mesh->lo[k] = std::min(mesh->lo[k], pos[3 * i + size_t(k)]);
++                            mesh->hi[k] = std::max(mesh->hi[k], pos[3 * i + size_t(k)]);
++                        }
++                    }
++                }
++                for (size_t t = 0; t + 2 < p.indices.size(); t += 3)
++                {
++                    const uint32_t a = p.indices[t], b = p.indices[t + 1], c = p.indices[t + 2];
++                    const float e1[3] = {pos[3 * b] - pos[3 * a], pos[3 * b + 1] - pos[3 * a + 1], pos[3 * b + 2] - pos[3 * a + 2]};
++                    const float e2[3] = {pos[3 * c] - pos[3 * a], pos[3 * c + 1] - pos[3 * a + 1], pos[3 * c + 2] - pos[3 * a + 2]};
++                    const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
++                    for (uint32_t v : {a, b, c})
++                        for (int k = 0; k < 3; ++k)
++                            nrm[3 * v + size_t(k)] += n[k];
++                }
++                out.vertices.reserve(p.vertices.size() * 12);
++                for (size_t i = 0; i < p.vertices.size(); ++i)
++                {
++                    const uint32_t c = p.vertices[i].rgba;
++                    float n[3] = {nrm[3 * i], nrm[3 * i + 1], nrm[3 * i + 2]};
++                    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
++                    for (float &x : n)
++                        x = len > 1e-12f ? x / len : 0.0f;
++                    out.vertices.insert(out.vertices.end(),
++                                        {pos[3 * i], pos[3 * i + 1], pos[3 * i + 2], p.vertices[i].uv[0], p.vertices[i].uv[1],
++                                         float(c & 0xFFu) / 255.0f, float((c >> 8) & 0xFFu) / 255.0f, float((c >> 16) & 0xFFu) / 255.0f,
++                                         float((c >> 24) & 0xFFu) / 255.0f, n[0], n[1], n[2]});
++                }
++                out.indices = p.indices;
++                mesh->parts.push_back(std::move(out));
++            }
++        }
++        if (mesh->parts.empty())
++            return nullptr;
++        return mesh;
++    }
++
++    int matchStage(const std::vector<bvr_assets::Stage> &stages, const std::vector<SeenUnit> &units)
++    {
++        int best = -1, bestScore = 0;
++        for (size_t s = 0; s < stages.size(); ++s)
++        {
++            int score = 0, known = 0;
++            for (const SeenUnit &u : units)
++            {
++                const bvr_assets::StageUnit *su = stages[s].unit(u.id);
++                if (!su)
++                    continue;
++                ++known;
++                const float dx = u.x - su->start[0], dz = u.z - su->start[2];
++                if (dx * dx + dz * dz < 400.0f * 400.0f)
++                    ++score;
++            }
++            // Every seen unit must exist in the stage; most must stand at their start.
++            if (known == int(units.size()) && score * 2 >= int(units.size()) && score > bestScore)
++                best = int(s), bestScore = score;
++        }
++        return best;
++    }
++
++    namespace
++    {
++        struct Loader
++        {
++            std::mutex mutex;
++            std::condition_variable wake;
++            bvr_assets::Archive archive;
++            std::vector<bvr_assets::Stage> stages;
++            std::atomic<bool> started{false}, isReady{false};
++            int stage = -1;
++            std::map<int, std::shared_ptr<const Mesh>> ships; // by unit ID, for the identified stage
++            std::map<int, bool> requested;
++            std::deque<int> queue;
++            uint64_t generation = 0; // reset() bumps it: work for an old battle is dropped
++        };
++        Loader &loader()
++        {
++            static Loader l;
++            return l;
++        }
++
++        void run()
++        {
++            Loader &l = loader();
++            if (!l.archive.open(bvr_assets::mountedDisc()))
++            {
++                std::fprintf(stderr, "[bvr] cannot read the disc's archives: no ship models\n");
++                return;
++            }
++            std::vector<bvr_assets::Stage> stages;
++            for (const std::string &path : bvr_assets::stagePaths(l.archive))
++            {
++                bvr_assets::Stage st;
++                if (bvr_assets::loadStage(l.archive, path, st))
++                    stages.push_back(std::move(st));
++            }
++            {
++                std::lock_guard<std::mutex> lock(l.mutex);
++                l.stages = std::move(stages);
++            }
++            l.isReady = true;
++            std::fprintf(stderr, "[bvr] %zu battle stages read from the disc\n", l.stages.size());
++            for (;;)
++            {
++                int unitId = -1;
++                std::string table;
++                uint64_t generation = 0;
++                {
++                    std::unique_lock<std::mutex> lock(l.mutex);
++                    l.wake.wait(lock, [&] { return !l.queue.empty(); });
++                    unitId = l.queue.front();
++                    l.queue.pop_front();
++                    if (l.stage < 0)
++                        continue;
++                    if (const bvr_assets::StageUnit *su = l.stages[size_t(l.stage)].unit(unitId))
++                        table = su->modelTable;
++                    generation = l.generation;
++                }
++                std::shared_ptr<const Mesh> mesh;
++                std::vector<bvr_assets::ShipPart> parts;
++                if (!table.empty() && bvr_assets::shipParts(l.archive, table, parts))
++                    mesh = buildMesh(l.archive, parts);
++                std::fprintf(stderr, "[bvr] unit %d: %s -> %zu parts, %zu triangles\n", unitId, table.c_str(), parts.size(),
++                             mesh ? mesh->triangles() : size_t(0));
++                std::lock_guard<std::mutex> lock(l.mutex);
++                if (generation == l.generation)
++                    l.ships[unitId] = mesh;
++            }
++        }
++    }
++
++    void start()
++    {
++        Loader &l = loader();
++        if (!l.started.exchange(true))
++            std::thread(run).detach();
++    }
++
++    bool ready() { return loader().isReady.load(); }
++
++    bool identify(const std::vector<SeenUnit> &units)
++    {
++        Loader &l = loader();
++        if (!l.isReady)
++            return false;
++        std::lock_guard<std::mutex> lock(l.mutex);
++        if (l.stage >= 0)
++            return true;
++        l.stage = matchStage(l.stages, units);
++        if (l.stage >= 0)
++            std::fprintf(stderr, "[bvr] battle stage %s\n", l.stages[size_t(l.stage)].path.c_str());
++        return l.stage >= 0;
++    }
++
++    void reset()
++    {
++        Loader &l = loader();
++        std::lock_guard<std::mutex> lock(l.mutex);
++        l.stage = -1;
++        l.ships.clear();
++        l.requested.clear();
++        l.queue.clear();
++        ++l.generation;
++    }
++
++    std::string stage()
++    {
++        Loader &l = loader();
++        std::lock_guard<std::mutex> lock(l.mutex);
++        return l.stage >= 0 ? l.stages[size_t(l.stage)].path : std::string();
++    }
++
++    float startRotation(int unitId)
++    {
++        Loader &l = loader();
++        std::lock_guard<std::mutex> lock(l.mutex);
++        if (l.stage < 0)
++            return 0.0f;
++        const bvr_assets::StageUnit *su = l.stages[size_t(l.stage)].unit(unitId);
++        return su ? su->startRot : 0.0f;
++    }
++
++    std::shared_ptr<const Mesh> ship(int unitId)
++    {
++        Loader &l = loader();
++        std::lock_guard<std::mutex> lock(l.mutex);
++        if (l.stage < 0)
++            return nullptr;
++        if (const auto it = l.ships.find(unitId); it != l.ships.end())
++            return it->second;
++        if (!l.requested[unitId])
++        {
++            l.requested[unitId] = true;
++            l.queue.push_back(unitId);
++            l.wake.notify_one();
++        }
++        return nullptr;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.h b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+new file mode 100644
+index 0000000..c400639
+--- /dev/null
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+@@ -0,0 +1,53 @@
++// The battle's ships for the VR table: which stage is being played (its units' IDs and start positions against the
++// disc's stage tables) and each unit's model, decoded from the disc on a loader thread (never on the game or VR
++// thread) into meshes ready to upload.
++#pragma once
++
++#include "bvr_assets.h"
++
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace bvr_ships
++{
++    // A ship in model space (game units; X right, Y down, Z forward), its parts' frames applied.
++    struct Mesh
++    {
++        struct Part
++        {
++            std::vector<float> vertices;  // per vertex: x y z, u v, r g b a (0x80 = 1.0 as 0..1 of 255), nx ny nz: 12 floats
++            std::vector<uint32_t> indices;
++            int texture = -1;             // into textures
++        };
++        std::vector<Part> parts;
++        std::vector<bvr_assets::Texture> textures;
++        float lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
++        size_t triangles() const;
++    };
++    // Builds a mesh from decoded models (each with its texture directory); textures are loaded by name.
++    std::shared_ptr<Mesh> buildMesh(const bvr_assets::Archive &archive, const std::vector<bvr_assets::ShipPart> &parts);
++
++    struct SeenUnit
++    {
++        int id;       // the unit's stage section ID (unit type field)
++        float x, z;   // its position (game units)
++    };
++    // The stage whose units start where these units are (call at the battle's start): the index into `stages`
++    // with the most units within tolerance of their START_POS, or -1 when none fits at least half of them.
++    int matchStage(const std::vector<bvr_assets::Stage> &stages, const std::vector<SeenUnit> &units);
++
++    // The loader (one per process; the disc is the mounted one).
++    // Starts indexing the disc and reading every stage table, once.
++    void start();
++    bool ready(); // the stages are read
++    // Identifies the stage from the units (sticks until reset()); true when known.
++    bool identify(const std::vector<SeenUnit> &units);
++    void reset();       // a new battle
++    std::string stage(); // the identified stage's path, or empty
++    // The ship of a unit ID of the identified stage: null while it loads (it is queued on the first call) or when
++    // the unit has no model.
++    std::shared_ptr<const Mesh> ship(int unitId);
++    // A unit's START_ROT in the identified stage (degrees), 0 when unknown.
++    float startRotation(int unitId);
++}
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index aa3ef8d..cc3375f 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -14,6 +14,7 @@
+ #include "runtime/ga2_activity.h"
+ #include "runtime/ga2_framepace.h"
+ #include "runtime/gs/gs_pgs.h"
++#include "battlevr/bvr_ships.h"
+ 
+ #include "raylib.h"
+ #include "rlgl.h"
+@@ -32,6 +33,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <map>
+ #include <mutex>
+ #include <sstream>
+ #include <string>
+@@ -939,6 +941,249 @@ void main()
+         V3 tableHelpPoint(const ga2_battletable::Pose &pose);
+         bool drawTrackedGlove(const M4 &viewProj, V3 eye, int hand, bool owner, float strength); // with the finger tracking below
+ 
++        // ---- the ships (battlevr/bvr_ships.h: the game's own models, read from the player's disc) ----
++        const char *kShipVs = R"(#version 330
++layout(location = 0) in vec3 pos;
++layout(location = 1) in vec2 uv;
++layout(location = 2) in vec4 col;
++layout(location = 3) in vec3 nrm;
++uniform mat4 mvp;
++uniform mat4 model;
++out vec2 v_uv;
++out vec4 v_col;
++out vec3 v_n;
++out vec3 v_w;
++void main()
++{
++    v_uv = uv;
++    v_col = col;
++    v_n = mat3(model) * nrm;
++    v_w = (model * vec4(pos, 1.0)).xyz;
++    gl_Position = mvp * vec4(pos, 1.0);
++})";
++        // The texture times the vertex colour (0x80 = 1.0, as the GS), lit from above, two-sided, with a rim in the
++        // team colour so friend and foe read at a glance.
++        const char *kShipFs = R"(#version 330
++in vec2 v_uv;
++in vec4 v_col;
++in vec3 v_n;
++in vec3 v_w;
++uniform sampler2D tex;
++uniform int textured;
++uniform vec3 eye;
++uniform vec3 tint;
++uniform float rimStrength;
++out vec4 o;
++void main()
++{
++    vec4 t = textured != 0 ? texture(tex, v_uv) : vec4(1.0);
++    if (t.a < 0.2) discard;
++    vec3 base = t.rgb * min(v_col.rgb * (255.0 / 128.0), vec3(2.0));
++    vec3 n = normalize(v_n);
++    vec3 v = normalize(eye - v_w);
++    if (dot(n, v) < 0.0) n = -n;
++    vec3 l = normalize(vec3(0.3, 0.9, 0.35));
++    float diffuse = 0.42 + 0.58 * max(dot(n, l), 0.0);
++    float rim = pow(1.0 - max(dot(n, v), 0.0), 3.0);
++    o = vec4(base * diffuse + tint * rim * rimStrength, 1.0);
++})";
++
++        struct GlShip
++        {
++            std::shared_ptr<const bvr_ships::Mesh> mesh; // kept alive with its GL copy
++            struct Part
++            {
++                GLuint vao = 0, vbo = 0, ibo = 0;
++                GLsizei count = 0;
++                int texture = -1;
++            };
++            std::vector<Part> parts;
++            std::vector<GLuint> textures;
++            float length = 1.0f; // the longest side (game units)
++            float centre[3] = {0, 0, 0};
++        };
++        struct ShipGl
++        {
++            GLuint program = 0;
++            std::map<const bvr_ships::Mesh *, GlShip> ships;
++            struct Heading
++            {
++                float x = 0, z = 0, angle = 0;
++                bool valid = false;
++            };
++            std::map<int, Heading> headings; // by unit ID
++            double lastActive = -1.0;
++            double lastMatchLog = -100.0;
++        } g_shipGl;
++
++        GlShip &glShip(const std::shared_ptr<const bvr_ships::Mesh> &mesh)
++        {
++            auto it = g_shipGl.ships.find(mesh.get());
++            if (it != g_shipGl.ships.end())
++                return it->second;
++            GlShip &g = g_shipGl.ships[mesh.get()];
++            g.mesh = mesh;
++            for (const bvr_assets::Texture &t : mesh->textures)
++            {
++                GLuint id = 0;
++                glGenTextures(1, &id);
++                glBindTexture(GL_TEXTURE_2D, id);
++                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, t.width, t.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, t.rgba.data());
++                glGenerateMipmap(GL_TEXTURE_2D);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
++                g.textures.push_back(id);
++            }
++            for (const bvr_ships::Mesh::Part &p : mesh->parts)
++            {
++                GlShip::Part gp;
++                glGenVertexArrays(1, &gp.vao);
++                glGenBuffers(1, &gp.vbo);
++                glGenBuffers(1, &gp.ibo);
++                glBindVertexArray(gp.vao);
++                glBindBuffer(GL_ARRAY_BUFFER, gp.vbo);
++                glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(p.vertices.size() * sizeof(float)), p.vertices.data(), GL_STATIC_DRAW);
++                const int stride = 12 * int(sizeof(float));
++                const int sizes[4] = {3, 2, 4, 3};
++                size_t offset = 0;
++                for (int a = 0; a < 4; ++a)
++                {
++                    glEnableVertexAttribArray(GLuint(a));
++                    glVertexAttribPointer(GLuint(a), sizes[a], GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void *>(offset * sizeof(float)));
++                    offset += size_t(sizes[a]);
++                }
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gp.ibo);
++                glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(p.indices.size() * sizeof(uint32_t)), p.indices.data(), GL_STATIC_DRAW);
++                glBindVertexArray(0);
++                gp.count = GLsizei(p.indices.size());
++                gp.texture = p.texture;
++                g.parts.push_back(gp);
++            }
++            g.length = std::max({mesh->hi[0] - mesh->lo[0], mesh->hi[1] - mesh->lo[1], mesh->hi[2] - mesh->lo[2], 1e-3f});
++            for (int k = 0; k < 3; ++k)
++                g.centre[k] = 0.5f * (mesh->lo[k] + mesh->hi[k]);
++            return g;
++        }
++
++        // The ships of the units on the plate, each the game's own model, standing over its unit and turned the way
++        // it moves (its stage start heading until it does). Shown at a readable size, not the map's scale: an angel
++        // about 4.5 cm long, bigger ships larger by the square root of their length.
++        void drawShips(const M4 &viewProj, V3 eye, const ga2_battletable::State &st, const ga2_battletable::Pose &pose,
++                       float time)
++        {
++            static const bool on = [] {
++                const char *v = std::getenv("GA2_BVR_SHIPS");
++                return !(v && std::string(v) == "0");
++            }();
++            if (!on)
++                return;
++            bvr_ships::start();
++            if (g_shipGl.lastActive >= 0.0 && time - g_shipGl.lastActive > 1.0)
++            {
++                bvr_ships::reset(); // the table was away: a new battle
++                g_shipGl.headings.clear();
++            }
++            g_shipGl.lastActive = time;
++            if (bvr_ships::stage().empty())
++            {
++                std::vector<bvr_ships::SeenUnit> seen;
++                for (int n = 0; n < st.unitCount; ++n)
++                    seen.push_back({st.units[n].id, st.units[n].x * 1000.0f, st.units[n].z * 1000.0f});
++                if (!bvr_ships::identify(seen) && bvr_ships::ready() && time - g_shipGl.lastMatchLog > 5.0)
++                {
++                    g_shipGl.lastMatchLog = time;
++                    std::string line;
++                    for (const auto &u : seen)
++                        line += " " + std::to_string(u.id) + "@" + std::to_string(int(u.x)) + "," + std::to_string(int(u.z));
++                    std::fprintf(stderr, "[bvr] no stage matches the units:%s\n", line.c_str());
++                }
++                return;
++            }
++            if (!g_shipGl.program)
++                g_shipGl.program = compile(kShipVs, kShipFs, "ship");
++            const GLuint prog = g_shipGl.program;
++            glUseProgram(prog);
++            const GLint locMvp = glGetUniformLocation(prog, "mvp"), locModel = glGetUniformLocation(prog, "model");
++            const GLint locTextured = glGetUniformLocation(prog, "textured"), locTint = glGetUniformLocation(prog, "tint");
++            glUniform1i(glGetUniformLocation(prog, "tex"), 0);
++            glUniform3f(glGetUniformLocation(prog, "eye"), eye.x, eye.y, eye.z);
++            glUniform1f(glGetUniformLocation(prog, "rimStrength"), 0.9f);
++            glDisable(GL_BLEND);
++            glEnable(GL_DEPTH_TEST);
++            glDepthFunc(GL_LESS);
++            glDepthMask(GL_TRUE);
++            glDisable(GL_CULL_FACE);
++            glActiveTexture(GL_TEXTURE0);
++            for (int n = 0; n < st.unitCount; ++n)
++            {
++                const ga2_battletable::Unit &unit = st.units[n];
++                if (!unit.onPlate)
++                    continue;
++                const std::shared_ptr<const bvr_ships::Mesh> mesh = bvr_ships::ship(unit.id);
++                if (!mesh)
++                    continue;
++                GlShip &ship = glShip(mesh);
++                // Heading: the direction it moves in (map x, z), smoothed; at first its START_ROT.
++                ShipGl::Heading &h = g_shipGl.headings[unit.id];
++                if (!h.valid)
++                {
++                    h = ShipGl::Heading{unit.x, unit.z, bvr_ships::startRotation(unit.id) * 0.01745329f, true};
++                }
++                else
++                {
++                    const float dx = unit.x - h.x, dz = unit.z - h.z;
++                    if (dx * dx + dz * dz > 0.002f * 0.002f)
++                    {
++                        const float target = std::atan2(dx, dz);
++                        float d = target - h.angle;
++                        while (d > 3.14159265f)
++                            d -= 6.2831853f;
++                        while (d < -3.14159265f)
++                            d += 6.2831853f;
++                        h.angle += d * 0.15f;
++                        h.x = unit.x, h.z = unit.z;
++                    }
++                }
++                // The heading's direction on the table (the map is turned and scaled on it).
++                float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
++                ga2_battletable::mapToTable(st, unit.x, unit.z, u0, v0);
++                ga2_battletable::mapToTable(st, unit.x + std::sin(h.angle), unit.z + std::cos(h.angle), u1, v1);
++                const float lift = unit.hovered ? 0.03f : 0.024f;
++                const V3 base = playPoint(pose, u0, v0, lift);
++                V3 f = playPoint(pose, u1, v1, lift) - base;
++                const V3 up = normalize(playPoint(pose, u0, v0, lift + 0.01f) - base);
++                f = normalize(f - up * dot(f, up));
++                const V3 r = cross(f, up);
++                const float size = 0.045f * std::clamp(std::sqrt(ship.length / 38.0f), 0.8f, 2.4f);
++                const float k = size / ship.length;
++                // Game model axes: X right, Y down, Z forward -> r, -up, f; centred on its bounds.
++                M4 model;
++                model.m[0] = r.x * k, model.m[1] = r.y * k, model.m[2] = r.z * k;
++                model.m[4] = -up.x * k, model.m[5] = -up.y * k, model.m[6] = -up.z * k;
++                model.m[8] = f.x * k, model.m[9] = f.y * k, model.m[10] = f.z * k;
++                const V3 c = r * (ship.centre[0] * k) - up * (ship.centre[1] * k) + f * (ship.centre[2] * k);
++                model.m[12] = base.x - c.x, model.m[13] = base.y - c.y, model.m[14] = base.z - c.z;
++                glUniformMatrix4fv(locModel, 1, GL_FALSE, model.m);
++                const M4 mvp = mul(viewProj, model);
++                glUniformMatrix4fv(locMvp, 1, GL_FALSE, mvp.m);
++                const V3 tint = unit.selected ? V3{1.0f, 0.78f, 0.25f} : unit.enemy ? V3{1.0f, 0.35f, 0.2f} : V3{0.3f, 0.7f, 1.0f};
++                glUniform3f(locTint, tint.x, tint.y, tint.z);
++                for (const GlShip::Part &p : ship.parts)
++                {
++                    const bool textured = p.texture >= 0 && size_t(p.texture) < ship.textures.size();
++                    glUniform1i(locTextured, textured ? 1 : 0);
++                    glBindTexture(GL_TEXTURE_2D, textured ? ship.textures[size_t(p.texture)] : 0);
++                    glBindVertexArray(p.vao);
++                    glDrawElements(GL_TRIANGLES, p.count, GL_UNSIGNED_INT, nullptr);
++                }
++            }
++            glBindVertexArray(0);
++            glDepthMask(GL_FALSE);
++            glEnable(GL_BLEND);
++        }
++
+         void drawTable(const M4 &viewProj, V3 eye, GLuint picture, float extentX, float extentY, bool wide, float time)
+         {
+             initTableGl();
+@@ -985,6 +1230,9 @@ void main()
+             drawArrays(g_tableGl.vao7, g_tableGl.vbo7, mesh, 7);
+             drawHudPanels(viewProj, eye, picture, extentX, extentY, st, pose);
+ 
++            drawShips(viewProj, eye, st, pose, time);
++            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++
+             // The units: a ring on the table, a stalk and the icon as a disc over it (facing the player).
+             glBlendFunc(GL_ONE, GL_ONE);
+             for (int n = 0; n < st.unitCount; ++n)
+diff --git a/ps2xTest/src/bvr_assets_tests.cpp b/ps2xTest/src/bvr_assets_tests.cpp
+index b9c653f..406cf07 100644
+--- a/ps2xTest/src/bvr_assets_tests.cpp
++++ b/ps2xTest/src/bvr_assets_tests.cpp
+@@ -1,7 +1,9 @@
+ #include "MiniTest.h"
+ 
+ #include "battlevr/bvr_assets.h"
++#include "battlevr/bvr_ships.h"
+ 
++#include <array>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdlib>
+@@ -66,6 +68,30 @@ void register_bvr_assets_tests()
+             t.Equals(tex.rgba[2], 0x00000000u, "transparent");
+         });
+ 
++        tc.Run("the stage is the one whose units start where they are", [](TestCase &t) {
++            auto stage = [](const char *path, std::vector<std::array<float, 3>> units) {
++                bvr_assets::Stage s;
++                s.path = path;
++                for (const auto &u : units)
++                {
++                    bvr_assets::StageUnit su;
++                    su.id = int(u[0]);
++                    su.start[0] = u[1], su.start[2] = u[2];
++                    s.units.push_back(su);
++                }
++                return s;
++            };
++            const std::vector<bvr_assets::Stage> stages = {
++                stage("a", {{0, 0, -1000}, {1, 1000, -3000}, {20, 1000, 3000}}),
++                stage("b", {{0, 0, -1000}, {1, -2000, -3000}, {20, 1000, 3000}}),
++                stage("c", {{0, 0, 0}, {1, 1000, -3000}}),
++            };
++            t.Equals(bvr_ships::matchStage(stages, {{0, 10, -990}, {1, 1050, -2950}, {20, 980, 3010}}), 0, "all three at their starts: a");
++            t.Equals(bvr_ships::matchStage(stages, {{0, 0, -1000}, {1, -2000, -3000}, {20, 1000, 3000}}), 1, "the angel elsewhere: b");
++            t.Equals(bvr_ships::matchStage(stages, {{0, 0, -1000}, {1, 1000, -3000}, {25, 0, 0}}), -1, "a unit no stage has: none");
++            t.Equals(bvr_ships::matchStage(stages, {{0, 5000, 5000}, {1, 9000, 9000}}), -1, "nobody at a start: none");
++        });
++
+         // GA2_TEST_ISO=<Eigou disc 1 image>: the ship models and their textures match the Python decoder
+         // (tools/assets/extract_skybox.py), numbers taken from it on 2026-11-19.
+         tc.Run("disc models match the Python decoder (GA2_TEST_ISO)", [](TestCase &t) {
+-- 
+2.56.0
+

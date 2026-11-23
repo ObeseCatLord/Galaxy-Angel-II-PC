@@ -411,7 +411,9 @@ namespace ga2
             // Keep the unreadable file for inspection and start empty.
             in.close();
             std::error_code ignored;
-            std::filesystem::rename(path, path.string() + ".bad", ignored);
+            std::filesystem::path bad = path;
+            bad += ".bad";
+            std::filesystem::rename(path, bad, ignored);
             m_discs.clear();
         }
     }
@@ -456,7 +458,7 @@ namespace ga2
         const auto image = std::filesystem::absolute(imagePath).lexically_normal();
         Iso9660 iso(image);
         const IsoFile *cnf = iso.find("/SYSTEM.CNF");
-        if (!cnf) throw std::runtime_error(image.filename().string() + " is not a PS2 game disc (no SYSTEM.CNF)");
+        if (!cnf) throw std::runtime_error(pathUtf8(image.filename()) + " is not a PS2 game disc (no SYSTEM.CNF)");
         const std::string bootPath = bootPathFromSystemCnf(iso.read(*cnf, 64u << 10));
         const IsoFile *boot = iso.find(bootPath);
         if (!boot) throw std::runtime_error("the disc's program " + bootPath + " is missing");
@@ -466,7 +468,7 @@ namespace ga2
         for (const auto &candidate : knownDiscs())
             if (equalFolded(bootPath, candidate.bootPath) && elfDigest == candidate.elfSha256) known = &candidate;
         if (!known)
-            throw std::runtime_error(image.filename().string() + " (" + bootPath.substr(1) +
+            throw std::runtime_error(pathUtf8(image.filename()) + " (" + bootPath.substr(1) +
                                      ") is not a supported Galaxy Angel II disc");
 
         if (progress)

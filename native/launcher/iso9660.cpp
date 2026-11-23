@@ -48,10 +48,10 @@ namespace ga2
         return total;
     }
 
-    Iso9660::Iso9660(const std::filesystem::path &image) : m_stream(image, std::ios::binary)
+    Iso9660::Iso9660(const std::filesystem::path &image)
     {
-        if (!m_stream) throw IsoError("cannot open " + image.string());
-        m_size = std::filesystem::file_size(image);
+        if (!m_file.open(image)) throw IsoError("cannot open " + image.string());
+        m_size = m_file.size();
         if (m_size == 0u || m_size % kSector != 0u)
             throw IsoError("image size is not a whole number of 2048-byte sectors (not a plain ISO dump?)");
         for (uint32_t n = 0u; n < 100u; ++n)
@@ -85,9 +85,7 @@ namespace ga2
     {
         if (offset > m_size || count > m_size - offset) throw IsoError("read outside the disc image");
         std::vector<uint8_t> data(count);
-        m_stream.seekg(static_cast<std::streamoff>(offset));
-        m_stream.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(count));
-        if (!m_stream) throw IsoError("disc image ended during a read");
+        if (!m_file.readAt(offset, data.data(), static_cast<size_t>(count))) throw IsoError("disc image ended during a read");
         return data;
     }
 

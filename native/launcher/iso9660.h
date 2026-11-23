@@ -5,7 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
+#include "runtime/ga2_fileread.h"
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -50,7 +50,7 @@ namespace ga2
         std::vector<uint8_t> readAt(uint64_t offset, uint64_t count);
         void walk(const IsoFile &directory, const std::string &parent, int depth);
 
-        std::ifstream m_stream;
+        ga2_fileread::File m_file; // positional 64-bit reads (std::ifstream stops at 2 GiB on Windows)
         uint64_t m_size = 0u;
         uint32_t m_volumeSpace = 0u;
         IsoFile m_root;

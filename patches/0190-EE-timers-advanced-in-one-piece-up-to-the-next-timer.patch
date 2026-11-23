@@ -1,0 +1,435 @@
+From ddd22ece3bf21a1fea9808f9a9eae79dacec7bd5 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:02:24 -0600
+Subject: [PATCH 190/191] EE timers: advanced in one piece up to the next timer
+ interrupt; GIF_STAT slot looked up once
+
+PS2Memory::advanceEeTimers runs at every branch the EE takes. Each call looked GIF_STAT up in the register hash map
+and did two 64-bit multiply-divides per running timer: 7-9 % of the game thread in a movie on a Steam Deck
+(measured; nearly all of it the timer arithmetic).
+
+- GIF_STAT's slot in m_ioRegisters is remembered (dropped when the map is cleared or its owner destroyed).
+- Timer deferral: a timer's count is a pure function of the cycles since it was last written, so calls are summed
+  and applied in one piece when the sum reaches the first cycle at which a timer interrupt is raised (the exact
+  horizon cyclesUntilNextEeTimerInterrupt already computes for the idle wait), and before any timer register is read
+  or written. The interrupt is raised by the same call as before.
+- GA2_EE_TIMER_DEFER=0 turns it off; =check advances a shadow copy call by call and aborts if the timers ever differ
+  from it, or if an interrupt was due inside a horizon.
+
+The state lives in ps2_memory.cpp (keyed by its PS2Memory), not in the class: ps2_memory.h is precompiled into the
+game code and stays untouched.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_memory.cpp | 332 +++++++++++++++++++++--------
+ 1 file changed, 239 insertions(+), 93 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index c0185b3..c1e40f6 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -166,6 +166,12 @@ namespace
+     constexpr uint32_t kEeTimerModeOvfe = 1u << 9;
+     constexpr uint32_t kEeTimerModeEquf = 1u << 10;
+     constexpr uint32_t kEeTimerModeOvff = 1u << 11;
++    // GIF_STAT's slot in the m_ioRegisters of one PS2Memory (the one that advanced its timers last), so
++    // advanceEeTimers does not look it up at every branch the EE takes. Kept here instead of in the class so the header
++    // the game code precompiles is untouched. An unordered_map's values keep their address until the map is cleared
++    // or destroyed; both drop the slot.
++    const PS2Memory *g_gifStatOwner = nullptr;
++    uint32_t *g_gifStatSlot = nullptr;
+     constexpr uint64_t kEeClockHz = 294912000ull;
+     constexpr std::array<uint64_t, 4> kEeTimerClockHz = {
+         147456000ull,
+@@ -245,6 +251,182 @@ static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y,
+ }
+ 
+ 
++namespace
++{
++    // The four timers over `eeCycles` (PS2Memory::m_eeTimers; a template because the timer type is private to the
++    // class and this lives outside it, see g_eeTimerDeferral). Returns the timers whose interrupt was raised.
++    template <class Timers>
++    uint32_t advanceEeTimerArray(Timers &timers, uint64_t eeCycles) noexcept
++    {
++    uint32_t interruptMask = 0u;
++    for (size_t index = 0; index < timers.size(); ++index)
++    {
++        auto &timer = timers[index];
++        if ((timer.mode & kEeTimerModeCue) == 0u)
++        {
++            continue;
++        }
++
++        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
++        const uint64_t wholeSeconds = eeCycles / kEeClockHz;
++        const uint64_t remainingCycles = eeCycles % kEeClockHz;
++        const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
++        const uint64_t ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
++        timer.clockRemainder = scaled % kEeClockHz;
++        if (ticks == 0u)
++        {
++            continue;
++        }
++
++        const uint32_t oldCount = timer.count & 0xFFFFu;
++        const uint32_t compare = timer.compare & 0xFFFFu;
++        const uint64_t compareDistance = ticksUntilMatch(oldCount, compare);
++        const uint64_t overflowDistance = 0x10000ull - oldCount;
++        const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
++        const bool compareReached = ticks >= compareDistance;
++        bool overflowReached = false;
++
++        if (zeroReturn)
++        {
++            overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
++            if (compareReached)
++            {
++                const uint64_t remaining = ticks - compareDistance;
++                timer.count = compare == 0u
++                                  ? static_cast<uint32_t>(remaining & 0xFFFFu)
++                                  : static_cast<uint32_t>(remaining % compare);
++            }
++            else
++            {
++                timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
++            }
++        }
++        else
++        {
++            overflowReached = ticks >= overflowDistance;
++            timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
++        }
++
++        if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
++        {
++            timer.mode |= kEeTimerModeEquf;
++            interruptMask |= 1u << index;
++        }
++        if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
++        {
++            timer.mode |= kEeTimerModeOvff;
++            interruptMask |= 1u << index;
++        }
++    }
++    return interruptMask;
++}
++
++    // EE cycles until the first timer interrupt (compare or overflow, enabled and not already flagged); max: none.
++    // Exact: the smallest advance whose tick count reaches the event.
++    template <class Timers>
++    uint64_t eeTimerInterruptHorizon(const Timers &timers) noexcept
++    {
++    uint64_t nearest = std::numeric_limits<uint64_t>::max();
++    for (const auto &timer : timers)
++    {
++        if ((timer.mode & kEeTimerModeCue) == 0u)
++        {
++            continue;
++        }
++
++        const uint32_t count = timer.count & 0xFFFFu;
++        const uint32_t compare = timer.compare & 0xFFFFu;
++        const uint64_t compareDistance = ticksUntilMatch(count, compare);
++        const uint64_t overflowDistance = 0x10000ull - count;
++        uint64_t eventTicks = std::numeric_limits<uint64_t>::max();
++
++        if ((timer.mode & kEeTimerModeCmpe) != 0u &&
++            (timer.mode & kEeTimerModeEquf) == 0u)
++        {
++            eventTicks = compareDistance;
++        }
++        const bool overflowCanOccur = (timer.mode & kEeTimerModeZret) == 0u ||
++                                      overflowDistance <= compareDistance;
++        if (overflowCanOccur &&
++            (timer.mode & kEeTimerModeOvfe) != 0u &&
++            (timer.mode & kEeTimerModeOvff) == 0u)
++        {
++            eventTicks = std::min(eventTicks, overflowDistance);
++        }
++        if (eventTicks == std::numeric_limits<uint64_t>::max())
++        {
++            continue;
++        }
++
++        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
++        const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
++        const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
++        nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
++    }
++    return nearest;
++}
++
++    // Timer deferral (GA2_EE_TIMER_DEFER=0: off; =check: a shadow copy is advanced call by call and compared).
++    // advanceEeTimers runs at every branch the EE takes (8 or 32 cycles at a time) and each running timer costs two
++    // 64-bit multiply-divides per call. A timer's count is a pure function of the cycles since it was last written,
++    // so the calls are summed and applied in one piece: when the sum reaches the first cycle at which a timer
++    // interrupt is raised (the same call that raised it before), and before any timer register is read or written.
++    // State of one PS2Memory, kept here so the header the game code precompiles is untouched.
++    struct EeTimerDeferral
++    {
++        const PS2Memory *owner = nullptr;
++        uint64_t deferred = 0; // cycles counted but not applied
++        uint64_t quiet = 0;    // further cycles that may be counted before a timer interrupt is due
++        unsigned char shadow[128] = {}; // check mode: the timers advanced call by call
++        bool shadowValid = false;
++    };
++    EeTimerDeferral g_eeTimerDeferral;
++
++    enum class EeTimerDeferMode { Off, On, Check };
++    EeTimerDeferMode eeTimerDeferMode() noexcept
++    {
++        static const EeTimerDeferMode mode = [] {
++            const char *v = std::getenv("GA2_EE_TIMER_DEFER");
++            if (!v || !*v) return EeTimerDeferMode::On;
++            if (std::strcmp(v, "check") == 0) return EeTimerDeferMode::Check;
++            return *v == '0' ? EeTimerDeferMode::Off : EeTimerDeferMode::On;
++        }();
++        return mode;
++    }
++
++    // Applies the deferred cycles of `timers` (the timers of `self`) and ends the deferral. By construction no
++    // interrupt is due inside the deferred span; one that were would be a bug and is reported.
++    template <class Timers>
++    void settleEeTimerDeferral(const PS2Memory *self, Timers &timers) noexcept
++    {
++        EeTimerDeferral &d = g_eeTimerDeferral;
++        if (d.owner != self)
++            return;
++        d.quiet = 0;
++        if (d.deferred == 0u)
++            return;
++        const uint64_t pending = d.deferred;
++        d.deferred = 0;
++        const uint32_t raised = advanceEeTimerArray(timers, pending);
++        if (raised != 0u)
++        {
++            std::fprintf(stderr, "[ee timers] deferral applied %llu cycles and raised interrupts 0x%x inside its horizon\n",
++                         static_cast<unsigned long long>(pending), raised);
++            std::abort();
++        }
++        if (d.shadowValid)
++        {
++            static_assert(sizeof(Timers) <= sizeof(d.shadow));
++            if (std::memcmp(d.shadow, &timers, sizeof(Timers)) != 0)
++            {
++                std::fprintf(stderr, "[ee timers] deferral check failed: %llu cycles in one piece differ from the same cycles call by call\n",
++                             static_cast<unsigned long long>(pending));
++                std::abort();
++            }
++        }
++    }
++}
++
+ PS2Memory::PS2Memory()
+     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr),
+       m_ipu(std::make_unique<IpuDevice>())
+@@ -261,6 +443,10 @@ PS2Memory::PS2Memory()
+ 
+ PS2Memory::~PS2Memory()
+ {
++    if (g_eeTimerDeferral.owner == this)
++        g_eeTimerDeferral = {};
++    if (g_gifStatOwner == this)
++        g_gifStatOwner = nullptr;
+     ps2Vif1ForgetPath2Decoder(this);
+     if (m_rdram)
+     {
+@@ -377,6 +563,8 @@ bool PS2Memory::initialize(size_t ramSize)
+ 
+         // Initialize I/O registers
+         m_ioRegisters.clear();
++        if (g_gifStatOwner == this)
++            g_gifStatOwner = nullptr;
+ 
+         // Initialize GS registers
+         memset(&gs_regs, 0, sizeof(gs_regs));
+@@ -424,6 +612,8 @@ bool PS2Memory::initialize(size_t ramSize)
+ 
+ void PS2Memory::resetEeTimers() noexcept
+ {
++    if (g_eeTimerDeferral.owner == this)
++        g_eeTimerDeferral = {};
+     m_eeTimers = {};
+ }
+ 
+@@ -436,113 +626,67 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+ 
+     constexpr uint32_t kGifStat = 0x10003020u;
+     constexpr uint32_t kGifFqcMask = 0x1F000000u;
+-    auto gifStatIt = m_ioRegisters.find(kGifStat);
+-    if (gifStatIt != m_ioRegisters.end())
+-        gifStatIt->second &= ~kGifFqcMask;
+-
+-    uint32_t interruptMask = 0u;
+-    for (size_t index = 0; index < m_eeTimers.size(); ++index)
++    // The register's slot is looked up once: this runs at every branch the EE takes. (unordered_map values keep
++    // their address until the map is cleared, which drops the cached slot.)
++    if (g_gifStatOwner != this)
+     {
+-        EeTimer &timer = m_eeTimers[index];
+-        if ((timer.mode & kEeTimerModeCue) == 0u)
+-        {
+-            continue;
+-        }
+-
+-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+-        const uint64_t wholeSeconds = eeCycles / kEeClockHz;
+-        const uint64_t remainingCycles = eeCycles % kEeClockHz;
+-        const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
+-        const uint64_t ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
+-        timer.clockRemainder = scaled % kEeClockHz;
+-        if (ticks == 0u)
++        auto gifStatIt = m_ioRegisters.find(kGifStat);
++        if (gifStatIt != m_ioRegisters.end())
+         {
+-            continue;
++            g_gifStatOwner = this;
++            g_gifStatSlot = &gifStatIt->second;
++            *g_gifStatSlot &= ~kGifFqcMask;
+         }
++    }
++    else
++        *g_gifStatSlot &= ~kGifFqcMask;
+ 
+-        const uint32_t oldCount = timer.count & 0xFFFFu;
+-        const uint32_t compare = timer.compare & 0xFFFFu;
+-        const uint64_t compareDistance = ticksUntilMatch(oldCount, compare);
+-        const uint64_t overflowDistance = 0x10000ull - oldCount;
+-        const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
+-        const bool compareReached = ticks >= compareDistance;
+-        bool overflowReached = false;
+-
+-        if (zeroReturn)
++    EeTimerDeferral &d = g_eeTimerDeferral;
++    const EeTimerDeferMode mode = eeTimerDeferMode();
++    if (mode == EeTimerDeferMode::Off)
++        return advanceEeTimerArray(m_eeTimers, eeCycles);
++    if (d.owner == this)
++    {
++        if (eeCycles < d.quiet)
+         {
+-            overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
+-            if (compareReached)
++            d.quiet -= eeCycles;
++            d.deferred += eeCycles;
++            if (mode == EeTimerDeferMode::Check)
+             {
+-                const uint64_t remaining = ticks - compareDistance;
+-                timer.count = compare == 0u
+-                                  ? static_cast<uint32_t>(remaining & 0xFFFFu)
+-                                  : static_cast<uint32_t>(remaining % compare);
+-            }
+-            else
+-            {
+-                timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
++                decltype(m_eeTimers) shadow;
++                std::memcpy(&shadow, d.shadowValid ? static_cast<const void *>(d.shadow) : static_cast<const void *>(&m_eeTimers), sizeof(shadow));
++                if (advanceEeTimerArray(shadow, eeCycles) != 0u)
++                {
++                    std::fprintf(stderr, "[ee timers] deferral check failed: an interrupt was due inside the horizon\n");
++                    std::abort();
++                }
++                std::memcpy(d.shadow, &shadow, sizeof(shadow));
++                d.shadowValid = true;
+             }
++            return 0u;
+         }
+-        else
+-        {
+-            overflowReached = ticks >= overflowDistance;
+-            timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+-        }
+-
+-        if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
+-        {
+-            timer.mode |= kEeTimerModeEquf;
+-            interruptMask |= 1u << index;
+-        }
+-        if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
+-        {
+-            timer.mode |= kEeTimerModeOvff;
+-            interruptMask |= 1u << index;
+-        }
++        // This call reaches the horizon (or there is none): the deferred cycles first, then this call's own, so an
++        // interrupt is raised by the same call as before and the count is the same.
++        settleEeTimerDeferral(this, m_eeTimers);
++    }
++    else if (d.owner != nullptr)
++    {
++        // Another PS2Memory (tests build several): its deferral cannot be applied from here, so none is kept across
++        // instances. Whoever defers settles before anyone else advances.
++        return advanceEeTimerArray(m_eeTimers, eeCycles);
+     }
++    const uint32_t interruptMask = advanceEeTimerArray(m_eeTimers, eeCycles);
++    d.owner = this;
++    d.deferred = 0;
++    d.shadowValid = false;
++    d.quiet = interruptMask != 0u ? 0u : eeTimerInterruptHorizon(m_eeTimers);
+     return interruptMask;
+ }
+ 
+ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+ {
+-    uint64_t nearest = std::numeric_limits<uint64_t>::max();
+-    for (const EeTimer &timer : m_eeTimers)
+-    {
+-        if ((timer.mode & kEeTimerModeCue) == 0u)
+-        {
+-            continue;
+-        }
+-
+-        const uint32_t count = timer.count & 0xFFFFu;
+-        const uint32_t compare = timer.compare & 0xFFFFu;
+-        const uint64_t compareDistance = ticksUntilMatch(count, compare);
+-        const uint64_t overflowDistance = 0x10000ull - count;
+-        uint64_t eventTicks = std::numeric_limits<uint64_t>::max();
+-
+-        if ((timer.mode & kEeTimerModeCmpe) != 0u &&
+-            (timer.mode & kEeTimerModeEquf) == 0u)
+-        {
+-            eventTicks = compareDistance;
+-        }
+-        const bool overflowCanOccur = (timer.mode & kEeTimerModeZret) == 0u ||
+-                                      overflowDistance <= compareDistance;
+-        if (overflowCanOccur &&
+-            (timer.mode & kEeTimerModeOvfe) != 0u &&
+-            (timer.mode & kEeTimerModeOvff) == 0u)
+-        {
+-            eventTicks = std::min(eventTicks, overflowDistance);
+-        }
+-        if (eventTicks == std::numeric_limits<uint64_t>::max())
+-        {
+-            continue;
+-        }
+-
+-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+-        const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
+-        const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
+-        nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+-    }
+-    return nearest;
++    settleEeTimerDeferral(this, const_cast<PS2Memory *>(this)->m_eeTimers);
++    return eeTimerInterruptHorizon(m_eeTimers);
+ }
+ 
+ bool PS2Memory::isScratchpad(uint32_t address) const
+@@ -1205,6 +1349,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        settleEeTimerDeferral(this, m_eeTimers); // the write sees, and starts from, the count as of now
+         EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+@@ -3099,6 +3244,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        settleEeTimerDeferral(this, m_eeTimers);
+         const EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+-- 
+2.56.0
+

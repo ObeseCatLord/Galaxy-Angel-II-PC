@@ -1,0 +1,261 @@
+From ccd33352ed3d85f64f2df978b3c769d812932290 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 02:21:56 -0600
+Subject: [PATCH] Hacks: full_color_scanout (show the 32-bit frame a plain
+ 16-bit copy came from)
+
+The GA2 discs render into a 32-bit target and copy it into a 16-bit scanout buffer with sprites (dithered on the
+PS2), so every gradient shows 5-bit bands. With the hack, the first sprite of such a copy snapshots the target as
+the copy reads it (scan_out_buffer, resized to the scanout's lines: the copy squeezes 480 lines into 448), and the
+vsync shows that snapshot while every enabled read circuit shows the copied buffer. A copy that is not plain (not
+a sprite, blended, tinted) or anything drawn on the buffer after the copy keeps the normal scanout. GS memory and
+the copy are unchanged. consume_full_color_shown() counts the vsyncs that used it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gs/gs_interface.cpp | 102 ++++++++++++++++++++++++++++++++++++++++++++
+ gs/gs_interface.hpp |  17 ++++++++
+ gs/gs_renderer.cpp  |  33 +++++++++++++-
+ gs/gs_renderer.hpp  |   3 +-
+ 4 files changed, 153 insertions(+), 2 deletions(-)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index f05b686..a9f9775 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -3115,8 +3115,80 @@ void GSInterface::ui_scanout_blit(uint32_t tbp, uint32_t tbw, uint32_t tpsm, int
+ 	}
+ }
+ 
++// [ga2] Hacks::full_color_scanout: watches each primitive for the game's frame copy (see the hack).
++void GSInterface::full_color_observe(unsigned nv)
++{
++	const auto &prim = registers.prim.desc;
++	const auto &ctx = registers.ctx[prim.CTXT];
++	const uint32_t fpsm = uint32_t(ctx.frame.desc.PSM);
++	const uint32_t fbp = uint32_t(ctx.frame.desc.FBP);
++	const uint32_t tpsm = uint32_t(ctx.tex0.desc.PSM), tbp = uint32_t(ctx.tex0.desc.TBP0);
++	const bool copy = prim.TME && (fpsm == PSMCT16 || fpsm == PSMCT16S) && (tpsm == PSMCT32 || tpsm == PSMCT24) &&
++	                  tbp % PGS_BLOCKS_PER_PAGE == 0;
++	if (!copy)
++	{
++		// Drawing on the scanout buffer after the copy (UI drawn there): that frame is shown from the buffer.
++		if (fbp == fc_dest_fbp)
++			fc_valid = false;
++		else
++			fc_latched = false; // the next frame is being drawn elsewhere
++		return;
++	}
++
++	// A plain copy: sprites, no blending, the texture's colour as it is (DECAL, or MODULATE with 0x80 grey).
++	bool plain = prim.PRIM == uint32_t(PRIMType::Sprite) && !prim.ABE && (tpsm == PSMCT32 || tpsm == PSMCT24);
++	if (uint32_t(ctx.tex0.desc.TFX) != 1u) // 1: DECAL
++		for (unsigned i = 0; i < nv && i < vertex_queue.count; i++)
++		{
++			const uint32_t rgb = vertex_queue.attr[vertex_queue.count - 1 - i].rgba & 0xffffffu;
++			plain = plain && rgb == 0x808080u;
++		}
++
++	if (fc_latched)
++	{
++		// The copy's other sprites (strips): all plain, into the same buffer.
++		if (!plain || fbp != fc_dest_fbp)
++			fc_valid = false;
++		return;
++	}
++	fc_latched = true;
++	fc_valid = false;
++	fc_snapshot = {};
++	fc_dest_fbp = fbp;
++	if (!plain || !fc_info_valid)
++		return;
++
++	// The target as the copy reads it (as ui_scanout_blit: the discs render 640x480 and the copy squeezes it to 448).
++	int src_x = 0, src_y = 0, src_h = 0;
++	if (nv == 2 && prim.FST && vertex_queue.count >= 2)
++	{
++		const auto &ua = vertex_queue.attr[vertex_queue.count - 2].uv, &ub = vertex_queue.attr[vertex_queue.count - 1].uv;
++		src_x = int(std::min(ua.x, ub.x)) >> 4;
++		src_y = int(std::min(ua.y, ub.y)) >> 4;
++		src_h = (std::abs(int(ub.y) - int(ua.y)) + 8) >> 4;
++	}
++	flush();
++	DISPFBBits fb = {};
++	fb.FBP = tbp / PGS_BLOCKS_PER_PAGE;
++	fb.FBW = uint32_t(ctx.tex0.desc.TBW);
++	fb.PSM = PSMCT32;
++	fb.DBX = uint32_t(std::max(0, src_x));
++	fb.DBY = uint32_t(std::max(0, src_y));
++	const uint32_t width = uint32_t(ctx.tex0.desc.TBW) * 64u;
++	const uint32_t height = src_h > 0 && src_h <= 2048 ? uint32_t(src_h) : 480u;
++	ScanoutResult result = renderer.scan_out_buffer(fb, width, height, fc_info, sampling_rate_x_log2, sampling_rate_y_log2,
++	                                                fc_out_height);
++	if (result.image)
++	{
++		fc_snapshot = std::move(result);
++		fc_valid = true;
++	}
++}
++
+ bool GSInterface::ui_layer_filtered(unsigned nv)
+ {
++	if (hacks.full_color_scanout)
++		full_color_observe(nv);
+ 	const uint32_t mode = hacks.ui_layer;
+ 	if (!mode)
+ 		return false;
+@@ -3188,6 +3260,13 @@ bool GSInterface::take_ui_snapshot(ScanoutResult &result)
+ 	return true;
+ }
+ 
++uint32_t GSInterface::consume_full_color_shown()
++{
++	const uint32_t n = fc_stats_shown;
++	fc_stats_shown = 0;
++	return n;
++}
++
+ GSInterface::UiLayerStats GSInterface::consume_ui_stats()
+ {
+ 	UiLayerStats s = ui_stats;
+@@ -5012,6 +5091,29 @@ ScanoutResult GSInterface::vsync(const VSyncInfo &info_)
+ 	                             sampling_rate_x_log2, sampling_rate_y_log2,
+ 								 promoted1, promoted2);
+ 
++	// [ga2] Hacks::full_color_scanout: the buffer on screen holds a plain copy of a 32-bit frame: show that frame.
++	if (hacks.full_color_scanout)
++	{
++		fc_info = info;
++		fc_info_valid = true;
++		// The snapshot is made at the scanout's own size (lines), so the frame keeps its geometry.
++		if (result.image && !(fc_valid && fc_snapshot.image && result.image == fc_snapshot.image))
++			fc_out_height = result.internal_height;
++		// Every enabled read circuit shows the copied buffer (the discs enable both on the same one).
++		const bool en1 = priv_registers.pmode.EN1, en2 = priv_registers.pmode.EN2;
++		const bool shows_copy = (en1 || en2) && (!en1 || uint32_t(priv_registers.dispfb1.FBP) == fc_dest_fbp) &&
++		                         (!en2 || uint32_t(priv_registers.dispfb2.FBP) == fc_dest_fbp);
++		if (result.image && fc_valid && fc_snapshot.image && shows_copy)
++		{
++			result.image = fc_snapshot.image;
++			result.internal_width = fc_snapshot.internal_width;
++			result.internal_height = fc_snapshot.internal_height;
++			result.high_resolution_scanout = fc_snapshot.high_resolution_scanout;
++			result.high_resolution_shift = fc_snapshot.high_resolution_shift;
++			fc_stats_shown++;
++		}
++	}
++
+ 	if (hacks.backbuffer_promotion && result.image)
+ 	{
+ 		if (priv_registers.pmode.EN1)
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index 42d2e10..492d8cb 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -264,6 +264,12 @@ struct Hacks
+ 	// Textured UI keeps the snapped path (its texels stay 1:1).
+ 	bool ssaa_untextured_flat = false;
+ 
++	// [ga2] Full-colour scanout: the games copy their finished 32-bit frame into a 16-bit scanout buffer (dithered on
++	// the PS2; the 16 bits band every gradient). When that buffer holds nothing but a plain copy (sprites sampling a
++	// 32-bit target, no blending, neutral colour), the vsync shows the target itself, taken when the copy starts; any
++	// other drawing on the buffer after the copy keeps the normal scanout. GS memory and the copy stay as they are.
++	bool full_color_scanout = false;
++
+ 	// [bt3 bisect] drop classes of kicks: 1 = FRAME is a 16-bit view, 2 = textured from a 24/32-bit view of block 10752,
+ 	// 4 = FRAME.FBP == 336. Diagnostic only.
+ 	uint32_t skip_kick_mask = 0;
+@@ -377,6 +383,7 @@ public:
+ 		uint32_t snapshots = 0;
+ 		uint32_t scene_targets = 0;
+ 	};
++	uint32_t consume_full_color_shown(); // [ga2] vsyncs that showed the full-colour frame since the last call
+ 	UiLayerStats consume_ui_stats();
+ 
+ private:
+@@ -688,6 +695,16 @@ private:
+ 	ScanoutResult ui_snapshot = {};
+ 	bool ui_snapshot_fresh = false;
+ 	UiLayerStats ui_stats;
++	// [ga2] Hacks::full_color_scanout
++	void full_color_observe(unsigned num_vertices);
++	bool fc_latched = false;      // a copy has started (its first sprite)
++	bool fc_valid = false;        // fc_snapshot shows what the copy put into fc_dest_fbp
++	uint32_t fc_dest_fbp = UINT32_MAX;
++	bool fc_info_valid = false;
++	VSyncInfo fc_info = {};
++	ScanoutResult fc_snapshot = {};
++	uint32_t fc_stats_shown = 0;
++	uint32_t fc_out_height = 0;  // the normal scanout's lines
+ 	void post_draw_kick_handler();
+ 
+ 	struct
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index b5ea175..6994164 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -4292,7 +4292,7 @@ bool GSRenderer::vsync_can_skip(const PrivRegisterState &priv, const VSyncInfo &
+ }
+ 
+ ScanoutResult GSRenderer::scan_out_buffer(const DISPFBBits &fb, uint32_t width, uint32_t height, const VSyncInfo &info,
+-                                          uint32_t sampling_rate_x_log2, uint32_t sampling_rate_y_log2)
++                                          uint32_t sampling_rate_x_log2, uint32_t sampling_rate_y_log2, uint32_t out_height)
+ {   // [vrhud]
+ 	ScanoutResult result = {};
+ 	if (!device || !width || !height)
+@@ -4325,6 +4325,37 @@ ScanoutResult GSRenderer::scan_out_buffer(const DISPFBBits &fb, uint32_t width,
+ 	sample_crtc_circuit(cmd, *image, fb, rect, super_samples, nullptr, hires_shift);
+ 	device->set_name(*image, "UI layer");
+ 
++	if (out_height && out_height != height)
++	{
++		// [ga2] full colour: resized to the scanout's lines (the discs' copy squeezes 480 lines into 448), filtered.
++		auto out_info = Vulkan::ImageCreateInfo::immutable_2d_image(width << hires_shift, out_height << hires_shift,
++		                                                            VK_FORMAT_R8G8B8A8_UNORM);
++		out_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++		out_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++		out_info.misc |= Vulkan::IMAGE_MISC_MUTABLE_SRGB_BIT;
++		auto out = device->create_image(out_info);
++		cmd.image_barrier(*image, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++		                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++		                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
++		cmd.image_barrier(*out, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++		                  VK_PIPELINE_STAGE_NONE, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
++		cmd.blit_image(*out, *image, {0, 0, 0},
++		               {int32_t(width << hires_shift), int32_t(out_height << hires_shift), 1}, {0, 0, 0},
++		               {int32_t(width << hires_shift), int32_t(height << hires_shift), 1}, 0, 0);
++		cmd.image_barrier(*out, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, info.dst_layout,
++		                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, info.dst_stage, info.dst_access);
++		cmd.end_region();
++		flush_submit(0);
++		result.image = std::move(out);
++		result.internal_width = width;
++		result.internal_height = out_height;
++		result.mode_width = width;
++		result.mode_height = out_height;
++		result.high_resolution_scanout = hires_shift != 0;
++		result.high_resolution_shift = hires_shift;
++		return result;
++	}
++
+ 	cmd.image_barrier(*image, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, info.dst_layout,
+ 	                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+ 	                  info.dst_stage, info.dst_access);
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index 1c4178a..24cfd0d 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -351,8 +351,9 @@ public:
+ 	// [vrhud] A buffer in GS memory as an RGBA image, alpha kept, no CRTC involved: width x height pixels from
+ 	// (fb.DBX, fb.DBY) of the buffer fb describes. Scanned out at 2x/4x with the super-samples when
+ 	// info.high_resolution_scanout (as vsync() does). The result is in info.dst_layout / dst_stage / dst_access.
++	// [ga2] out_height (not 0, not height): resized to that many lines (filtered), for the full-colour scanout.
+ 	ScanoutResult scan_out_buffer(const DISPFBBits &fb, uint32_t width, uint32_t height, const VSyncInfo &info,
+-	                              uint32_t sampling_rate_x_log2, uint32_t sampling_rate_y_log2);
++	                              uint32_t sampling_rate_x_log2, uint32_t sampling_rate_y_log2, uint32_t out_height = 0);
+ 
+ 	static TexRect compute_effective_texture_rect(const TextureDescriptor &desc);
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,383 @@
+From 03c14bf54ccc6fc9f1e40ce7b08f318955216660 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:39:12 -0600
+Subject: [PATCH] VR battle table: the stage's map model drawn natively on the
+ plate (grid, play area, obstacle solids)
+
+- bvr_assets: AXO line primitives (lines, line strips) are kept as index pairs (Part::lines); Stage::mapModel reads
+  MAPVIEW_MAPMODELFILENAME.
+- bvr_ships::mapModel(): the identified stage's map model, built on the loader thread (Mesh::Part::lines).
+- ga2_vr drawMapModel: the model under the table's own map transform (turned and scaled with the map), lines glowing,
+  solids faint glass, heights flattened to 15 % (GA2_MAP_HEIGHT), clipped to the round plate with its rim fade.
+  GA2_NATIVE_MAP=0 turns it off (the game then draws the map's 3D as before).
+
+With native/compat/ga2_battledraw.cpp skipping the game's map meshes while the table shows the map, an Eigou 1
+battle in table mode runs at full speed with the game thread at 44-46 % (was ~85-95 %); VU1 17.5 Mcycles/s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/battlevr/bvr_assets.cpp |  22 ++-
+ ps2xRuntime/src/lib/battlevr/bvr_assets.h   |   2 +
+ ps2xRuntime/src/lib/battlevr/bvr_ships.cpp  |  42 +++++-
+ ps2xRuntime/src/lib/battlevr/bvr_ships.h    |   4 +
+ ps2xRuntime/src/lib/ga2_vr.cpp              | 150 ++++++++++++++++++++
+ 5 files changed, 213 insertions(+), 7 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+index a4a85f8..084ed52 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.cpp
+@@ -431,6 +431,8 @@ namespace bvr_assets
+         stage.size[2] = table.number("STAGE", "SIZE_Z", 0.0f);
+         for (const std::string &entry : table.list("BG"))
+             stage.sky.push_back(entry.substr(0, entry.find_first_of(" \t")));
++        if (const std::string *map = table.get("STAGE", "MAPVIEW_MAPMODELFILENAME"))
++            stage.mapModel = map->substr(0, map->find_first_of(" \t"));
+         for (const Table::Section &s : table.sections)
+         {
+             const std::string *id = table.get(s.name, "ID"), *model = table.get(s.name, "MODEL_FILENAME");
+@@ -769,8 +771,8 @@ namespace bvr_assets
+                 const auto tag = b.data.find(0), pos = b.data.find(1), uv = b.data.find(3), col = b.data.find(4);
+                 if (tag == b.data.end() || pos == b.data.end() || uv == b.data.end() || col == b.data.end() || tag->second.empty())
+                     continue;
+-                const uint32_t prim = uint32_t(tag->second[0][0]) & 7u; // 3 triangles, 4 strip, 5 fan
+-                if (prim < 3 || prim > 5)
++                const uint32_t prim = uint32_t(tag->second[0][0]) & 7u; // 1 lines, 2 line strip, 3 triangles, 4 strip, 5 fan
++                if (prim < 1 || prim > 5)
+                     continue;
+                 const size_t count = std::min({pos->second.size(), uv->second.size(), col->second.size()});
+                 const uint32_t base = uint32_t(part.vertices.size());
+@@ -794,7 +796,17 @@ namespace bvr_assets
+                         finite3(part.vertices[base + c2].pos))
+                         part.indices.insert(part.indices.end(), {base + uint32_t(a), base + uint32_t(b2), base + uint32_t(c2)});
+                 };
+-                if (prim == 3)
++                auto line = [&](size_t a, size_t b2) {
++                    if (finite3(part.vertices[base + a].pos) && finite3(part.vertices[base + b2].pos))
++                        part.lines.insert(part.lines.end(), {base + uint32_t(a), base + uint32_t(b2)});
++                };
++                if (prim == 1)
++                    for (size_t i = 0; i + 1 < count; i += 2)
++                        line(i, i + 1);
++                else if (prim == 2)
++                    for (size_t i = 0; i + 1 < count; ++i)
++                        line(i, i + 1);
++                else if (prim == 3)
+                     for (size_t i = 0; i + 2 < count; i += 3)
+                         tri(i, i + 1, i + 2);
+                 else if (prim == 4)
+@@ -804,11 +816,11 @@ namespace bvr_assets
+                     for (size_t i = 1; i + 1 < count; ++i)
+                         tri(0, i, i + 1);
+             }
+-            if (!part.indices.empty())
++            if (!part.indices.empty() || !part.lines.empty())
+                 model.parts.push_back(std::move(part));
+         }
+         if (model.parts.empty())
+-            return fail("an AXO model without triangles");
++            return fail("an AXO model without triangles or lines");
+         return true;
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_assets.h b/ps2xRuntime/src/lib/battlevr/bvr_assets.h
+index 1cd5abc..1e4f8a5 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_assets.h
++++ b/ps2xRuntime/src/lib/battlevr/bvr_assets.h
+@@ -98,6 +98,7 @@ namespace bvr_assets
+         int texture = -1; // index into Model::textures, -1 untextured
+         std::vector<Vertex> vertices;
+         std::vector<uint32_t> indices; // triangles, consistent winding along strips
++        std::vector<uint32_t> lines;   // line segments (index pairs): the map view's grid and outlines
+     };
+     struct Frame
+     {
+@@ -132,6 +133,7 @@ namespace bvr_assets
+         float size[3] = {0, 0, 0}; // SIZE_X/Y/Z
+         std::vector<StageUnit> units;
+         std::vector<std::string> sky; // [BG]: the sky model tables (drawn additively around the battle)
++        std::string mapModel;         // MAPVIEW_MAPMODELFILENAME: the tactical map's model table (grid, obstacle solids)
+         const StageUnit *unit(int id) const;
+     };
+     bool loadStage(const Archive &archive, const std::string &path, Stage &stage);
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+index 3efe42a..dd16966 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.cpp
+@@ -95,6 +95,7 @@ namespace bvr_ships
+                                          float((c >> 24) & 0xFFu) / 255.0f, n[0], n[1], n[2]});
+                 }
+                 out.indices = p.indices;
++                out.lines = p.lines;
+                 mesh->parts.push_back(std::move(out));
+             }
+         }
+@@ -147,6 +148,7 @@ namespace bvr_ships
+     namespace
+     {
+         constexpr int kSkyJob = -1000; // the loader's queue entry for the stage's sky
++        constexpr int kMapJob = -1001; // ... and for its map model
+         constexpr int kIconJob = 1 << 20; // + unit ID * 64 + expression: a unit's map icon
+         struct Loader
+         {
+@@ -158,8 +160,8 @@ namespace bvr_ships
+             int stage = -1;
+             std::map<int, std::shared_ptr<const Mesh>> ships; // by unit ID, for the identified stage
+             std::map<int, bool> requested;
+-            std::shared_ptr<const Mesh> sky;
+-            bool skyRequested = false;
++            std::shared_ptr<const Mesh> sky, map;
++            bool skyRequested = false, mapRequested = false;
+             std::map<int, std::shared_ptr<const bvr_assets::Texture>> icons; // by unit ID * 64 + expression
+             std::map<int, bool> iconRequested;
+             std::deque<int> queue;
+@@ -218,6 +220,25 @@ namespace bvr_ships
+                             l.sky = sky;
+                         continue;
+                     }
++                    if (unitId == kMapJob)
++                    {
++                        std::vector<bvr_assets::ShipPart> parts;
++                        const std::string table = l.stages[size_t(l.stage)].mapModel;
++                        lock.unlock();
++                        if (!table.empty())
++                            bvr_assets::skyParts(l.archive, table, parts);
++                        std::shared_ptr<const Mesh> map = parts.empty() ? nullptr : buildMesh(l.archive, parts);
++                        size_t lines = 0;
++                        if (map)
++                            for (const Mesh::Part &p : map->parts)
++                                lines += p.lines.size() / 2;
++                        std::fprintf(stderr, "[bvr] map model %s: %zu triangles, %zu lines\n", table.c_str(),
++                                     map ? map->triangles() : size_t(0), lines);
++                        lock.lock();
++                        if (generation == l.generation)
++                            l.map = map;
++                        continue;
++                    }
+                     if (unitId >= kIconJob)
+                     {
+                         const int key = unitId - kIconJob;
+@@ -286,6 +307,8 @@ namespace bvr_ships
+         l.requested.clear();
+         l.sky.reset();
+         l.skyRequested = false;
++        l.map.reset();
++        l.mapRequested = false;
+         l.icons.clear();
+         l.iconRequested.clear();
+         l.queue.clear();
+@@ -326,6 +349,21 @@ namespace bvr_ships
+         return l.sky;
+     }
+ 
++    std::shared_ptr<const Mesh> mapModel()
++    {
++        Loader &l = loader();
++        std::lock_guard<std::mutex> lock(l.mutex);
++        if (l.stage < 0)
++            return nullptr;
++        if (!l.mapRequested)
++        {
++            l.mapRequested = true;
++            l.queue.push_front(kMapJob);
++            l.wake.notify_one();
++        }
++        return l.map;
++    }
++
+     float startRotation(int unitId)
+     {
+         Loader &l = loader();
+diff --git a/ps2xRuntime/src/lib/battlevr/bvr_ships.h b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+index 6191477..668f458 100644
+--- a/ps2xRuntime/src/lib/battlevr/bvr_ships.h
++++ b/ps2xRuntime/src/lib/battlevr/bvr_ships.h
+@@ -18,6 +18,7 @@ namespace bvr_ships
+         {
+             std::vector<float> vertices;  // per vertex: x y z, u v, r g b a (0x80 = 1.0 as 0..1 of 255), nx ny nz: 12 floats
+             std::vector<uint32_t> indices;
++            std::vector<uint32_t> lines;  // line segments (index pairs)
+             int texture = -1;             // into textures
+         };
+         std::vector<Part> parts;
+@@ -56,6 +57,9 @@ namespace bvr_ships
+     std::shared_ptr<const Mesh> ship(int unitId);
+     // The identified stage's sky ([BG] models, drawn additively around the viewer), null while it loads.
+     std::shared_ptr<const Mesh> stageSky();
++    // The identified stage's tactical map model (MAPVIEW_MAPMODELFILENAME: its grid and obstacle solids, in map units
++    // with x/z the map's plane), null while it loads or when the stage has none.
++    std::shared_ptr<const Mesh> mapModel();
+     // A unit's START_ROT in the identified stage (degrees), 0 when unknown.
+     float startRotation(int unitId);
+     // A unit's map icon (MAPVIEW_UNITBASE_FILENAMEnn of its section; the last one when the expression is beyond its
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index cb21aac..14ab335 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1545,6 +1545,154 @@ void main()
+             glEnable(GL_BLEND);
+         }
+ 
++        // ---- the tactical map's own model, drawn natively ---------------------------------------------------------
++        // The stage's MAPVIEW_MAPMODELFILENAME model (its grid, the outline of the play area, obstacle solids), in map
++        // units with x/z on the map's plane and y down. While the table shows the map the game no longer draws its 3D
++        // (native/compat/ga2_battledraw.cpp), so the plate shows this instead: the lines glow, the solids are faint
++        // glass, all standing on the plate in true height, clipped to the round plate and fading at its rim.
++        const char *kMapVs = R"(#version 330
++layout(location = 0) in vec3 pos;
++layout(location = 2) in vec4 col;
++uniform mat4 mvp;
++uniform mat4 toTable; // model -> table (u, v) metres in x, y
++uniform float radius;
++out vec4 v_col;
++out vec2 v_t;
++void main()
++{
++    v_col = col;
++    v_t = (toTable * vec4(pos, 1.0)).xy / radius;
++    gl_Position = mvp * vec4(pos, 1.0);
++})";
++        const char *kMapFs = R"(#version 330
++in vec4 v_col;
++in vec2 v_t;
++uniform vec3 tint;
++uniform float alpha;
++out vec4 o;
++void main()
++{
++    float e = length(v_t);
++    if (e > 1.0) discard;
++    float fade = 1.0 - smoothstep(0.72, 1.0, e);
++    vec3 c = mix(tint, clamp(v_col.rgb * 2.0, 0.0, 1.5), 0.35);
++    o = vec4(c * alpha * fade, 0.0); // additive
++})";
++
++        struct MapGl
++        {
++            const void *mesh = nullptr;
++            GLuint program = 0, vao = 0, vbo = 0, lineEbo = 0, triEbo = 0;
++            GLsizei lines = 0, tris = 0;
++        } g_mapGl;
++
++        void drawMapModel(const M4 &viewProj, const ga2_battletable::State &st, const ga2_battletable::Pose &pose)
++        {
++            static const bool on = [] {
++                const char *v = std::getenv("GA2_NATIVE_MAP");
++                return !(v && *v == '0');
++            }();
++            if (!on || bvr_ships::stage().empty())
++                return;
++            const std::shared_ptr<const bvr_ships::Mesh> mesh = bvr_ships::mapModel();
++            if (!mesh)
++                return;
++            MapGl &g = g_mapGl;
++            if (!g.program)
++                g.program = compile(kMapVs, kMapFs, "map model");
++            if (g.mesh != mesh.get())
++            {
++                // One buffer for every part (12 floats a vertex: pos, uv, colour, normal), line and triangle indices.
++                std::vector<float> verts;
++                std::vector<uint32_t> lines, tris;
++                for (const bvr_ships::Mesh::Part &p : mesh->parts)
++                {
++                    const uint32_t base = uint32_t(verts.size() / 12);
++                    verts.insert(verts.end(), p.vertices.begin(), p.vertices.end());
++                    for (uint32_t i : p.lines)
++                        lines.push_back(base + i);
++                    for (uint32_t i : p.indices)
++                        tris.push_back(base + i);
++                }
++                if (!g.vao)
++                {
++                    glGenVertexArrays(1, &g.vao);
++                    glGenBuffers(1, &g.vbo);
++                    glGenBuffers(1, &g.lineEbo);
++                    glGenBuffers(1, &g.triEbo);
++                }
++                glBindVertexArray(g.vao);
++                glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
++                glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(verts.size() * sizeof(float)), verts.data(), GL_STATIC_DRAW);
++                glEnableVertexAttribArray(0);
++                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12 * sizeof(float), nullptr);
++                glEnableVertexAttribArray(2);
++                glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 12 * sizeof(float), reinterpret_cast<void *>(5 * sizeof(float)));
++                glBindVertexArray(0);
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.lineEbo);
++                glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(lines.size() * sizeof(uint32_t)), lines.data(), GL_STATIC_DRAW);
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.triEbo);
++                glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(tris.size() * sizeof(uint32_t)), tris.data(), GL_STATIC_DRAW);
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
++                g.lines = GLsizei(lines.size()), g.tris = GLsizei(tris.size());
++                g.mesh = mesh.get();
++                std::fprintf(stderr, "[bvr] map model on the table: %d line segments, %d triangles\n", g.lines / 2, g.tris / 3);
++            }
++            // Map (x, y down, z) -> play space: the table's own map transform (turned and scaled), 3 mm over the glass.
++            // Heights flattened (15 % by default, GA2_MAP_HEIGHT): the play area's posts and the obstacle solids span
++            // +-4 map units, a fifth of the stage's width, and at true scale stood over the units like walls.
++            static const float heightScale = [] {
++                const char *v = std::getenv("GA2_MAP_HEIGHT");
++                return v && *v ? std::clamp(float(std::atof(v)), 0.0f, 1.0f) : 0.15f;
++            }();
++            const float lift = 0.003f;
++            float u0 = 0, v0 = 0, ux = 0, vx = 0, uz = 0, vz = 0;
++            ga2_battletable::mapToTable(st, 0.0f, 0.0f, u0, v0);
++            ga2_battletable::mapToTable(st, 1.0f, 0.0f, ux, vx);
++            ga2_battletable::mapToTable(st, 0.0f, 1.0f, uz, vz);
++            const V3 o = playPoint(pose, u0, v0, lift);
++            const V3 ex = playPoint(pose, ux, vx, lift) - o, ez = playPoint(pose, uz, vz, lift) - o;
++            const V3 up = normalize(playPoint(pose, u0, v0, lift + 0.01f) - o) * (length(ex) * heightScale);
++            M4 model;
++            model.m[0] = ex.x, model.m[1] = ex.y, model.m[2] = ex.z, model.m[3] = 0;
++            model.m[4] = -up.x, model.m[5] = -up.y, model.m[6] = -up.z, model.m[7] = 0;
++            model.m[8] = ez.x, model.m[9] = ez.y, model.m[10] = ez.z, model.m[11] = 0;
++            model.m[12] = o.x, model.m[13] = o.y, model.m[14] = o.z, model.m[15] = 1;
++            M4 toTable;
++            for (float &x : toTable.m)
++                x = 0.0f;
++            toTable.m[0] = ux - u0, toTable.m[1] = vx - v0;
++            toTable.m[8] = uz - u0, toTable.m[9] = vz - v0;
++            toTable.m[12] = u0, toTable.m[13] = v0, toTable.m[15] = 1.0f;
++            glUseProgram(g.program);
++            setMatrix(g.program, "mvp", mul(viewProj, model));
++            setMatrix(g.program, "toTable", toTable);
++            glUniform1f(glGetUniformLocation(g.program, "radius"), pose.halfWidth);
++            const GLint locTint = glGetUniformLocation(g.program, "tint"), locAlpha = glGetUniformLocation(g.program, "alpha");
++            glEnable(GL_BLEND);
++            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++            glDepthMask(GL_FALSE);
++            glEnable(GL_DEPTH_TEST);
++            glDepthFunc(GL_LEQUAL);
++            glBindVertexArray(g.vao);
++            if (g.tris)
++            {
++                glUniform3f(locTint, 0.35f, 0.75f, 1.0f);
++                glUniform1f(locAlpha, 0.10f);
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.triEbo);
++                glDrawElements(GL_TRIANGLES, g.tris, GL_UNSIGNED_INT, nullptr);
++            }
++            if (g.lines)
++            {
++                glUniform3f(locTint, 0.45f, 1.0f, 0.75f);
++                glUniform1f(locAlpha, 0.55f);
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.lineEbo);
++                glDrawElements(GL_LINES, g.lines, GL_UNSIGNED_INT, nullptr);
++            }
++            glBindVertexArray(0);
++            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
++        }
++
+         // ---- palm menus (battlevr/bvr_hands.h; after BattleGroupVR's hand menus) -----------------------------------
+         // Turn a palm toward the face and its menu shows over it; the other hand's fingertip pokes its keys.
+         //   left palm, "Squadron": the angels (their own icons, shield bars, the selected one lit): a poke selects one
+@@ -1794,6 +1942,8 @@ void main()
+             glUniform4fv(glGetUniformLocation(g_tableGl.table, "masks"), 8, masks);
+             setUnitIcons(g_tableGl.table, st); // the game's flat unit icons are left off the plate
+             drawArrays(g_tableGl.vao7, g_tableGl.vbo7, mesh, 7);
++            if (mapShown)
++                drawMapModel(viewProj, st, pose);
+             if (mapShown)
+                 drawHudPanels(viewProj, eye, picture, extentX, extentY, st, pose);
+ 
+-- 
+2.56.0
+

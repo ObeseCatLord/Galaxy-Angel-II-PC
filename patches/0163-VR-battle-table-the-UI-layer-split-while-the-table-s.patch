@@ -1,0 +1,262 @@
+From 5cd444e6a2bce393a29c081724feac92a3ec5c39 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:06:03 -0600
+Subject: [PATCH 163/171] VR battle table: the UI layer split while the table
+ shows (HUD panels are the HUD alone, the plate stays whole)
+
+---
+ ps2xRuntime/include/runtime/gs/gs_pgs.h |  3 +
+ ps2xRuntime/src/lib/ga2_vr.cpp          | 74 +++++++++++++++++++++++--
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp       | 19 +++++--
+ 3 files changed, 87 insertions(+), 9 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index e02bcc4..a7fe4a8 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -71,6 +71,9 @@ namespace ga2_pgs
+     // dialogue, menus) alone into an RGBA image, alpha as the game wrote it (0x80 = opaque), transparent black
+     // elsewhere; while a frame is split (3D stereo scene) the eye frames leave the overlay out.
+     bool uiLayer();
++    // The VR battle table: split the frames into scene and UI layer while it is shown (its HUD panels and units
++    // come from the UI layer, the plate from the scene).
++    void setTableSplit(bool on);
+     // Newest UI layer image; uiSplit: the eye frames of the same game frame lack their overlay.
+     bool takeUiFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height, bool &uiSplit);
+     // Zero-copy presentation (GA2_PGS_ZERO_COPY=0 turns it off): each frame of eye 0 (and eye 1 in VR stereo) is
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index cc3375f..a9ba3df 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -576,6 +576,8 @@ uniform sampler2D tex;
+ uniform vec2 extent;
+ uniform float time;
+ uniform vec4 masks[8]; // the HUD's pieces in picture uv (x0, y0, x1, y1): shown as panels around the table, not on it
++uniform sampler2D ui;  // the UI layer (premultiplied, alpha 0x80 = 1): the units' icons, zones, order lines and the HUD
++uniform int hasUi;     // with it the scene is whole and only the HUD's pieces of the UI layer are left out
+ out vec4 o;
+ float box(vec2 p, vec4 r, float soft) {
+     vec2 a = smoothstep(r.xy - soft, r.xy, p) * (1.0 - smoothstep(r.zw, r.zw + soft, p));
+@@ -588,9 +590,19 @@ void main()
+     // Inside the picture (soft border) and outside the HUD.
+     vec2 inPic = smoothstep(vec2(0.0), vec2(0.03), v_uv) * (1.0 - smoothstep(vec2(0.97), vec2(1.0), v_uv));
+     float pic = inPic.x * inPic.y;
++    float hud = 1.0;
+     for (int i = 0; i < 8; ++i)
+-        pic *= 1.0 - box(v_uv, masks[i], 0.01);
+-    vec3 map = texture(tex, clamp(v_uv, 0.0, 1.0) * extent).rgb * 1.15;
++        hud *= 1.0 - box(v_uv, masks[i], 0.01);
++    vec3 map = texture(tex, clamp(v_uv, 0.0, 1.0) * extent).rgb;
++    if (hasUi != 0)
++    {
++        vec4 u = texture(ui, clamp(v_uv, 0.0, 1.0));
++        float ua = clamp(u.a * (255.0 / 128.0), 0.0, 1.0) * hud;
++        map = map * (1.0 - ua) + u.rgb * hud;
++    }
++    else
++        pic *= hud;
++    map *= 1.15;
+     // The plate: a dark blue glass with a glowing rim and a faint scan line drifting across.
+     float rim = smoothstep(0.93, 0.985, edge) * (1.0 - smoothstep(0.985, 1.0, edge));
+     float scan = 0.5 + 0.5 * sin((v_aux.y * 0.5 + 0.5 - fract(time * 0.12)) * 60.0);
+@@ -610,13 +622,21 @@ uniform vec2 extent;
+ uniform vec4 src; // picture uv: centre x, y, half size x, y
+ uniform vec3 tint;
+ uniform float glow;
++uniform sampler2D ui;
++uniform int hasUi;
+ out vec4 o;
+ void main()
+ {
+     vec2 d = v_uv - 0.5;
+     float r = length(d) * 2.0;
+     if (r > 1.0) discard;
+-    vec3 c = texture(tex, clamp(src.xy + d * 2.0 * src.zw, vec2(0.0), vec2(1.0)) * extent).rgb;
++    vec2 p = clamp(src.xy + d * 2.0 * src.zw, vec2(0.0), vec2(1.0));
++    vec3 c = texture(tex, p * extent).rgb;
++    if (hasUi != 0)
++    {
++        vec4 u = texture(ui, p);
++        c = c * (1.0 - clamp(u.a * (255.0 / 128.0), 0.0, 1.0)) + u.rgb;
++    }
+     float ring = smoothstep(0.80, 0.90, r) * (1.0 - smoothstep(0.95, 1.0, r));
+     float a = 1.0 - smoothstep(0.92, 1.0, r);
+     vec3 col = c * (1.0 + glow * 0.3) + tint * ring * (1.0 + glow);
+@@ -636,12 +656,32 @@ in vec2 v_uv;
+ uniform sampler2D tex;
+ uniform vec2 extent;
+ uniform vec4 src; // picture uv: centre x, y, half size x, y
++uniform sampler2D ui;
++uniform int hasUi;
+ out vec4 o;
+ void main()
+ {
+-    vec3 c = texture(tex, clamp(src.xy + (v_uv - 0.5) * 2.0 * src.zw, vec2(0.0), vec2(1.0)) * extent).rgb;
++    vec2 p = clamp(src.xy + (v_uv - 0.5) * 2.0 * src.zw, vec2(0.0), vec2(1.0));
+     vec2 e = abs(v_uv - 0.5) * 2.0;
+     float edge = max(e.x, e.y);
++    if (hasUi != 0)
++    {
++        // The HUD piece alone, floating: its pixels with their own alpha, a little brighter, and a faint glow
++        // around them so it reads as light in the air.
++        vec4 u = texture(ui, p);
++        float a = clamp(u.a * (255.0 / 128.0), 0.0, 1.0);
++        float halo = 0.0;
++        for (int i = 0; i < 8; ++i)
++        {
++            vec2 off = vec2(cos(float(i) * 0.785), sin(float(i) * 0.785)) * src.zw * 0.025;
++            halo += clamp(texture(ui, p + off).a * (255.0 / 128.0), 0.0, 1.0);
++        }
++        halo = clamp(halo / 8.0 - a, 0.0, 1.0) * 0.35;
++        float fade = 1.0 - smoothstep(0.97, 1.0, edge);
++        o = vec4((u.rgb * 1.08 + vec3(0.25, 0.6, 1.0) * halo) * fade, max(a, halo) * fade);
++        return;
++    }
++    vec3 c = texture(tex, p * extent).rgb;
+     float rim = smoothstep(0.96, 0.99, edge) * (1.0 - smoothstep(0.99, 1.0, edge));
+     float a = 0.94 * (1.0 - smoothstep(0.995, 1.0, edge));
+     vec3 col = mix(vec3(0.02, 0.05, 0.11), c, 0.97) + vec3(0.25, 0.6, 1.0) * rim * 0.9;
+@@ -868,6 +908,9 @@ void main()
+             drawHandMesh(viewProj, eye, aimPose, nullptr, left, point, fist, grabbing, strength);
+         }
+ 
++        // The UI layer's image while the frames are split (defined with the HUD panel below).
++        GLuint tableUiTexture();
++
+         struct TableView
+         {
+             bool active = false;
+@@ -882,6 +925,24 @@ void main()
+         bool g_handsStill = false;     // both palms holding still (the table's recentre gesture)
+         bool g_handOnly[2] = {false, false}; // a tracked hand without its controller (finger tracking below)
+ 
++        // The UI layer on texture unit 1 for a table program ("ui", "hasUi"); unit 0 stays active.
++        void bindTableUi(GLuint program)
++        {
++            const GLuint ui = tableUiTexture();
++            glActiveTexture(GL_TEXTURE1);
++            glBindTexture(GL_TEXTURE_2D, ui);
++            if (ui)
++            {
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++            }
++            glActiveTexture(GL_TEXTURE0);
++            glUniform1i(glGetUniformLocation(program, "ui"), 1);
++            glUniform1i(glGetUniformLocation(program, "hasUi"), ui ? 1 : 0);
++        }
++
+         // The HUD's pieces as the game draws them this frame (State::hud, 2D layer 640 x 480) in picture uv, a little
+         // larger: left out of the table's picture (they are panels around it).
+         void tableMasks(const ga2_battletable::State &st, float out[32])
+@@ -912,6 +973,7 @@ void main()
+             glBindTexture(GL_TEXTURE_2D, picture);
+             glUniform1i(glGetUniformLocation(g_tableGl.panel, "tex"), 0);
+             glUniform2f(glGetUniformLocation(g_tableGl.panel, "extent"), extentX, extentY);
++            bindTableUi(g_tableGl.panel);
+             glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+             for (int i = 0; i < st.hudCount; ++i)
+             {
+@@ -1223,6 +1285,7 @@ void main()
+             glBindTexture(GL_TEXTURE_2D, picture);
+             glUniform1i(glGetUniformLocation(g_tableGl.table, "tex"), 0);
+             glUniform2f(glGetUniformLocation(g_tableGl.table, "extent"), extentX, extentY);
++            bindTableUi(g_tableGl.table);
+             glUniform1f(glGetUniformLocation(g_tableGl.table, "time"), time);
+             float masks[32];
+             tableMasks(st, masks);
+@@ -1255,6 +1318,7 @@ void main()
+                 glUseProgram(g_tableGl.icon);
+                 setMatrix(g_tableGl.icon, "mvp", viewProj);
+                 glUniform2f(glGetUniformLocation(g_tableGl.icon, "extent"), extentX, extentY);
++                bindTableUi(g_tableGl.icon);
+                 const float iconHalf = 24.0f;
+                 glUniform4f(glGetUniformLocation(g_tableGl.icon, "src"), unit.sx / 640.0f, unit.sy / 480.0f, iconHalf / 640.0f,
+                             iconHalf / 480.0f);
+@@ -2770,6 +2834,7 @@ void main()
+             bool uiSplit = false;
+         };
+         UiImage g_uiImage;
++        GLuint tableUiTexture() { return g_uiImage.texture && g_uiImage.uiSplit ? g_uiImage.texture : 0u; }
+ 
+         float envFloat(const char *name, float fallback, float lo, float hi)
+         {
+@@ -3007,6 +3072,7 @@ void main()
+         // The battle table (ga2_battletable.h): the game says when the tactical map is shown in table mode.
+         g_tableView.state = ga2_battletable::latest();
+         g_tableView.active = g_tableView.state.active;
++        ga2_pgs::setTableSplit(g_tableView.active); // its HUD and units from the UI layer, the plate from the scene
+         g_tableView.aimValid[0] = g_tableView.aimValid[1] = false;
+         locateHands(frameState.predictedDisplayTime, world);
+         float grips[2] = {script ? script->l1 : scalar(g_xr.l1), script ? script->r1 : scalar(g_xr.r1)};
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 973d343..40d4518 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -242,6 +242,9 @@ namespace
+         }
+     };
+ 
++    // The VR battle table wants the UI layer split from the scene (ga2_pgs::setTableSplit).
++    std::atomic<bool> g_tableSplit{false};
++
+     struct State
+     {
+         std::mutex mutex;
+@@ -259,6 +262,7 @@ namespace
+         bool wideDetail = false;
+         InstanceWorker jitterWorkers[3];
+         bool uiLayer = false;
++        bool uiPanelStereo = false; // GA2_VR_HUD_PANEL=1: the overlay as one panel over the stereo views
+         uint32_t instanceCount() const { return eyeCount + jitterCount + (uiLayer ? 1u : 0u); }
+         // The worker of instance i, or null when the calling thread runs it.
+         InstanceWorker *worker(uint32_t i)
+@@ -653,11 +657,14 @@ namespace
+             else
+                 std::fprintf(stderr, "[pgs] jitter instances failed; rendering stays at 4x\n");
+         }
+-        // HUD panel: a third instance for the 2D overlay (GA2_VR_HUD_PANEL=1, only with the two eye instances).
+-        // It renders the overlay at its own super-sampling (GA2_VR_HUD_SSAA, default 1: the game's 640x480; 4 scans
+-        // it out at 1280x960, smoother on a panel close to the eyes, for about 2 ms of EE-thread time per vsync).
++        // The UI layer: a third instance for the 2D overlay, with the two eye instances (VR). The battle table shows
++        // the HUD's pieces as holograms from it (setTableSplit), and with GA2_VR_HUD_PANEL=1 the stereo views show
++        // the whole overlay as one panel. It renders the overlay at its own super-sampling (GA2_VR_HUD_SSAA, default
++        // 1: the game's 640x480; 4 scans it out at 1280x960, smoother on a panel close to the eyes) for about 2 ms of
++        // EE-thread time per vsync. GA2_VR_HUD_PANEL=0: no UI layer (the table cuts the HUD out of the picture).
+         s.hudDebug = envInt("GA2_VR_HUD_DEBUG", 0) == 1;
+-        if ((s.eyeCount == 2 && envInt("GA2_VR_HUD_PANEL", 0) == 1) || s.hudDebug)
++        s.uiPanelStereo = envInt("GA2_VR_HUD_PANEL", -1) == 1;
++        if ((s.eyeCount == 2 && envInt("GA2_VR_HUD_PANEL", -1) != 0) || s.hudDebug)
+         {
+             GSOptions uiOptions = eyeOptions;
+             const int u = envInt("GA2_VR_HUD_SSAA", 1);
+@@ -1288,7 +1295,7 @@ namespace ga2_pgs
+         const ga2_stereo::Setup next = t.next;
+         // HUD panel: the frames the instances are about to draw are split into scene and UI layer while the game
+         // renders them in stereo.
+-        const bool split = s.uiLayer && (next.active || s.hudDebug);
++        const bool split = s.uiLayer && ((s.uiPanelStereo && next.active) || s.hudDebug || g_tableSplit.load());
+         // The port's text and prompts of the frame being scanned out (the game flipped to a new one since the last
+         // vsync, or it is still the last one), kept with its picture.
+         const auto frameText = ga2_hitext::sealFrame(t.newFrame, std::move(t.pieces));
+@@ -1472,6 +1479,7 @@ namespace ga2_pgs
+     }
+ 
+     bool uiLayer() { return state().uiLayer; }
++    void setTableSplit(bool on) { g_tableSplit.store(on); }
+ 
+     bool jittered() { return state().jitterCount == 3; }
+ 
+@@ -1805,6 +1813,7 @@ namespace ga2_pgs
+     bool waitFreshFrame(int) { return false; }
+     bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *, double *) { return false; }
+     bool uiLayer() { return false; }
++    void setTableSplit(bool) {}
+     bool takeUiFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &, bool &) { return false; }
+     bool jittered() { return false; }
+     bool takeJitterFrames(std::vector<uint8_t> (&)[4], uint32_t &, uint32_t &) { return false; }
+-- 
+2.56.0
+
