@@ -36,6 +36,12 @@ namespace ga2_hud
     };
     constexpr int kMaxAreas = 8;
     void captureAreas(bool on);
+    bool capturing();
+    // A 2D layer item that belongs to the tactical map, not the HUD (a unit's marker piece, the cursor ring), by its
+    // pointer, marked by the battle pointer as the game places it: while capturing (the VR battle table, which draws
+    // the units and the cursor itself), the game does not draw it, so the 2D layer the HUD panels are taken from
+    // holds the HUD alone. A mark lasts a moment (items are reused).
+    void markMapItem(uint32_t item);
     // The last whole frame's areas; returns their count.
     int areas(Area *out, int max);
     // The last whole frame's items themselves (before merging; an area's panel shows only what lies inside them, not

@@ -72,8 +72,10 @@ guide are in [docs/PLAYING.md](docs/PLAYING.md).
   Menus, windows and the HUD keep their original pixels, crisp (Settings >
   Menus and HUD: Sharp pixels, or Anime4K).
 - Cheats menu (F1) and an in-game settings menu (F2).
-- VR through OpenXR (SteamVR, Monado). The game is shown on a big screen,
-  and the 3D scenes are drawn in stereo around you. Battles are played
+- VR through OpenXR (SteamVR, Monado), with full motion controls: point at
+  anything with a controller and pull the trigger to click it (menus, choices,
+  the story), and play battles with your hands. The game is shown on a big
+  screen, and the 3D scenes are drawn in stereo around you. Battles are played
   on a round holographic battle table in front of you, inside the battle's
   own sky, with the game's own ship models standing on it, and motion controls: hold
   your hand over a unit and pull the trigger to select it, drag to a spot or

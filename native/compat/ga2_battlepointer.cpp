@@ -48,6 +48,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 
 namespace
 {
@@ -332,6 +333,17 @@ namespace
         // Map units: the map plane is y = 0 in the same units as the camera
         // look-at point and the projector's x 0.001 (units are millimetres).
         return worldRay(view, setup.unitsPerMetre, origin, direction, ray);
+    }
+
+    // A 2D layer object's items: the vector at holder + 4 .. + 8 (an object placed by setPosition).
+    template <typename F>
+    void holderItems(const uint8_t *ram, uint32_t holder, F &&each)
+    {
+        const uint32_t first = word(ram, holder + 4u), last = word(ram, holder + 8u);
+        if (first >= 0x100000u && last <= 0x2000000u && last > first && last - first <= 64u * 4u)
+            for (uint32_t at = first; at < last; at += 4u)
+                if (const uint32_t item = word(ram, at); item >= 0x100000u && item < 0x2000000u)
+                    each(item);
     }
 
     template <size_t I>
@@ -1081,6 +1093,9 @@ namespace
         }
         // The HUD's pieces (ga2_hud.h), for the panels around the table.
         ga2_hud::captureAreas(true);
+        // The map's cursor ring (mapview + 0x14, its items at + 0x64 .. 0x68) is the map's: the table draws its own.
+        if (const uint32_t ring = word(ram, mapview + 0x14); ring >= 0x100000u && ring < 0x2000000u)
+            holderItems(ram, ring + 0x60u, [](uint32_t item) { ga2_hud::markMapItem(item); });
         {
             ga2_hud::Area areas[ga2_battletable::State::kMaxHud];
             st.hudCount = ga2_hud::areas(areas, ga2_battletable::State::kMaxHud);
@@ -2022,6 +2037,49 @@ namespace
         return n;
     }
 
+    // The game places each unit's map marker pieces (ring, frame, face, star, ...) with setPosition at the unit's own
+    // icon position (its fields at unit + sx): while the battle table is shown, those objects' items are the map's,
+    // not the HUD's (ga2_hud::markMapItem), and the game leaves them out of its picture (the table draws the units).
+    template <size_t I>
+    void setPositionHook(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_table.state.active && ga2_hud::capturing())
+        {
+            const Disc &D = kDiscs[I];
+            const uint32_t holder = GPR_U32(ctx, 4);
+            const float x = ctx->f[12], y = ctx->f[13];
+            const uint32_t mgr = word(ram, D.mgrGlobal);
+            const uint32_t last = !mgr ? 0u : D.countField ? word(ram, mgr + D.countField) : 0x4fu;
+            bool unit = false;
+            if (mgr && !(D.countField && int32_t(last) < 0))
+                for (uint32_t i = 0; i <= last && i < 0x100u && !unit; ++i)
+                {
+                    const uint32_t u = unitAt<I>(ram, mgr, i);
+                    unit = usable<I>(ram, u) && flt(ram, u + D.sx) == x && flt(ram, u + D.sx + 4) == y;
+                }
+            if (unit)
+                holderItems(ram, holder, [](uint32_t item) { ga2_hud::markMapItem(item); });
+            static const bool log = std::getenv("GA2_HUD_ITEMLOG") != nullptr;
+            if (log)
+            {
+                static std::unordered_map<uint32_t, int> seen;
+                if (seen.find(holder) == seen.end() || seen[holder] != int(unit))
+                {
+                    seen[holder] = int(unit);
+                    std::string items;
+                    holderItems(ram, holder, [&](uint32_t item) {
+                        char b[12];
+                        std::snprintf(b, sizeof(b), " %06x", item);
+                        items += b;
+                    });
+                    std::fprintf(stderr, "[hud place] ra=%06x holder=%06x x=%.1f y=%.1f unit=%d items:%s\n", GPR_U32(ctx, 31),
+                                 holder, x, y, int(unit), items.c_str());
+                }
+            }
+        }
+        g_original<I, SetPosition>(ram, ctx, runtime);
+    }
+
     template <size_t I>
     void bind(PS2Runtime &runtime)
     {
@@ -2047,6 +2105,7 @@ namespace
         hook(d.moveAll, g_original<I, MoveAll>, moveAll<I>);
         hook(d.moveOne, g_original<I, MoveOne>, moveOne<I>);
         g_original<I, SetPosition> = runtime.lookupFunction(d.setPosition); // called, not replaced
+        runtime.replaceFunction(d.setPosition, setPositionHook<I>); // the units' map markers (ga2_hud::markMapItem)
         g_original<I, Focus> = runtime.lookupFunction(d.focus);             // likewise
         hook(d.mapUpdate, g_original<I, MapUpdate>, mapUpdate<I>);
         hook(d.mapCamera, g_original<I, MapCamera>, mapCamera<I>);

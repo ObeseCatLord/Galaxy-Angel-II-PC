@@ -1,0 +1,41 @@
+From 3b100985f2b7459e5504bd095500cfc34918c797 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:56:11 -0600
+Subject: [PATCH] VR table HUD panels: no cut around the units' icons
+
+The game's own unit markers are left out of its 2D layer while the battle table is shown (the port's
+HUD hooks mark them by the objects the game places at each unit), so the layer the HUD panels are
+taken from holds the HUD alone; the panel shader's cut around each unit took a bite out of the radar
+or a unit panel a unit passed under.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_vr.cpp | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index b8af5ac..a677c9a 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -707,16 +707,14 @@ uniform vec2 extent;
+ uniform vec4 src; // picture uv: centre x, y, half size x, y
+ uniform sampler2D ui;
+ uniform int hasUi;
+-uniform vec4 icons[64]; // the units' icons (as on the plate): a HUD piece never carries map icons along
+-uniform int iconCount;
+ uniform vec4 items[48]; // the HUD items' own rectangles (uv x0, y0, x1, y1): only their pixels are the HUD's
+ uniform int itemCount;  // 0: not known (the whole area shows)
+ out vec4 o;
+ float uiAlpha(vec2 q)
+ {
++    // No cut around the units' icons: the game's own 2D icons are left out of the picture while the table shows
++    // (ga2_features.cpp), and a cut would take a bite out of the radar or a unit panel a unit passes under.
+     float keep = 1.0;
+-    for (int i = 0; i < iconCount; ++i)
+-        keep *= smoothstep(0.85, 1.0, length((q - icons[i].xy) / icons[i].zw));
+     if (itemCount > 0)
+     {
+         float inItem = 0.0;
+-- 
+2.56.0
+

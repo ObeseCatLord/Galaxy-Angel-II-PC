@@ -37,7 +37,9 @@
     battle's own sky (the stage's sky rendered around you from your disc);
   - the HUD's pieces (radar, clock, unit panel) float on their own as
     holograms, drawn from the game's 2D layer alone, with no map behind them,
-    and the table is never cut;
+    and the table is never cut; the game's own unit markers are left out of
+    that layer while the table shows (the table draws the units), so a unit
+    passing under the radar or a unit panel no longer cuts a hole in it;
   - each unit's marker is its own icon from the game (the angel's face, the
     ship's silhouette), upscaled, on a disc drawn at any resolution with its
     shield as a ring and a heading arrow under the ship; markers are solid

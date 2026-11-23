@@ -771,6 +771,14 @@ namespace
         return in;
     }
 
+    // Map items (ga2_hud::markMapItem): item -> the vblank it was last marked at; a mark lasts half a second.
+    std::unordered_map<uint32_t, uint64_t> g_mapItems;
+    bool isMapItem(uint32_t item)
+    {
+        const auto it = g_mapItems.find(item);
+        return it != g_mapItems.end() && ga2_activity::vsyncs.load(std::memory_order_relaxed) - it->second <= 30u;
+    }
+
     void captureItem(const uint8_t *rdram, uint32_t item, uint32_t kind)
     {
         const uint64_t frame = ga2_activity::vsyncs.load(std::memory_order_relaxed);
@@ -785,6 +793,8 @@ namespace
             g_lastAreas = std::move(done);
             g_lastItems = std::move(items);
         }
+        if (isMapItem(item))
+            return; // the map's (a unit's marker, the cursor ring), not the HUD's
         if (kind == 4u)
         {
             // A layout draws its children itself (not through this hook): each child's rectangle.
@@ -803,7 +813,7 @@ namespace
         Rect r;
         if (kind == 2u || !itemRect(rdram, item, r) || r.x1 - r.x0 < 4.0f || r.y1 - r.y0 < 4.0f)
             return;
-        if ((!g_centreItems.empty() && g_centreItems.count(item)) || onUnitIcon(r) || (r.x1 - r.x0 > 560.0f && r.y1 - r.y0 > 400.0f))
+        if ((!g_centreItems.empty() && g_centreItems.count(item)) || (r.x1 - r.x0 > 560.0f && r.y1 - r.y0 > 400.0f))
             return;
         const Anchor side = sideOf(r.x0, r.x1);
         if (ga2_activity::wideFrame())
@@ -819,7 +829,37 @@ namespace
     {
         g_rdram = rdram;
         if (g_capture.load(std::memory_order_relaxed))
-            captureItem(rdram, GPR_U32(ctx, 4), word(rdram, GPR_U32(ctx, 4) + 8));
+        {
+            const uint32_t item = GPR_U32(ctx, 4), kind = word(rdram, item + 8);
+            captureItem(rdram, item, kind);
+            // GA2_HUD_ITEMLOG=1 (diagnostics): every item drawn while the table captures (new ones and changes).
+            static const bool itemLog = std::getenv("GA2_HUD_ITEMLOG") != nullptr;
+            if (itemLog)
+            {
+                static std::unordered_map<uint32_t, std::string> seen;
+                Rect lr{};
+                const bool has = itemRect(rdram, item, lr);
+                char line[200];
+                std::snprintf(line, sizeof(line), "kind=%u rect=%d %.0f,%.0f-%.0f,%.0f cb=%06x f04=%08x f0c=%08x f28=%08x map=%d",
+                              kind, int(has), lr.x0, lr.y0, lr.x1, lr.y1, word(rdram, item + 0x78), word(rdram, item + 4),
+                              word(rdram, item + 0xc), word(rdram, item + 0x28), int(isMapItem(item)));
+                if (seen[item] != line)
+                {
+                    seen[item] = line;
+                    std::fprintf(stderr, "[hud item] v=%llu p=%06x %s\n",
+                                 (unsigned long long)ga2_activity::vsyncs.load(std::memory_order_relaxed), item, line);
+                }
+            }
+            // The map's own items (the units' marker pieces, the cursor ring: ga2_hud::markMapItem) are left out of
+            // the picture while the table is shown: it draws the units and the cursor itself, and the 2D layer the HUD
+            // panels are taken from then holds nothing but the HUD.
+            if (isMapItem(item))
+            {
+                SET_GPR_U32(ctx, 2, 0);
+                ctx->pc = GPR_U32(ctx, 31);
+                return;
+            }
+        }
         if (!ga2_activity::wideFrame())
         {
             g_original<I, ItemDraw>(rdram, ctx, runtime);
@@ -1069,6 +1109,16 @@ void ga2_hud::setUnitIcons(const float *xy, int count)
 void ga2_hud::keepCentred(uint32_t item)
 {
     g_centreItems.insert(item);
+}
+
+bool ga2_hud::capturing()
+{
+    return g_capture.load(std::memory_order_relaxed);
+}
+
+void ga2_hud::markMapItem(uint32_t item)
+{
+    g_mapItems[item] = ga2_activity::vsyncs.load(std::memory_order_relaxed);
 }
 
 void ga2_hud::captureAreas(bool on)
