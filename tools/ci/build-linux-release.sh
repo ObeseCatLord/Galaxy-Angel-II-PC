@@ -18,6 +18,12 @@ export GA2_COMPILERS="-DCMAKE_C_COMPILER=${GA2_CC:-clang-18} -DCMAKE_CXX_COMPILE
 export GA2_DISC_IDS="zettai;mugen-1;mugen-2;eigou-1;eigou-2"
 export GA2_RUNTIME_BUILD="${GA2_RUNTIME_BUILD:-$PRIVATE/build/release}"
 export PKG_CONFIG_PATH="$FFMPEG/lib/pkgconfig"
+# A cached FFmpeg keeps the absolute paths of where it was built (the workspace path changes with the repository's
+# name): point its pkg-config files at where it is now.
+for pc in "$FFMPEG"/lib/pkgconfig/*.pc; do
+    old="$(sed -n 's/^prefix=//p' "$pc")"
+    [ -n "$old" ] && [ "$old" != "$FFMPEG" ] && sed -i "s#$old#$FFMPEG#g" "$pc"
+done
 # --as-needed drops libraries nothing calls (raylib links libGLU, the runtime
 # libatomic), which a minimal system or SteamOS outside the Steam runtime lacks.
 STATIC="-static-libstdc++ -static-libgcc -Wl,--as-needed"

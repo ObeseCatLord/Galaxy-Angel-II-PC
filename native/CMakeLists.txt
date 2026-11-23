@@ -156,6 +156,7 @@ add_executable(ga2
     "${CMAKE_CURRENT_LIST_DIR}/launcher/main.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/launcher/library.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/launcher/iso9660.cpp"
+    "${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib/ga2_fileread.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/launcher/process.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/launcher/settings.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/launcher/assets.cpp"

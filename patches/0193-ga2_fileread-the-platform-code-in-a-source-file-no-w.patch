@@ -1,0 +1,292 @@
+From a6fde67e08c9d29b9db37bf1e6e9efc6ae55aa31 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:14:01 -0600
+Subject: [PATCH] ga2_fileread: the platform code in a source file (no
+ <windows.h> in the header)
+
+The header pulled in <windows.h>, whose macros (EXCEPTION_BREAKPOINT and others) clash with the runtime's enum
+names: the Windows release build failed in ps2_disc_mount.cpp once ga2_fileread.h was included before
+ps2_runtime.h (and Support.h now includes it in every stub). The handle is kept as a pointer-sized integer and the
+CreateFileW/ReadFile and open/pread code moved to src/lib/ga2_fileread.cpp (the launcher compiles it too).
+
+Verified: Linux build and unit tests 661/662; x86_64-w64-mingw32 syntax check of ps2_disc_mount.cpp,
+bvr_assets.cpp, Kernel/Stubs/CD.cpp and ga2_movie.cpp with the build's flags.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt                 |   1 +
+ ps2xRuntime/include/runtime/ga2_fileread.h | 125 +++------------------
+ ps2xRuntime/src/lib/ga2_fileread.cpp       |  94 ++++++++++++++++
+ 3 files changed, 110 insertions(+), 110 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/ga2_fileread.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index fd4dd1a..2e4683f 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -401,6 +401,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ps2_mouse_menus.cpp
+     src/lib/ga2_present.cpp
+     src/lib/ga2_movie.cpp
++    src/lib/ga2_fileread.cpp
+     src/lib/ga2_zerocopy.cpp
+     src/lib/ga2_vuthread.cpp
+     src/lib/ga2_battletable.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_fileread.h b/ps2xRuntime/include/runtime/ga2_fileread.h
+index f2dad1d..b1a630e 100644
+--- a/ps2xRuntime/include/runtime/ga2_fileread.h
++++ b/ps2xRuntime/include/runtime/ga2_fileread.h
+@@ -1,28 +1,13 @@
+ // Reads at a 64-bit offset on every platform. Disc images are over 4 GB and some files live past 2 GiB in them (the
+ // Mugen discs' SYSTEM.CNF at 4.2-4.5 GB): std::ifstream::seekg and long-based fseek stop at 2 GiB in the Windows build,
+ // so they read the wrong bytes there. Positional reads (pread; ReadFile with a 64-bit OVERLAPPED offset) have no
+-// seek pointer and no such limit.
++// seek pointer and no such limit. The platform code is in src/lib/ga2_fileread.cpp: this header does not pull in
++// <windows.h> (its macros, such as EXCEPTION_BREAKPOINT, clash with the runtime's names).
+ #pragma once
+ 
+ #include <cstddef>
+ #include <cstdint>
+ #include <filesystem>
+-#include <utility>
+-
+-#ifdef _WIN32
+-#ifndef WIN32_LEAN_AND_MEAN
+-#define WIN32_LEAN_AND_MEAN
+-#endif
+-#ifndef NOMINMAX
+-#define NOMINMAX
+-#endif
+-#include <windows.h>
+-#else
+-#include <cerrno>
+-#include <fcntl.h>
+-#include <sys/stat.h>
+-#include <unistd.h>
+-#endif
+ 
+ namespace ga2_fileread
+ {
+@@ -45,106 +30,26 @@ namespace ga2_fileread
+             return *this;
+         }
+ 
+-        bool open(const std::filesystem::path &path)
+-        {
+-            close();
+-#ifdef _WIN32
+-            m_handle = CreateFileW(path.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+-                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+-            if (m_handle == INVALID_HANDLE_VALUE)
+-                return false;
+-            LARGE_INTEGER size{};
+-            if (!GetFileSizeEx(m_handle, &size))
+-            {
+-                close();
+-                return false;
+-            }
+-            m_size = uint64_t(size.QuadPart);
+-#else
+-            m_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+-            if (m_fd < 0)
+-                return false;
+-            struct stat st{};
+-            if (fstat(m_fd, &st) != 0)
+-            {
+-                close();
+-                return false;
+-            }
+-            m_size = uint64_t(st.st_size);
+-#endif
+-            return true;
+-        }
+-
+-        void close()
+-        {
+-#ifdef _WIN32
+-            if (m_handle != INVALID_HANDLE_VALUE)
+-                CloseHandle(m_handle);
+-            m_handle = INVALID_HANDLE_VALUE;
+-#else
+-            if (m_fd >= 0)
+-                ::close(m_fd);
+-            m_fd = -1;
+-#endif
+-            m_size = 0;
+-        }
+-
+-        bool isOpen() const
+-        {
+-#ifdef _WIN32
+-            return m_handle != INVALID_HANDLE_VALUE;
+-#else
+-            return m_fd >= 0;
+-#endif
+-        }
++        bool open(const std::filesystem::path &path);
++        void close();
++        bool isOpen() const { return m_handle != kNone; }
+         uint64_t size() const { return m_size; }
+-
+         // All `count` bytes at `offset`, or false (past the end, or a read error).
+-        bool readAt(uint64_t offset, void *destination, size_t count) const
+-        {
+-            if (!isOpen() || offset > m_size || count > m_size - offset)
+-                return false;
+-            auto *out = static_cast<uint8_t *>(destination);
+-            while (count > 0)
+-            {
+-#ifdef _WIN32
+-                const DWORD chunk = DWORD(count > 0x40000000u ? 0x40000000u : count);
+-                OVERLAPPED at{};
+-                at.Offset = DWORD(offset & 0xFFFFFFFFu);
+-                at.OffsetHigh = DWORD(offset >> 32);
+-                DWORD got = 0;
+-                if (!ReadFile(m_handle, out, chunk, &got, &at) || got == 0)
+-                    return false;
+-#else
+-                const ssize_t got = ::pread(m_fd, out, count, off_t(offset));
+-                if (got < 0 && errno == EINTR)
+-                    continue; // interrupted by a signal: read again
+-                if (got <= 0)
+-                    return false;
+-#endif
+-                out += size_t(got);
+-                offset += uint64_t(got);
+-                count -= size_t(got);
+-            }
+-            return true;
+-        }
++        bool readAt(uint64_t offset, void *destination, size_t count) const;
+ 
+     private:
++        // A Windows HANDLE or a POSIX file descriptor, held as a pointer-sized integer.
++        static constexpr intptr_t kNone = -1;
+         void swap(File &other) noexcept
+         {
+-#ifdef _WIN32
+-            std::swap(m_handle, other.m_handle);
+-#else
+-            std::swap(m_fd, other.m_fd);
+-#endif
+-            std::swap(m_size, other.m_size);
++            const intptr_t h = m_handle;
++            m_handle = other.m_handle;
++            other.m_handle = h;
++            const uint64_t s = m_size;
++            m_size = other.m_size;
++            other.m_size = s;
+         }
+-
+-#ifdef _WIN32
+-        HANDLE m_handle = INVALID_HANDLE_VALUE;
+-#else
+-        int m_fd = -1;
+-#endif
++        intptr_t m_handle = kNone;
+         uint64_t m_size = 0;
+     };
+ 
+diff --git a/ps2xRuntime/src/lib/ga2_fileread.cpp b/ps2xRuntime/src/lib/ga2_fileread.cpp
+new file mode 100644
+index 0000000..1567e10
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_fileread.cpp
+@@ -0,0 +1,94 @@
++#include "runtime/ga2_fileread.h"
++
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <cerrno>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
++namespace ga2_fileread
++{
++    bool File::open(const std::filesystem::path &path)
++    {
++        close();
++#ifdef _WIN32
++        const HANDLE h = CreateFileW(path.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++        if (h == INVALID_HANDLE_VALUE)
++            return false;
++        m_handle = reinterpret_cast<intptr_t>(h);
++        LARGE_INTEGER size{};
++        if (!GetFileSizeEx(h, &size))
++        {
++            close();
++            return false;
++        }
++        m_size = uint64_t(size.QuadPart);
++#else
++        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++        if (fd < 0)
++            return false;
++        m_handle = fd;
++        struct stat st{};
++        if (fstat(fd, &st) != 0)
++        {
++            close();
++            return false;
++        }
++        m_size = uint64_t(st.st_size);
++#endif
++        return true;
++    }
++
++    void File::close()
++    {
++        if (m_handle != kNone)
++        {
++#ifdef _WIN32
++            CloseHandle(reinterpret_cast<HANDLE>(m_handle));
++#else
++            ::close(int(m_handle));
++#endif
++        }
++        m_handle = kNone;
++        m_size = 0;
++    }
++
++    bool File::readAt(uint64_t offset, void *destination, size_t count) const
++    {
++        if (!isOpen() || offset > m_size || count > m_size - offset)
++            return false;
++        auto *out = static_cast<uint8_t *>(destination);
++        while (count > 0)
++        {
++#ifdef _WIN32
++            const DWORD chunk = DWORD(count > 0x40000000u ? 0x40000000u : count);
++            OVERLAPPED at{};
++            at.Offset = DWORD(offset & 0xFFFFFFFFu);
++            at.OffsetHigh = DWORD(offset >> 32);
++            DWORD got = 0;
++            if (!ReadFile(reinterpret_cast<HANDLE>(m_handle), out, chunk, &got, &at) || got == 0)
++                return false;
++#else
++            const ssize_t got = ::pread(int(m_handle), out, count, off_t(offset));
++            if (got < 0 && errno == EINTR)
++                continue; // interrupted by a signal: read again
++            if (got <= 0)
++                return false;
++#endif
++            out += size_t(got);
++            offset += uint64_t(got);
++            count -= size_t(got);
++        }
++        return true;
++    }
++}
+-- 
+2.56.0
+
