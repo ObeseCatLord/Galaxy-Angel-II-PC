@@ -1,0 +1,182 @@
+From 8e87cb257782cce26881784adda983b1952ac43b Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 01:03:41 -0600
+Subject: [PATCH] IOP memory: high allocations and free-memory queries see the
+ whole pool (SCREAM bank loads failed)
+
+AllocSysMemory(flag 1), QueryMaxFreeMemSize and QueryTotalFreeMemSize walked the free extents from HeapBase, and
+that walk gives up (reports "invalid") as soon as one block lies below HeapBase. IRX images are placed below it
+(allocateLowest, pool 0x10000-0x120000), so after the first module loaded every high allocation returned 0 and
+both queries returned 0. SCREAM's snd_ReadBank asks for its bank chunk with a high allocation ("SCREAM Error:
+cause 15", 29 of 29 bank loads on every disc) and sizes its sample transfer buffer from QueryMaxFreeMemSize
+(cause 16 once the first was fixed), so no bank was ever loaded and every PLAYSOUND went to bank 0: the port
+played no SCREAM sound effect at all.
+
+The walk now starts at PoolBase for those three; the highest-fit choice of allocateLast is unchanged where it
+succeeded before (the extents above HeapBase are the same). allocateLast commits the block itself (the fixed
+placement path of allocate() refuses addresses below HeapBase); allocate() accepts a request up to the pool size
+when it is not a fixed placement, as the largest free block can now span below HeapBase. GA2_IOP_ALLOC_TRACE
+also logs every allocateLast (size, walk validity, chosen address).
+
+Verified: Zettai with a blank card: both bank loads reply with the block address, PLAYSOUND replies carry the
+0x85 handles, cursor moves and the New Game confirm are audible (-34 dBFS RMS / -14.5 dBFS peak over the title
+music, same size every time). New test in ps2_iop_import_tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/core/iop_memory.cpp | 39 ++++++++++++++++++------
+ ps2xIOP/tests/iop_import_tests.cpp       | 29 +++++++++++++++++-
+ 2 files changed, 58 insertions(+), 10 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index b3a9492..c71446c 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -36,9 +36,10 @@ namespace ps2x::iop::detail
+ 
+         // Derived from the existing allocation vector; no second free-space state.
+         template <class Visitor>
+-        bool visitFreeExtents(std::span<const IopMemory::Allocation> blocks, Visitor &&visitor)
++        bool visitFreeExtents(std::span<const IopMemory::Allocation> blocks, Visitor &&visitor,
++                              uint32_t base = IopMemory::HeapBase)
+         {
+-            uint32_t cursor = IopMemory::HeapBase;
++            uint32_t cursor = base;
+             while (cursor < IopMemory::HeapLimit)
+             {
+                 uint32_t nextStart = IopMemory::HeapLimit;
+@@ -47,7 +48,7 @@ namespace ps2x::iop::detail
+                 for (const auto &block : blocks)
+                 {
+                     const uint64_t end = uint64_t(block.address) + block.size;
+-                    if (block.size == 0u || block.address < IopMemory::HeapBase || end > IopMemory::HeapLimit)
++                    if (block.size == 0u || block.address < base || end > IopMemory::HeapLimit)
+                         return false;
+                     if (block.address <= cursor && cursor < end)
+                     {
+@@ -506,7 +507,8 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopMemory::allocate(uint32_t size, uint32_t alignment, std::optional<uint32_t> fixed)
+     {
+-        if (size > HeapLimit - HeapBase)
++        // A free block that spans below HeapBase (QueryMaxFreeMemSize reports it) can be larger than the heap range.
++        if (size > (fixed ? HeapLimit - HeapBase : HeapLimit - PoolBase))
+             return 0u;
+         size = alignUp(std::max(size, 1u), 16u);
+         alignment = std::max<uint32_t>(alignment, 4u);
+@@ -623,6 +625,9 @@ namespace ps2x::iop::detail
+         std::optional<uint32_t> selected;
+         // Provisional private mode-1 interpretation: highest aligned placement.
+         // Exact original-kernel rounding/overhead still needs a reference trace.
++        // The walk covers the whole pool: module images sit below HeapBase, and a walk that started
++        // at HeapBase gave up (returned false) as soon as one block lay below it, so every high
++        // allocation failed once the first module was loaded (SCREAM's bank loads among them).
+         const bool valid = visitFreeExtents(m_allocations, [&](uint32_t begin, uint32_t end)
+         {
+             if (size <= end - begin)
+@@ -632,11 +637,24 @@ namespace ps2x::iop::detail
+                     selected = aligned;
+             }
+             return true;
+-        });
++        }, PoolBase);
++        if (m_diagnostic && std::getenv("GA2_IOP_ALLOC_TRACE"))
++        {
++            uint32_t lowest = 0xFFFFFFFFu;
++            for (const auto &b : m_allocations)
++                lowest = std::min(lowest, b.address);
++            char line[200];
++            std::snprintf(line, sizeof(line), "[iop-alloc] allocateLast size=%x align=%x walk_valid=%d selected=%x blocks=%zu lowest=%x",
++                          size, alignment, int(valid), selected.value_or(0u), m_allocations.size(),
++                          m_allocations.empty() ? 0u : lowest);
++            m_diagnostic(line);
++        }
+         if (!valid || !selected)
+             return 0u;
+-        // Reuse the exact placement commit, preserving the forward cursor.
+-        return allocate(size, alignment, selected);
++        // Commit like allocate(): the heap cursor (the forward allocator's start) is not moved.
++        m_allocations.push_back({*selected, size});
++        markOwned(*selected, size);
++        return *selected;
+     }
+ 
+     bool IopMemory::freeAllocation(uint32_t address)
+@@ -687,6 +705,9 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
++    // QueryMaxFreeMemSize / QueryTotalFreeMemSize: the free extents of the whole pool (module images sit below
++    // HeapBase; a walk from HeapBase returned 0 as soon as one existed, so SCREAM's transfer buffer, sized from
++    // the largest free block, could never be allocated).
+     uint32_t IopMemory::maxFreeMemory() const
+     {
+         uint32_t largest = 0u;
+@@ -696,7 +717,7 @@ namespace ps2x::iop::detail
+             if (aligned <= end)
+                 largest = std::max(largest, uint32_t(end - aligned) & ~15u);
+             return true;
+-        });
++        }, PoolBase);
+         return valid ? largest : 0u;
+     }
+ 
+@@ -707,7 +728,7 @@ namespace ps2x::iop::detail
+         {
+             total += end - begin;
+             return true;
+-        });
++        }, PoolBase);
+         return valid ? total : 0u;
+     }
+ 
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index 2d99c39..f0bb438 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -460,6 +460,33 @@ namespace
+                       "allocation failure produced a fake transfer-buffer pointer");
+     }
+ 
++    // A module image below HeapBase (placed by allocateLowest) must not stop high allocations
++    // (AllocSysMemory flag 1, SCREAM's bank loads): the free-extent walk covers the whole pool.
++    bool testHighAllocationAboveModuleImage()
++    {
++        IopMemory memory;
++        const uint32_t image = memory.allocateLowest(0x2000u, 16u);
++        if (!expect(image >= IopMemory::PoolBase && image < IopMemory::HeapBase, "module image not placed below the heap"))
++            return false;
++        const uint32_t largest = memory.maxFreeMemory();
++        if (!expect(largest != 0u && largest <= memory.totalFreeMemory(), "free-memory queries blind below the heap") ||
++            !expect(memory.allocate(largest, 16u) != 0u && memory.maxFreeMemory() < largest, "the largest free block could not be allocated"))
++            return false;
++        memory.reset();
++        if (!expect(memory.allocateLowest(0x2000u, 16u) == image, "module image placement changed"))
++            return false;
++        const uint32_t first = memory.allocateLast(0x470u, 16u);
++        if (!expect(first == IopMemory::HeapLimit - 0x470u, "high allocation above a module image"))
++            return false;
++        const uint32_t second = memory.allocateLast(0xa120u, 16u);
++        if (!expect(second != 0u && second + 0xa120u <= first, "second high allocation not below the first"))
++            return false;
++        if (!expect(memory.freeAllocation(first) && memory.allocateLast(0x470u, 16u) == first, "freed top block not reused"))
++            return false;
++        // Exhausted pool: still a failure, not a crash or an overlap.
++        return expect(memory.allocateLast(IopMemory::HeapLimit - IopMemory::PoolBase, 16u) == 0u, "oversized high allocation succeeded");
++    }
++
+     bool testDvdSectorTransfer()
+     {
+         ImageHost host;
+@@ -746,7 +773,7 @@ namespace
+ int main()
+ {
+     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+-        !testCdvdReadBufferOwnership() || !testDvdSectorTransfer() || !testCdvdSubcommandFifo() || !testSystemStatusEvent() || !testFlaggedDmaInterrupt() || !testSifOtherDataReceive() || !testTimrmanPeriodicCallback())
++        !testCdvdReadBufferOwnership() || !testDvdSectorTransfer() || !testHighAllocationAboveModuleImage() || !testCdvdSubcommandFifo() || !testSystemStatusEvent() || !testFlaggedDmaInterrupt() || !testSifOtherDataReceive() || !testTimrmanPeriodicCallback())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+     return 0;
+-- 
+2.56.0
+

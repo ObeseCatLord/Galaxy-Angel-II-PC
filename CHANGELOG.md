@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.1
+
+- Sound effects: the games' sound effects (menu cursor and confirm sounds, battle
+  sounds and the others played by the sound driver) were silent in every earlier
+  release. The sound driver could not load its sound banks because the emulated
+  I/O processor's memory allocator refused its requests; it now finds the free
+  memory, and the sound effects play on all five discs. Music and voices are
+  unchanged.
+
 ## 0.12.0
 
 - Native movies (new setting "Movies", default Native): the PC decodes and

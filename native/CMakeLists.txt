@@ -172,3 +172,7 @@ set_target_properties(ga2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DI
 if(PS2X_RUNTIME_SHARED)
     ps2x_export_program_table(ga2_disc_probe)
 endif()
+
+if(GA2_EXTRA_CMAKE)
+    include("${GA2_EXTRA_CMAKE}")
+endif()
